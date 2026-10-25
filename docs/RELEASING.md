@@ -83,4 +83,4 @@ sudo sh install.sh            # Docker. Add --native for a systemd service (Linu
   sudo sh DIR/aegisnet-gateway/install.sh --from DIR/aegisnet-gateway
   ```
 
-Installation options for servers that already run nginx or v2ray, and access to the console on a public server, are covered in [OPERATIONS.md](OPERATIONS.md#install-next-to-existing-services).
+The full server guide (first-time setup, servers that already run nginx or v2ray, console access on a public server, upgrades) is [INSTALL.md](INSTALL.md).

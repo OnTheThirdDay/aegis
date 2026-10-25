@@ -18,6 +18,8 @@ curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/inst
 sudo sh install.sh              # Docker; add --native for a Linux systemd service
 ```
 
+**Step-by-step guide** (servers that already run nginx/v2ray/Cloudflare, public servers, setup, upgrades): [docs/INSTALL.md](docs/INSTALL.md).
+
 Releases are built and published by GitHub Actions; see [docs/RELEASING.md](docs/RELEASING.md) for the branch flow (work branch → `staging` → `main`), version bumps and verification.
 
 The installer:
