@@ -1,0 +1,89 @@
+# Runnable gateway profile for same-host cloudflared (or a local reverse
+# proxy) in front of 127.0.0.1:18080. Validate with:
+#   aegisctl validate deploy/examples/gateway.toml
+schema_version = "0.1"
+node_id = "pi-gateway-01"           # operator label; never a metric label
+role = "gateway"
+
+[core]
+shutdown_grace_seconds = 15
+max_sessions = 128
+max_streams_per_session = 64
+process_buffer_budget_bytes = 33554432
+peer_buffer_budget_bytes = 8388608
+stream_buffer_budget_bytes = 65536
+session_window_bytes = 2097152
+fail_closed = true
+
+[management]
+bind = "127.0.0.1:9080"
+remote_access_enabled = false
+authentication = "local-owner"
+config_store = "/var/lib/aegisnet/state.db"
+
+[secrets]
+dir = "/etc/aegisnet/secrets"
+
+[identity]
+peer_auth = "mutual_tls_1_3"
+server_identity = "secret://identity/server-cert.pem"
+server_private_key = "secret://identity/server-key.pem"
+trusted_client_ca = "secret://identity/ca.pem"
+# Local CA used to sign enrollment CSRs. Keep this key off untrusted hosts
+# where feasible (11 §5); omit both lines to disable API enrollment.
+ca_certificate = "secret://identity/ca.pem"
+ca_private_key = "secret://identity/ca-key.pem"
+
+[[inbounds]]
+id = "ingress-ws"
+kind = "websocket"
+bind = "127.0.0.1:18080"
+path = "/agp"
+max_pending_handshakes = 32
+max_frame_bytes = 131072
+
+[[outbounds]]
+id = "public-egress"
+kind = "direct_tcp"
+restricted_address_policy = "deny-private-and-metadata"
+
+[routing]
+default_outbound = "public-egress"
+default_action = "deny"
+
+[[routing.rules]]
+id = "authorized-users-public-egress"
+match = "authenticated-and-public-destination"
+action = "proxy"
+outbound = "public-egress"
+
+[dns]
+# The gateway's configured egress resolver; never the client's resolver.
+mode = "remote_required"
+fallback_to_system_resolver = false
+ipv6_policy = "follow-routing-policy"
+resolver = "explicit"
+nameservers = ["1.1.1.1:53", "9.9.9.9:53"]
+
+[telemetry]
+enabled = false
+otlp_export_enabled = false
+logs_to_console = false
+local_metrics_enabled = true
+sensitive_diagnostics_enabled = false
+profile = "off"
+semantic_conventions_version = "1.44.0"
+
+[transport]
+preferred = "websocket"
+h2_experimental = false
+sse_experimental = false
+allow_insecure_fallback = false
+
+[cloudflare]
+mode = "external_tunnel"
+origin_bind = "127.0.0.1:18080"
+
+[ui]
+enabled = true
+bind = "127.0.0.1:9080"

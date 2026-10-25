@@ -1,0 +1,37 @@
+[package]
+name = "aegis-node"
+description = "Composition root: wires transports, inbounds, outbounds and the session engine to the core admission gate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+aegis-buffer = { workspace = true }
+aegis-agp = { workspace = true }
+aegis-session = { workspace = true }
+aegis-config = { workspace = true }
+aegis-policy = { workspace = true }
+aegis-platform = { workspace = true }
+aegis-identity = { workspace = true }
+aegis-transport-ws = { workspace = true }
+aegis-inbound-socks = { workspace = true }
+aegis-inbound-http = { workspace = true }
+aegis-dns = { workspace = true }
+aegis-outbound-direct = { workspace = true }
+aegis-telemetry = { workspace = true }
+aegis-storage = { workspace = true }
+aegis-core = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+rustls = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros"] }
+tempfile = "3"
+rand = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }

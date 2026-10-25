@@ -1,0 +1,21 @@
+[package]
+name = "aegis-inbound-http"
+description = "HTTP CONNECT inbound with strict request limits (D-002)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "time"] }
+httparse = { workspace = true }
+base64 = { workspace = true }
+subtle = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "time", "rt", "macros"] }

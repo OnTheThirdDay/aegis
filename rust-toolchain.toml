@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned per A-001. Bump deliberately with a dependency/toolchain review.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

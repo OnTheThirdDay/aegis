@@ -1,0 +1,25 @@
+[package]
+name = "aegis-transport-ws"
+description = "WebSocket byte-duplex transport adapter (C-004)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }

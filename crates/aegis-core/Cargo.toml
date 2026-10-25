@@ -1,0 +1,27 @@
+[package]
+name = "aegis-core"
+description = "Admission gate, activation coordinator, crash recovery and supervision (B-001, B-002, B-005). Transport-agnostic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+aegis-config = { workspace = true }
+aegis-policy = { workspace = true }
+aegis-platform = { workspace = true }
+aegis-traffic-policy = { workspace = true }
+aegis-identity = { workspace = true }
+aegis-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

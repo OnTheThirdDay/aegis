@@ -1,0 +1,44 @@
+# Runnable client (agent) profile: local SOCKS5 + HTTP CONNECT, tunneled to
+# the gateway through its public WebSocket entry. The client never resolves
+# names itself (dns.mode = remote_required): domains travel to the gateway.
+schema_version = "0.1"
+node_id = "laptop-1"
+role = "client"
+
+[management]
+bind = "127.0.0.1:9081"
+config_store = "/var/lib/aegisnet-client/state.db"
+
+[secrets]
+dir = "/etc/aegisnet-client/secrets"
+
+[identity]
+peer_auth = "mutual_tls_1_3"
+client_identity = "secret://identity/cert.pem"   # from `aegisctl enroll-redeem`
+client_private_key = "secret://identity/key.pem" # generated locally by `aegisctl pki csr`
+trusted_server_ca = "secret://identity/ca.pem"
+
+[[inbounds]]
+id = "local-socks"
+kind = "socks5"
+bind = "127.0.0.1:1080"
+
+[[inbounds]]
+id = "local-http"
+kind = "http_connect"
+bind = "127.0.0.1:8080"
+
+[[outbounds]]
+id = "tunnel"
+kind = "agp_tunnel"
+url = "wss://gateway.example.invalid/agp"     # replace with your edge hostname
+server_name = "gateway.aegis.internal"        # inner TLS name in the gateway certificate
+
+[routing]
+default_outbound = "tunnel"
+default_action = "proxy"
+
+[dns]
+mode = "remote_required"
+fallback_to_system_resolver = false
+ipv6_policy = "follow-routing-policy"

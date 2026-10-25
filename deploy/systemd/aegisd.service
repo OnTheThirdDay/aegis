@@ -1,0 +1,52 @@
+# AegisNet service for ordinary SOCKS/HTTP/WebSocket operation (no TUN).
+# Requires a static "aegisnet" user owning /etc/aegisnet/secrets (0700).
+# Validate on each supported distribution before release (06 §5).
+[Unit]
+Description=AegisNet gateway/agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aegisnet
+Group=aegisnet
+ExecStartPre=/usr/local/bin/aegisd --config /etc/aegisnet/config.toml --check
+ExecStart=/usr/local/bin/aegisd --config /etc/aegisnet/config.toml
+StateDirectory=aegisnet
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+
+# Hardening: no capabilities are needed for non-TUN operation.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aegisnet
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,41 @@
+# cargo-deny policy (06 §1, TC-S01). Exceptions must be scoped, owned and
+# expiring; record them in docs/DEPENDENCIES.md.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # No dynamic plugin loading (02 §3 T0/T1 only).
+    { name = "libloading" },
+    # OTLP is hand-encoded; the OTel SDK requires its own review (05 §1).
+    { name = "opentelemetry" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

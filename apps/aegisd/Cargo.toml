@@ -1,0 +1,17 @@
+[package]
+name = "aegisd"
+description = "AegisNet gateway/agent service."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-config = { workspace = true }
+aegis-node = { workspace = true }
+aegis-management = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "signal", "time", "macros", "sync"] }
+serde_json = { workspace = true }

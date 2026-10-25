@@ -1,0 +1,18 @@
+[package]
+name = "aegis-policy"
+description = "Route compiler, explainable decisions and egress address policy (D-003, D-005)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+ipnet = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

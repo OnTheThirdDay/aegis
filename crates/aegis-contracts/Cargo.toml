@@ -1,0 +1,13 @@
+[package]
+name = "aegis-contracts"
+description = "Stable, platform-neutral domain contracts. Must not depend on tokio/hyper/management (A-002)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "aegis-dns"
+description = "Explicit resolvers with no implicit fallback (D-004)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+hickory-resolver = { workspace = true }
+tokio = { workspace = true, features = ["net", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "time", "rt", "macros"] }

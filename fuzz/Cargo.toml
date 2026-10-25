@@ -1,0 +1,50 @@
+[package]
+name = "aegis-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1.7"
+serde_json = "1.0"
+aegis-agp = { path = "../crates/aegis-agp" }
+aegis-config = { path = "../crates/aegis-config" }
+aegis-inbound-http = { path = "../crates/aegis-inbound-http" }
+aegis-contracts = { path = "../crates/aegis-contracts" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "agp_decoder"
+path = "fuzz_targets/agp_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "agp_control"
+path = "fuzz_targets/agp_control.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http_connect_head"
+path = "fuzz_targets/http_connect_head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "destination"
+path = "fuzz_targets/destination.rs"
+test = false
+doc = false

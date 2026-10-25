@@ -1,0 +1,23 @@
+[package]
+name = "aegis-telemetry"
+description = "Noop-by-default telemetry: local bounded counters, allowlisted coarse OTLP export, expiring local diagnostics."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "rt"] }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["time", "sync", "rt", "macros", "net", "io-util"] }
+proptest = { workspace = true }

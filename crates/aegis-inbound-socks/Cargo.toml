@@ -1,0 +1,19 @@
+[package]
+name = "aegis-inbound-socks"
+description = "SOCKS5 CONNECT inbound (RFC 1928/1929) (D-001)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "time"] }
+subtle = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "time", "rt", "macros"] }
+proptest = { workspace = true }

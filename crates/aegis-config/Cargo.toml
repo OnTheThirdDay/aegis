@@ -1,0 +1,25 @@
+[package]
+name = "aegis-config"
+description = "Typed configuration schema, validation, graph compiler, canonical digest and security diff."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+aegis-policy = { workspace = true }
+aegis-traffic-policy = { workspace = true }
+aegis-platform = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ipnet = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

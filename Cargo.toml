@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/aegisd", "apps/aegisctl", "xtask"]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+
+[workspace.dependencies]
+# First-party crates
+aegis-contracts = { path = "crates/aegis-contracts" }
+aegis-buffer = { path = "crates/aegis-buffer" }
+aegis-agp = { path = "crates/aegis-agp" }
+aegis-session = { path = "crates/aegis-session" }
+aegis-config = { path = "crates/aegis-config" }
+aegis-policy = { path = "crates/aegis-policy" }
+aegis-traffic-policy = { path = "crates/aegis-traffic-policy" }
+aegis-identity = { path = "crates/aegis-identity" }
+aegis-transport-ws = { path = "crates/aegis-transport-ws" }
+aegis-inbound-socks = { path = "crates/aegis-inbound-socks" }
+aegis-inbound-http = { path = "crates/aegis-inbound-http" }
+aegis-dns = { path = "crates/aegis-dns" }
+aegis-outbound-direct = { path = "crates/aegis-outbound-direct" }
+aegis-telemetry = { path = "crates/aegis-telemetry" }
+aegis-storage = { path = "crates/aegis-storage" }
+aegis-platform = { path = "crates/aegis-platform" }
+aegis-core = { path = "crates/aegis-core" }
+aegis-node = { path = "crates/aegis-node" }
+aegis-management = { path = "crates/aegis-management" }
+
+# Third-party candidates (06 §1). Not pre-approved: see docs/DEPENDENCIES.md.
+tokio = { version = "1.54", default-features = false }
+bytes = "1.7"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+subtle = "2.6"
+zeroize = "1.8"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+ipnet = { version = "2.10", features = ["serde"] }
+httparse = "1.9"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+# PEM parsing via pki-types' PemObject (replaces unmaintained rustls-pemfile, RUSTSEC-2025-0134).
+rustls-pki-types = { version = "1.12", features = ["std"] }
+webpki-roots = "1.0"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+x509-parser = "0.18"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# >= 0.26.1 fixes RUSTSEC-2026-0119 (hickory-proto name-compression CPU exhaustion).
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+argon2 = "0.5"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tower = { version = "0.5", default-features = false }
+http = "1.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+proptest = "1.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

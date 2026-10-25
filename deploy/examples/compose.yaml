@@ -1,0 +1,41 @@
+# Local Compose topology (pairs with a copy of gateway.toml whose WebSocket
+# inbound and cloudflare.origin_bind use 0.0.0.0:18080 on the private bridge).
+# Build the image locally first:  docker build -f deploy/Dockerfile -t aegisnet/gateway:dev .
+# cloudflared must be pinned to an audited digest before use.
+name: aegisnet
+services:
+  gateway:
+    image: aegisnet/gateway:dev
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 128
+    mem_limit: 256m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    volumes:
+      - ./gateway.container.toml:/etc/aegisnet/config.toml:ro
+      - ./secrets:/etc/aegisnet/secrets:ro
+      - state:/var/lib/aegisnet
+    expose:
+      - "18080"
+    networks: [private]
+    restart: unless-stopped
+  cloudflared:
+    image: cloudflare/cloudflared:REPLACE_WITH_AUDITED_PINNED_VERSION
+    command: ["tunnel", "--config", "/etc/cloudflared/config.yaml", "--no-autoupdate", "run"]
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    depends_on: [gateway]
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks: [private]
+    restart: unless-stopped
+networks:
+  private:
+    internal: false
+volumes:
+  state:

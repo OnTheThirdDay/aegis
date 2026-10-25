@@ -1,0 +1,21 @@
+[package]
+name = "aegis-session"
+description = "AGP/1 session multiplexer with reserved receive credit (C-003)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+aegis-agp = { workspace = true }
+aegis-buffer = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "sync", "time", "rt", "rt-multi-thread", "macros", "test-util"] }
+rand = { workspace = true }

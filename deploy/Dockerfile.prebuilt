@@ -1,0 +1,17 @@
+# Thin runtime image around binaries built elsewhere (e.g. on an
+# x86_64-unknown-linux-gnu host with glibc <= 2.36). Same runtime contract
+# as deploy/Dockerfile: rootless uid 10001, no TUN, no NET_ADMIN.
+#
+# Build context must contain bin/aegisd and bin/aegisctl.
+# Pin the base image to a reviewed digest before release use.
+FROM debian:bookworm-slim
+RUN groupadd --system --gid 10001 aegisnet \
+    && useradd --system --uid 10001 --gid 10001 --home-dir /var/lib/aegisnet --shell /usr/sbin/nologin aegisnet \
+    && install -d -o 10001 -g 10001 -m 0700 /var/lib/aegisnet \
+    && install -d -m 0755 /etc/aegisnet
+COPY bin/aegisd bin/aegisctl /usr/local/bin/
+USER 10001:10001
+VOLUME ["/var/lib/aegisnet"]
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD ["/usr/local/bin/aegisctl", "--socket", "/var/lib/aegisnet/aegisd.sock", "health"]
+ENTRYPOINT ["/usr/local/bin/aegisd", "--config", "/etc/aegisnet/config.toml"]

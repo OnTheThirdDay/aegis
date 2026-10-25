@@ -1,0 +1,17 @@
+[package]
+name = "aegis-agp"
+description = "AGP/1 frame and control-message codec (C-001). Pure, no async runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "aegis-buffer"
+description = "Hierarchical buffer budgets and RAII reservations (B-003)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-contracts = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
