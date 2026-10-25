@@ -91,7 +91,21 @@ impl Host {
             // Brackets around something that is not an IPv6 literal.
             return Err(DestinationError::InvalidCharacter);
         }
-        normalize_domain(input).map(Host::Domain)
+        let name = normalize_domain(input)?;
+        // "1.2.3.4." is an IP literal in disguise: one canonical form only.
+        if let Ok(ip) = name.parse::<IpAddr>() {
+            return Ok(Host::Ip(canonical_ip(ip)));
+        }
+        // A numeric last label ("127.1", "0x7f.1") is read as IPv4 by some
+        // resolvers and by the URL standard; never treat it as a name.
+        let last = name.rsplit('.').next().unwrap_or_default();
+        let hex = last
+            .strip_prefix("0x")
+            .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+        if last.bytes().all(|b| b.is_ascii_digit()) || hex {
+            return Err(DestinationError::InvalidLabel);
+        }
+        Ok(Host::Domain(name))
     }
 
     pub fn is_domain(&self) -> bool {
@@ -190,6 +204,17 @@ mod tests {
             Err(DestinationError::InvalidCharacter)
         );
         assert!(normalize_domain(&"a.".repeat(130)).is_err());
+    }
+
+    #[test]
+    fn numeric_names_are_ips_or_rejected() {
+        let d = Destination::parse_authority("0.3.3.3.:2").expect("trailing-dot IPv4");
+        assert_eq!(d.host, Host::Ip("0.3.3.3".parse().expect("ip")));
+        assert_eq!(Destination::parse_authority(&d.to_string()), Ok(d));
+        for bad in ["127.1:80", "0x7f.1:80", "example.123:80", "1.2.3.4.5:80"] {
+            assert!(Destination::parse_authority(bad).is_err(), "{bad}");
+        }
+        assert!(Destination::parse_authority("123.example:80").is_ok());
     }
 
     #[test]

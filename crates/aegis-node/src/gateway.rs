@@ -155,7 +155,8 @@ async fn read_chunked(io: &mut Box<dyn Duplex>, mut raw: Vec<u8>) -> Option<Vec<
         if size == 0 {
             return Some(out);
         }
-        if out.len() + size > EDGE_MAX_BODY {
+        // Bound the size before arithmetic: a huge hex size must not overflow.
+        if size > EDGE_MAX_BODY - out.len() {
             return None;
         }
         while raw.len() < pos + size + 2 {
@@ -408,4 +409,36 @@ async fn handle_open(
     ));
     let outcome = relay(&mut mux, &mut tcp, idle).await;
     finish_mux(mux, outcome, ctx.obs());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn chunked(raw: &[u8]) -> Option<Vec<u8>> {
+        let (io, _peer) = tokio::io::duplex(64);
+        let mut io: Box<dyn Duplex> = Box::new(io);
+        read_chunked(&mut io, raw.to_vec()).await
+    }
+
+    #[tokio::test]
+    async fn chunked_bodies_decode_and_hostile_sizes_are_refused() {
+        assert_eq!(
+            chunked(b"3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\n\r\n").await,
+            Some(b"abcde".to_vec())
+        );
+        // Unauthenticated input: an enormous chunk size must neither panic
+        // (overflow) nor slip past the body limit.
+        assert_eq!(chunked(b"1\r\nx\r\nffffffffffffffff\r\n").await, None);
+        assert_eq!(
+            chunked(format!("{:x}\r\n", EDGE_MAX_BODY + 1).as_bytes()).await,
+            None
+        );
+        assert_eq!(chunked(b"zz\r\n").await, None);
+        assert_eq!(
+            chunked(b"3\r\nabcXX").await,
+            None,
+            "missing CRLF after data"
+        );
+    }
 }

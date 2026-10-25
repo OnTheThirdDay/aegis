@@ -1,0 +1,83 @@
+# Proposed AegisNet configuration. Illustrative; implementation does not yet exist.
+# Same-host processes only. Use config.container.toml with compose.yaml.
+schema_version = "0.1"
+node_id = "pi-gateway-01"           # operator label: NEVER emitted as raw metric label
+role = "gateway"
+
+[core]
+shutdown_grace_seconds = 15
+max_sessions = 128
+max_streams_per_session = 64
+# These are ceilings, not a promise of simultaneously granting every stream its
+# full buffer. Admission reserves receive credit from peer/process capacity;
+# control and TLS/WS parsing capacity remain reserved under DATA saturation.
+process_buffer_budget_bytes = 33554432
+stream_buffer_budget_bytes = 65536
+fail_closed = true
+
+[management]
+bind = "127.0.0.1:9080"
+remote_access_enabled = false
+authentication = "local-owner"
+config_store = "/var/lib/aegisnet/state.db"
+
+[identity]
+peer_auth = "mutual_tls_1_3"
+server_identity = "secret://identity/server-cert"
+server_private_key = "secret://identity/server-key"
+trusted_client_ca = "secret://identity/client-ca"
+
+[[inbounds]]
+id = "ingress-ws"
+kind = "websocket"
+bind = "127.0.0.1:18080"   # intended for cloudflared same-host ingress
+max_pending_handshakes = 32
+max_frame_bytes = 65536
+
+[[outbounds]]
+id = "public-egress"
+kind = "direct_tcp"
+# deny loopback/link-local/internal ranges for remote clients by default
+restricted_address_policy = "deny-private-and-metadata"
+
+[routing]
+default_outbound = "public-egress"
+default_action = "deny"
+
+[[routing.rules]]
+id = "authorized-users-public-egress"
+match = "authenticated-and-public-destination"
+action = "proxy"
+outbound = "public-egress"
+
+[dns]
+# On a gateway this means the configured egress resolver, not recursively dialing
+# another Aegis gateway. Resolver endpoint/bootstrap routes must be provisioned
+# explicitly before activation; this illustrative file is not a complete profile.
+mode = "remote_required"
+fallback_to_system_resolver = false
+ipv6_policy = "follow-routing-policy"
+
+[telemetry]
+enabled = false
+otlp_export_enabled = false
+logs_to_console = false
+local_metrics_enabled = true # in-memory authenticated health only; not OTel
+sensitive_diagnostics_enabled = false
+profile = "off" # optional explicit admin-controlled coarse_export
+semantic_conventions_version = "1.44.0"
+
+[transport]
+preferred = "websocket"
+h2_experimental = false
+sse_experimental = false
+allow_insecure_fallback = false
+
+[cloudflare]
+mode = "external_tunnel"
+# cloudflared process is separate and managed outside this config
+origin_bind = "127.0.0.1:18080"
+
+[ui]
+enabled = true
+bind = "127.0.0.1:9080"

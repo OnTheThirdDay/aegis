@@ -122,7 +122,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal
-      - run: cargo +nightly install --locked cargo-fuzz --version 0.12.0
+      - run: cargo +nightly install --locked cargo-fuzz --version 0.13.2
       - name: Fuzz each target
         run: |
           secs=60

@@ -180,7 +180,7 @@ fn valid_gateway_and_client_compile() {
 
 #[test]
 fn spec_example_requires_explicit_resolver() {
-    let spec = include_str!("../../../aegis-spec/examples/config.toml");
+    let spec = include_str!("fixtures/spec-config.toml");
     assert_rejected(spec, "dns.resolver must be set explicitly");
 }
 

@@ -443,6 +443,17 @@ impl NodeRuntime {
         ctx.gate.set_admission(false);
         let _ = ctx.shutdown.send(true);
         ctx.sessions.goaway_all();
+        // Client side: outbound tunnels drain and close like inbound sessions.
+        let tunnels: Vec<Arc<client::Tunnel>> = ctx
+            .tunnels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for t in &tunnels {
+            t.goaway().await;
+        }
         let deadline = tokio::time::Instant::now() + grace;
         while ctx.streams_active.load(Ordering::Relaxed) > 0
             && tokio::time::Instant::now() < deadline
@@ -450,6 +461,9 @@ impl NodeRuntime {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         ctx.sessions.close_all(ResetReason::Shutdown);
+        for t in &tunnels {
+            t.close(ResetReason::Shutdown).await;
+        }
         for t in &self.tasks {
             t.abort();
         }

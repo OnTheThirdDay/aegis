@@ -8,7 +8,7 @@ use crate::{now_unix, LoadedIdentity, NodeContext};
 use aegis_buffer::Budget;
 use aegis_config::{secret, InboundConfig, NodeConfig, OutboundConfig, OutboundKind};
 use aegis_contracts::observability::{Event, Observability, OperationResult};
-use aegis_contracts::reason::{OpenFailure, ReasonGroup};
+use aegis_contracts::reason::{OpenFailure, ReasonGroup, ResetReason};
 use aegis_contracts::Destination;
 use aegis_core::{Backoff, CircuitBreaker};
 use aegis_identity::tls;
@@ -98,6 +98,23 @@ impl Tunnel {
             }),
             connected: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Stop new streams on the current session (graceful shutdown).
+    pub(crate) async fn goaway(&self) {
+        if let Some(s) = &self.state.lock().await.session {
+            s.goaway();
+        }
+    }
+
+    /// Close the current session; its streams fail immediately.
+    pub(crate) async fn close(&self, reason: ResetReason) {
+        let mut st = self.state.lock().await;
+        if let Some(s) = st.session.take() {
+            s.close(reason);
+        }
+        self.connected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn connected(&self) -> bool {
@@ -280,11 +297,13 @@ async fn run_relay(ctx: &NodeContext, mut local: TcpStream, mut upstream: Upstre
     }
 }
 
-/// Forward one plain-HTTP request: the rebuilt head and exactly the declared
-/// body go upstream; afterwards only the response flows back (client bytes
-/// are discarded) until the origin closes, so a reused client connection can
-/// never send a second request to this destination. Upgrades relay both
-/// directions.
+/// Forward one plain-HTTP request. The rebuilt head and exactly the declared
+/// body go upstream while the response streams back concurrently (so an
+/// origin's `100 Continue` reaches a client waiting for it). After the body,
+/// further client bytes are discarded, so a reused client connection can
+/// never send a second request to this destination; a client that
+/// half-closes after its request still receives the whole response.
+/// Upgrades relay both directions.
 async fn run_forward(
     ctx: &NodeContext,
     mut local: TcpStream,
@@ -296,37 +315,48 @@ async fn run_forward(
     ctx.obs().record(Event::StreamOpened);
     let _active = ActiveGuard::new(&ctx.streams_active);
     let idle = Duration::from_secs(u64::from(ctx.startup.core.idle_timeout_seconds));
-    let outcome = async {
-        upstream.write_all(&request.head).await?;
-        let first = leftover
-            .len()
-            .min(usize::try_from(request.body_len).unwrap_or(usize::MAX));
-        upstream.write_all(&leftover[..first]).await?;
-        let mut remaining = request.body_len - first as u64;
-        let mut buf = vec![0u8; 16 * 1024];
-        while remaining > 0 {
-            let want = buf
-                .len()
-                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-            let n = tokio::time::timeout(idle, local.read(&mut buf[..want]))
-                .await
-                .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
-            if n == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-            }
-            upstream.write_all(&buf[..n]).await?;
-            remaining -= n as u64;
-        }
-        upstream.flush().await?;
+    let timed_out = || std::io::Error::from(std::io::ErrorKind::TimedOut);
+    let outcome: std::io::Result<Option<RelayOutcome>> = async {
         if request.upgrade {
+            upstream.write_all(&request.head).await?;
+            upstream.write_all(&leftover).await?;
+            upstream.flush().await?;
             return Ok(Some(relay(&mut local, &mut upstream, idle).await));
         }
         let (mut local_read, mut local_write) = local.split();
-        let response = async {
-            loop {
-                let n = tokio::time::timeout(idle, upstream.read(&mut buf))
+        let (mut up_read, mut up_write) = tokio::io::split(&mut upstream);
+        let upload = async {
+            up_write.write_all(&request.head).await?;
+            let first = leftover
+                .len()
+                .min(usize::try_from(request.body_len).unwrap_or(usize::MAX));
+            up_write.write_all(&leftover[..first]).await?;
+            let mut remaining = request.body_len - first as u64;
+            let mut buf = vec![0u8; 16 * 1024];
+            while remaining > 0 {
+                let want = buf
+                    .len()
+                    .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                let n = tokio::time::timeout(idle, local_read.read(&mut buf[..want]))
                     .await
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+                    .map_err(|_| timed_out())??;
+                if n == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                up_write.write_all(&buf[..n]).await?;
+                remaining -= n as u64;
+            }
+            up_write.flush().await?;
+            // Anything after the declared body is never forwarded.
+            while local_read.read(&mut buf).await? != 0 {}
+            Ok::<_, std::io::Error>(())
+        };
+        let download = async {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                let n = tokio::time::timeout(idle, up_read.read(&mut buf))
+                    .await
+                    .map_err(|_| timed_out())??;
                 if n == 0 {
                     break;
                 }
@@ -335,17 +365,18 @@ async fn run_forward(
             local_write.flush().await?;
             Ok::<_, std::io::Error>(())
         };
-        let discard = async {
-            let mut sink = [0u8; 4096];
-            while let Ok(n) = local_read.read(&mut sink).await {
-                if n == 0 {
-                    break;
-                }
+        tokio::pin!(upload, download);
+        let mut uploaded = false;
+        loop {
+            tokio::select! {
+                r = &mut download => return r.map(|_| None),
+                r = &mut upload, if !uploaded => match r {
+                    // The client finished (or half-closed): keep streaming
+                    // the response until the origin closes.
+                    Ok(()) => uploaded = true,
+                    Err(e) => return Err(e),
+                },
             }
-        };
-        tokio::select! {
-            r = response => r.map(|_| None),
-            _ = discard => Ok(None),
         }
     }
     .await;
