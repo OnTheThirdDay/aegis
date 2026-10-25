@@ -1234,3 +1234,111 @@ async fn gateway_limits_cover_pending_agp_and_live_sessions() {
         gw.shutdown(Duration::from_millis(100)).await;
     }
 }
+
+async fn read_request_head(s: &mut TcpStream) {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8];
+        s.read_exact(&mut b).await.expect("head");
+        head.push(b[0]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_forward_relays_100_continue_before_the_body() {
+    let Some(env) = setup().await else { return };
+    let origin = TcpListener::bind(SocketAddr::new(env.echo.ip(), 0))
+        .await
+        .expect("origin");
+    let target = origin.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (mut s, _) = origin.accept().await.expect("accept");
+        read_request_head(&mut s).await;
+        s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .expect("100");
+        let mut b = [0u8];
+        s.read_exact(&mut b).await.expect("body");
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("200");
+    });
+    let mut client = TcpStream::connect(env.client.bound_addr("http").expect("http"))
+        .await
+        .expect("proxy");
+    client
+        .write_all(format!("POST http://{target}/ HTTP/1.1\r\nHost: {target}\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n").as_bytes())
+        .await
+        .expect("request");
+    let mut interim = [0u8; 25];
+    let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut interim))
+        .await
+        .expect("100 Continue forwarded before the body")
+        .expect("read");
+    assert!(interim[..n].starts_with(b"HTTP/1.1 100"));
+    client.write_all(b"x").await.expect("body");
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+        .await
+        .expect("bounded")
+        .expect("response");
+    assert!(String::from_utf8_lossy(&rest).contains("200 OK"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_forward_answers_a_client_that_half_closes() {
+    let Some(env) = setup().await else { return };
+    let origin = TcpListener::bind(SocketAddr::new(env.echo.ip(), 0))
+        .await
+        .expect("origin");
+    let target = origin.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (mut s, _) = origin.accept().await.expect("accept");
+        read_request_head(&mut s).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = s
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+            .await;
+    });
+    let mut client = TcpStream::connect(env.client.bound_addr("http").expect("http"))
+        .await
+        .expect("proxy");
+    client
+        .write_all(format!("GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+        .await
+        .expect("request");
+    client.shutdown().await.expect("half-close");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+        .await
+        .expect("bounded")
+        .expect("response");
+    assert!(response.ends_with(b"OK"), "{response:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_shutdown_closes_existing_tunnel_streams() {
+    let Some(env) = setup().await else { return };
+    let (mut s, reply) = socks_connect(
+        env.client.bound_addr("socks").expect("socks"),
+        &env.echo.to_string(),
+        None,
+    )
+    .await;
+    assert_eq!(reply, 0);
+    s.write_all(b"before").await.expect("write");
+    let mut b = [0u8; 6];
+    s.read_exact(&mut b).await.expect("echo");
+    env.client.shutdown(Duration::ZERO).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let forwarded = async {
+        s.write_all(b"after!").await?;
+        s.read_exact(&mut b).await?;
+        Ok::<_, std::io::Error>(b)
+    };
+    let result = tokio::time::timeout(Duration::from_secs(2), forwarded).await;
+    assert!(
+        !matches!(result, Ok(Ok(_))),
+        "client still forwards through its tunnel after shutdown: {result:?}"
+    );
+}

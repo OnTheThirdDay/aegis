@@ -1,0 +1,368 @@
+registry_name: aegisnet_private_internal_and_coarse_export
+schema_version: '0.3'
+upstream_semconv: 1.44.0
+privacy_default: 'off'
+max_values_per_dimension: 50
+max_series_per_instrument: 1024
+unknown_value: other
+attribute_enums:
+  aegis.platform:
+  - linux
+  - windows
+  - macos
+  - android
+  - ios
+  - other
+  aegis.transport.kind:
+  - websocket
+  - http2
+  - sse_post
+  - direct_tls
+  - other
+  aegis.edge.kind:
+  - cloudflare_proxy
+  - cloudflare_tunnel
+  - direct
+  - other
+  aegis.result:
+  - ok
+  - error
+  - cancelled
+  - denied
+  - timeout
+  - other
+  aegis.direction:
+  - up
+  - down
+  - other
+  aegis.peer.role:
+  - client
+  - gateway
+  - controller
+  - other
+  aegis.signal:
+  - trace
+  - metric
+  - log
+  - other
+  aegis.inbound.kind:
+  - socks5
+  - http_connect
+  - websocket
+  - http2
+  - tun
+  - other
+  aegis.reason.group:
+  - auth
+  - policy
+  - dns
+  - tls
+  - timeout
+  - transport
+  - quota
+  - platform
+  - internal
+  - cancelled
+  - shutdown
+  - other
+  aegis.dns.resolver_kind:
+  - gateway
+  - system_explicit
+  - doh
+  - dot
+  - static
+  - other
+  aegis.route.action:
+  - proxy
+  - direct
+  - deny
+  - other
+  aegis.rule.class:
+  - explicit_deny
+  - privacy
+  - identity
+  - domain
+  - cidr
+  - default
+  - other
+  aegis.pool.class:
+  - receive
+  - transmit
+  - control
+  - handshake
+  - telemetry
+  - other
+  aegis.resource.kind:
+  - buffer
+  - session
+  - stream
+  - socket
+  - task
+  - timer
+  - rate
+  - other
+  aegis.error.group:
+  - auth
+  - policy
+  - dns
+  - tls
+  - timeout
+  - transport
+  - quota
+  - platform
+  - internal
+  - cancelled
+  - other
+  network.transport:
+  - tcp
+  - udp
+  - other
+  aegis.state:
+  - active
+  - inactive
+  - unknown
+  aegis.guard.status:
+  - active
+  - inactive
+  - unknown
+  - unavailable
+  runtime.result:
+  - ok
+  - failed
+  - cancelled
+  - other
+  runtime.reason:
+  - backpressure
+  - capacity
+  - deadline
+  - invalid
+  - other
+standard_export_policy:
+  default: suppress
+  http.server.request.duration: local_diagnostic_only_when_semconv_and_privacy_allow
+  http.client.request.duration: local_diagnostic_only_when_semconv_and_privacy_allow
+  dns.lookup.duration: local_diagnostic_only_when_semconv_and_privacy_allow
+custom_fallbacks:
+  policy: no_standard_name_relabeling
+  default: no_export
+prohibited_export_attributes:
+- aegis.app.name
+- aegis.app.ref
+- aegis.capture.state
+- aegis.destination.host
+- aegis.dns.resolver_kind
+- aegis.edge.kind
+- aegis.guard.status
+- aegis.inbound.kind
+- aegis.peer.role
+- aegis.platform
+- aegis.route.action
+- aegis.rule.id
+- aegis.secret
+- aegis.stream.id
+- aegis.transport.kind
+- aegis.user.email
+- container.id
+- dns.question.name
+- host.id
+- host.name
+- k8s.pod.name
+- network.local.address
+- network.peer.address
+- process.command
+- process.command_args
+- process.command_line
+- process.executable.name
+- process.executable.path
+- process.pid
+- server.address
+- url.full
+- url.path
+- user.id
+otel_default_provider: noop
+autodetect_resources: false
+external_profiles:
+  'off':
+    enabled: false
+    allowed_metrics: []
+    automatic_resource_detectors: false
+  coarse_export:
+    enabled: false
+    enable_requires_explicit_admin_approval: true
+    allowed_metrics:
+    - runtime.work.active
+    - runtime.operation.completed
+    - runtime.buffer.in_use
+    - runtime.telemetry.dropped
+    allowed_resource_attributes:
+    - service.name
+    - telemetry.sdk.name
+    - telemetry.sdk.language
+    - telemetry.sdk.version
+    automatic_resource_detectors: false
+    allowed_signals:
+    - metrics
+internal_metrics:
+- name: aegis.session.active
+  instrument: observable_up_down_counter
+  unit: '{session}'
+  dimensions:
+  - aegis.transport.kind
+  - aegis.peer.role
+- name: aegis.stream.active
+  instrument: observable_up_down_counter
+  unit: '{stream}'
+  dimensions:
+  - aegis.inbound.kind
+  - network.transport
+- name: aegis.stream.open.duration
+  instrument: histogram
+  unit: s
+  dimensions:
+  - aegis.transport.kind
+  - aegis.result
+  boundaries:
+  - 0.005
+  - 0.01
+  - 0.025
+  - 0.05
+  - 0.1
+  - 0.25
+  - 0.5
+  - 1
+  - 2.5
+  - 5
+  - 10
+- name: aegis.stream.closed
+  instrument: counter
+  unit: '{stream}'
+  dimensions:
+  - aegis.result
+  - aegis.reason.group
+- name: aegis.transport.bytes
+  instrument: counter
+  unit: By
+  dimensions:
+  - aegis.transport.kind
+  - aegis.direction
+- name: aegis.transport.reconnects
+  instrument: counter
+  unit: '{reconnect}'
+  dimensions:
+  - aegis.transport.kind
+  - aegis.reason.group
+- name: aegis.transport.handshake.duration
+  instrument: histogram
+  unit: s
+  dimensions:
+  - aegis.transport.kind
+  - aegis.result
+- name: aegis.dns.lookup.duration
+  instrument: histogram
+  unit: s
+  dimensions:
+  - aegis.dns.resolver_kind
+  - aegis.result
+- name: aegis.transport.request.duration
+  instrument: histogram
+  unit: s
+  dimensions:
+  - aegis.transport.kind
+  - aegis.edge.kind
+  - aegis.result
+- name: aegis.management.request.duration
+  instrument: histogram
+  unit: s
+  dimensions:
+  - aegis.result
+- name: aegis.route.decisions
+  instrument: counter
+  unit: '{decision}'
+  dimensions:
+  - aegis.route.action
+  - aegis.rule.class
+- name: aegis.buffer.in_use
+  instrument: observable_gauge
+  unit: By
+  dimensions:
+  - aegis.pool.class
+- name: aegis.resource.throttles
+  instrument: counter
+  unit: '{throttle}'
+  dimensions:
+  - aegis.resource.kind
+  - aegis.reason.group
+- name: aegis.config.activations
+  instrument: counter
+  unit: '{activation}'
+  dimensions:
+  - aegis.result
+- name: aegis.auth.failures
+  instrument: counter
+  unit: '{failure}'
+  dimensions:
+  - aegis.peer.role
+  - aegis.reason.group
+- name: aegis.telemetry.dropped
+  instrument: counter
+  unit: '{item}'
+  dimensions:
+  - aegis.signal
+  - aegis.reason.group
+- name: aegis.edge.errors
+  instrument: counter
+  unit: '{error}'
+  dimensions:
+  - aegis.edge.kind
+  - aegis.error.group
+- name: aegis.capture.state
+  instrument: observable_gauge
+  unit: '1'
+  dimensions:
+  - aegis.state
+- name: aegis.flow.decisions
+  instrument: counter
+  unit: '{flow}'
+  dimensions:
+  - aegis.result
+  - aegis.reason.group
+- name: aegis.capture.errors
+  instrument: counter
+  unit: '{error}'
+  dimensions:
+  - aegis.reason.group
+- name: aegis.identity.unresolved
+  instrument: counter
+  unit: '{flow}'
+  dimensions:
+  - aegis.result
+- name: aegis.guard.state
+  instrument: observable_gauge
+  unit: '1'
+  dimensions:
+  - aegis.guard.status
+- name: aegis.host.reconciliations
+  instrument: counter
+  unit: '{reconciliation}'
+  dimensions:
+  - aegis.result
+coarse_export_metrics:
+- name: runtime.work.active
+  instrument: observable_gauge
+  unit: '{item}'
+  dimensions: []
+- name: runtime.operation.completed
+  instrument: counter
+  unit: '{operation}'
+  dimensions:
+  - runtime.result
+- name: runtime.buffer.in_use
+  instrument: observable_gauge
+  unit: By
+  dimensions: []
+- name: runtime.telemetry.dropped
+  instrument: counter
+  unit: '{item}'
+  dimensions:
+  - runtime.reason
+local_only: true
