@@ -51,6 +51,28 @@ pub fn handle(ctx: &ManagementContext, req: &Value) -> Value {
         return err("missing cmd");
     };
     match cmd {
+        "config_inspect" => match ctx.coord.gate().current() {
+            Some(bundle) => ok(
+                json!({"revision_id":bundle.revision_id,"digest":bundle.digest,"specification":aegis_config::to_json(&bundle.compiled.config)}),
+            ),
+            None => err("no_active_configuration"),
+        },
+        "certificate_reload" => {
+            let reload = ctx
+                .certificate_reload
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match reload.map(|f| f()) {
+                Some(Ok(())) => ok(
+                    json!({"reloaded":true,"existing_sessions":"retain established TLS; revocation affects all"}),
+                ),
+                Some(Err(_)) => err("replacement_identity_rejected"),
+                None => err("certificate_reload_unavailable"),
+            }
+        }
+        "config_apply" => config_apply(ctx, req),
+        "identity_register" => identity_register(ctx, req),
         "health" => ok(serde_json::to_value(ctx.coord.health()).unwrap_or(Value::Null)),
         "bootstrap_token" => match ctx.create_bootstrap_token() {
             Ok((token, expires)) => {
@@ -151,5 +173,326 @@ pub fn handle(ctx: &ManagementContext, req: &Value) -> Value {
             ok(serde_json::to_value(ctx.metrics.snapshot((ctx.gauges)())).unwrap_or(Value::Null))
         }
         _ => err("unknown cmd"),
+    }
+}
+
+fn config_apply(ctx: &ManagementContext, req: &Value) -> Value {
+    let Some(spec) = req.get("specification") else {
+        return err("specification required");
+    };
+    let Ok(cfg) = aegis_config::parse_json(spec) else {
+        return err("invalid_configuration");
+    };
+    let Some(active) = ctx.coord.gate().current() else {
+        return err("no_active_configuration");
+    };
+    let digest = aegis_config::config_digest(&cfg);
+    if digest == active.digest {
+        return ok(json!({"applied":true,"revision_id":active.revision_id}));
+    }
+    if req["expected_revision"].as_str() != Some(active.revision_id.as_str()) {
+        return err("stale_config_revision");
+    }
+    if !aegis_config::security_diff(Some(&active.compiled.config), &cfg)
+        .restart_required
+        .is_empty()
+    {
+        return err("restart_required");
+    }
+    let result = (|| {
+        let profile = ctx
+            .coord
+            .store()
+            .read(|c| aegis_storage::get_profile(c, &active.profile_id))?;
+        let p = ctx
+            .coord
+            .patch_profile(None, &profile.id, &profile.etag(), None, Some(spec))?;
+        let validation = ctx
+            .coord
+            .validate(None, &p.id, &p.etag(), &p.desired_revision_id)?;
+        if !validation.valid {
+            return Err(aegis_core::CoordinatorError::Invalid(validation.errors));
+        }
+        let key = s(req, "operation_key").ok_or(aegis_core::CoordinatorError::Conflict(
+            "operation_key required",
+        ))?;
+        let job = ctx.coord.submit_activation(
+            &aegis_core::ActivateRequest {
+                actor_id: None,
+                profile_id: p.id.clone(),
+                if_match: p.etag(),
+                idempotency_key: key.into(),
+                target_revision_id: p.desired_revision_id,
+                config_digest: validation.config_digest,
+                validation_id: validation.validation_id,
+            },
+            &format!("/local/profiles/{}/activate", p.id),
+        )?;
+        ctx.coord.run_job(&job.id)
+    })();
+    match result {
+        Ok(job) => ok(
+            json!({"applied":job.status=="succeeded","job_id":job.id,"revision_id":job.result_revision_id}),
+        ),
+        Err(_) => err("configuration_activation_failed"),
+    }
+}
+
+/// Authenticated local forwarding to the same REST router. This makes every
+/// management API usable through Docker exec on Mac without publishing an
+/// admin port or adding a privileged management network bridge.
+pub async fn dispatch(ctx: std::sync::Arc<ManagementContext>, req: Value) -> Value {
+    if s(&req, "cmd") != Some("api") {
+        return tokio::task::spawn_blocking(move || handle(&ctx, &req))
+            .await
+            .unwrap_or_else(|_| err("internal"));
+    }
+    use tower::ServiceExt;
+    let Some(path) = s(&req, "path").filter(|p| p.starts_with("/api/v1/") && p.len() <= 2048)
+    else {
+        return err("invalid_api_path");
+    };
+    let method = s(&req, "method").unwrap_or("GET");
+    let mut request = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", format!("127.0.0.1:{}", ctx.bind.port()))
+        .header("content-type", "application/json");
+    if !matches!(
+        path,
+        "/api/v1/bootstrap/claim" | "/api/v1/nodes/enrollment/redeem" | "/api/v1/auth/login"
+    ) {
+        let token = match ctx.mint_bearer(None, Duration::from_secs(60)) {
+            Ok((token, _)) => token,
+            Err(_) => return err("owner_bootstrap_required"),
+        };
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(headers) = req["headers"].as_object() {
+        for name in [
+            "if-match",
+            "idempotency-key",
+            "x-aegis-export-preview-digest",
+        ] {
+            if let Some(value) = headers.get(name).and_then(Value::as_str) {
+                request = request.header(name, value);
+            }
+        }
+    }
+    let body = req
+        .get("body")
+        .filter(|v| !v.is_null())
+        .map(Value::to_string)
+        .unwrap_or_default();
+    let Ok(request) = request.body(axum::body::Body::from(body)) else {
+        return err("invalid_api_request");
+    };
+    let response = match crate::router(ctx).oneshot(request).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    };
+    let status = response.status().as_u16();
+    let headers: serde_json::Map<String, Value> = response
+        .headers()
+        .iter()
+        .filter(|(k, _)| matches!(k.as_str(), "etag" | "location" | "retry-after"))
+        .filter_map(|(k, v)| Some((k.as_str().into(), json!(v.to_str().ok()?))))
+        .collect();
+    let Ok(bytes) = axum::body::to_bytes(response.into_body(), 1024 * 1024).await else {
+        return err("api_response_limit");
+    };
+    ok(
+        json!({"status":status,"headers":headers,"body":serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)}),
+    )
+}
+
+#[cfg(unix)]
+pub async fn serve(
+    ctx: std::sync::Arc<ManagementContext>,
+    path: std::path::PathBuf,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.file_type().is_socket() {
+            return Err(std::io::Error::other("IPC path is not an owned socket"));
+        }
+        if tokio::net::UnixStream::connect(&path).await.is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "IPC is already serving",
+            ));
+        }
+        std::fs::remove_file(&path)?;
+    }
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let owner = std::fs::metadata(&path)?.uid();
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let Ok(permit) = std::sync::Arc::clone(&slots).try_acquire_owned() else {
+            continue;
+        };
+        if !stream.peer_cred().is_ok_and(|p| p.uid() == owner) {
+            continue;
+        }
+        let ctx = std::sync::Arc::clone(&ctx);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut chunk).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.len() > MAX_REQUEST {
+                        return Err(std::io::Error::other("request limit"));
+                    }
+                    if bytes.contains(&b'\n') {
+                        break;
+                    }
+                }
+                Ok(bytes)
+            })
+            .await;
+            let Ok(Ok(bytes)) = result else {
+                return;
+            };
+            let Ok(req) = serde_json::from_slice(bytes.trim_ascii()) else {
+                return;
+            };
+            let response = dispatch(ctx, req).await;
+            let Ok(mut bytes) = serde_json::to_vec(&response) else {
+                return;
+            };
+            bytes.push(b'\n');
+            let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(&bytes)).await;
+        });
+    }
+}
+
+fn identity_register(ctx: &ManagementContext, req: &Value) -> Value {
+    let Some(cert) = s(req, "certificate_pem") else {
+        return err("certificate_required");
+    };
+    if cert.len() > 64 * 1024 {
+        return err("certificate_too_large");
+    }
+    let result = (|| -> Result<_, String> {
+        let bundle = ctx
+            .coord
+            .gate()
+            .current()
+            .ok_or("configuration_unavailable")?;
+        let ca = bundle
+            .compiled
+            .config
+            .identity
+            .trusted_client_ca
+            .as_ref()
+            .ok_or("client_ca_unavailable")?;
+        let ca = aegis_config::secret::read(&ctx.secrets_dir, ca)
+            .map_err(|_| "client_ca_unavailable")?;
+        let peer = aegis_identity::tls::validate_client_certificate(cert, &ca)
+            .map_err(|_| "invalid_device_certificate")?;
+        let node_id = ctx
+            .coord
+            .store()
+            .tx(|c| {
+                if let Some(existing) = aegis_storage::get_node_by_name(c, &peer.node_id)? {
+                    if existing.status != "active" || existing.role != "client" {
+                        return Err(aegis_storage::StoreError::Conflict(
+                            "identity_requires_approved_renewal".into(),
+                        ));
+                    }
+                    if existing.cert_fingerprint.as_deref() != Some(peer.fingerprint_hex().as_str())
+                    {
+                        if req["replace"] != true {
+                            return Err(aegis_storage::StoreError::Conflict(
+                                "identity_requires_approved_renewal".into(),
+                            ));
+                        }
+                        aegis_storage::rotate_node_certificate(
+                            c,
+                            &existing.id,
+                            &peer.fingerprint_hex(),
+                            &peer.serial_hex,
+                            peer.not_after,
+                        )?;
+                        aegis_storage::insert_identity(
+                            c,
+                            &peer.fingerprint_hex(),
+                            &existing.id,
+                            &peer.serial_hex,
+                            peer.not_before,
+                            peer.not_after,
+                        )?;
+                        aegis_storage::bump_epoch(c)?;
+                        aegis_storage::append_audit(
+                            c,
+                            aegis_storage::AuditInsert {
+                                actor_id: None,
+                                action: "identity.local_renew",
+                                target_type: "node",
+                                target_id: Some(&existing.id),
+                                decision: "allowed",
+                                revision_digest: None,
+                                metadata: json!({"identity_version":1}),
+                            },
+                        )?;
+                    }
+                    return Ok(existing.id);
+                }
+                let id = aegis_storage::new_id();
+                aegis_storage::insert_node(
+                    c,
+                    &aegis_storage::NodeRow {
+                        id: id.clone(),
+                        name: peer.node_id.clone(),
+                        role: "client".into(),
+                        cert_fingerprint: Some(peer.fingerprint_hex()),
+                        cert_serial: Some(peer.serial_hex.clone()),
+                        status: "active".into(),
+                        generation: 1,
+                        not_after: Some(peer.not_after),
+                        created_at: aegis_storage::now_unix(),
+                    },
+                )?;
+                aegis_storage::insert_identity(
+                    c,
+                    &peer.fingerprint_hex(),
+                    &id,
+                    &peer.serial_hex,
+                    peer.not_before,
+                    peer.not_after,
+                )?;
+                aegis_storage::bump_epoch(c)?;
+                aegis_storage::append_audit(
+                    c,
+                    aegis_storage::AuditInsert {
+                        actor_id: None,
+                        action: "identity.local_register",
+                        target_type: "node",
+                        target_id: Some(&id),
+                        decision: "allowed",
+                        revision_digest: None,
+                        metadata: json!({"identity_version":if peer.san_identity{1}else{0}}),
+                    },
+                )?;
+                Ok(id)
+            })
+            .map_err(|_| "identity_registration_conflict")?;
+        ctx.coord
+            .refresh_identities()
+            .map_err(|_| "identity_publication_failed")?;
+        Ok(json!({"node_id":node_id,"expires_at":aegis_core::rfc3339(peer.not_after)}))
+    })();
+    match result {
+        Ok(v) => ok(v),
+        Err(code) => err(code),
     }
 }

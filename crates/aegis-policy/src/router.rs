@@ -396,6 +396,11 @@ impl Router {
                         return false;
                     }
                 }
+                // A name-scoped rule provisionally satisfies its CIDR
+                // constraint before resolution; check_resolved re-verifies
+                // every dialed address against this same rule. CIDR-only
+                // rules never match an unresolved name.
+                None if m.has_name_criteria() => {}
                 None => return false,
             }
         }
@@ -492,12 +497,24 @@ impl Router {
         }
         for &i in &self.deny_rules {
             let r = &self.rules[i];
-            if !r.spec.matcher.cidrs.is_empty() && Self::matches(&r.spec.matcher, input, Some(ip)) {
+            if Self::matches(&r.spec.matcher, input, Some(ip)) {
                 return Err(RouteDecision::deny(
                     Some(r.spec.id.clone()),
                     RuleClass::ExplicitDeny,
                 ));
             }
+        }
+        // DNS must not broaden the rule that authorized admission. In
+        // particular, an unresolved name only provisionally satisfies a
+        // public_destination constraint, even when another rule/outbound
+        // permits private addresses. Do not fall back to a different allow
+        // rule (and potentially a different outbound) after resolution.
+        if let Some(r) = self.best_allow(input) {
+            if !Self::matches(&r.spec.matcher, input, Some(ip)) {
+                return Err(RouteDecision::deny(Some(r.spec.id.clone()), r.class));
+            }
+        } else if self.default_action == RouteAction::Deny {
+            return Err(self.default_decision());
         }
         Ok(())
     }
@@ -668,6 +685,52 @@ mod tests {
     }
 
     #[test]
+    fn name_scoped_cidr_is_provisional_until_resolution() {
+        let r = Router::compile(
+            vec![
+                rule(
+                    "lan-cidr",
+                    RouteAction::Proxy,
+                    Matcher {
+                        cidrs: vec!["10.0.0.0/8".parse().expect("net")],
+                        ..Default::default()
+                    },
+                ),
+                rule(
+                    "nas",
+                    RouteAction::Proxy,
+                    Matcher {
+                        domains: vec!["nas.lan.test".into()],
+                        cidrs: vec!["10.0.0.5/32".parse().expect("net")],
+                        ..Default::default()
+                    },
+                ),
+            ],
+            RouteAction::Deny,
+            Some("egress".into()),
+            AddressPolicy::AllowPrivate,
+            &outbounds(),
+        )
+        .expect("compile");
+        let d = dest("nas.lan.test:443");
+        assert_eq!(r.decide(&input(&d)).rule_id.as_deref(), Some("nas"));
+        assert!(r
+            .check_resolved(&input(&d), "10.0.0.5".parse().expect("ip"))
+            .is_ok());
+        assert!(
+            r.check_resolved(&input(&d), "10.0.0.6".parse().expect("ip"))
+                .is_err(),
+            "resolution outside the rule's CIDR fails closed"
+        );
+        let d = dest("other.lan.test:443");
+        assert_eq!(
+            r.decide(&input(&d)).action,
+            RouteAction::Deny,
+            "CIDR-only rules never authorize an unresolved name"
+        );
+    }
+
+    #[test]
     fn node_scoped_rules() {
         let r = compile(
             vec![rule(
@@ -728,6 +791,69 @@ mod tests {
             .check_resolved(&i, "203.0.113.9".parse().expect("ip"))
             .is_err());
         assert_eq!(r.explain(&i).action, ExplainAction::Indeterminate);
+    }
+
+    #[test]
+    fn public_rule_is_revalidated_with_private_egress_enabled() {
+        let router = Router::compile(
+            vec![
+                rule(
+                    "public",
+                    RouteAction::Proxy,
+                    Matcher {
+                        public_destination: true,
+                        ..Default::default()
+                    },
+                ),
+                rule(
+                    "private-ip",
+                    RouteAction::Proxy,
+                    Matcher {
+                        cidrs: vec!["10.0.0.0/8".parse().expect("net")],
+                        ..Default::default()
+                    },
+                ),
+                rule(
+                    "private-name",
+                    RouteAction::Proxy,
+                    Matcher {
+                        domains: vec!["internal.example".into()],
+                        ..Default::default()
+                    },
+                ),
+            ],
+            RouteAction::Deny,
+            None,
+            AddressPolicy::AllowPrivate,
+            &outbounds(),
+        )
+        .expect("router");
+        for name in ["rebind.example", "10.250.0.1"] {
+            let destination = Destination {
+                host: Host::Domain(name.into()),
+                port: 443,
+            };
+            let request = input(&destination);
+            assert_eq!(router.decide(&request).rule_id.as_deref(), Some("public"));
+            assert!(router
+                .check_resolved(&request, "93.184.216.34".parse().expect("ip"))
+                .is_ok());
+            for private in ["10.250.0.1", "192.168.1.1", "fd00::1", "::ffff:10.250.0.1"] {
+                assert!(
+                    router
+                        .check_resolved(&request, private.parse().expect("ip"))
+                        .is_err(),
+                    "public rule must reject {name} resolving to {private}"
+                );
+            }
+        }
+        // An explicit private exception remains usable when it was the
+        // actual admission rule, rather than a post-DNS fallback.
+        for destination in [dest("internal.example:443"), dest("10.250.0.1:443")] {
+            assert!(router
+                .check_resolved(&input(&destination), "10.250.0.1".parse().expect("ip"))
+                .is_ok());
+        }
     }
 
     #[test]

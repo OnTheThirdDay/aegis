@@ -10,6 +10,7 @@ mod client;
 mod egress;
 mod gateway;
 pub mod modules;
+mod outer_tls;
 pub mod relay;
 mod sessions;
 
@@ -35,9 +36,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 /// Stable, secret-free startup failure codes (the only console output a
@@ -79,11 +80,25 @@ impl std::fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
+/// Plain HTTP requests the gateway's public edge answers besides the
+/// WebSocket upgrade (device enrollment and self-renewal). The handler is
+/// installed by the composition root; without one the edge only upgrades.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeRequest {
+    Enroll,
+    Renew,
+}
+
+pub type EdgeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = (u16, Vec<u8>)> + Send>>;
+pub type EdgeHook = Arc<dyn Fn(EdgeRequest, Vec<u8>) -> EdgeFuture + Send + Sync>;
+
 /// Identity material loaded from secrets.
+#[derive(Clone)]
 pub(crate) struct LoadedIdentity {
     pub server_tls: Option<Arc<rustls::ServerConfig>>,
     pub client_tls: Option<Arc<rustls::ClientConfig>>,
     pub ca: Option<CaBundle>,
+    pub trust_digest: String,
 }
 
 pub struct NodeContext {
@@ -101,13 +116,57 @@ pub struct NodeContext {
     pub startup: NodeConfig,
     /// Local CA used to sign enrollment CSRs (gateway only).
     pub ca: Option<CaBundle>,
-    pub(crate) identity: LoadedIdentity,
-    pub(crate) tunnels: HashMap<String, Arc<client::Tunnel>>,
+    pub(crate) identity: RwLock<LoadedIdentity>,
+    pub(crate) outer_tls: HashMap<String, Arc<outer_tls::ReloadingTls>>,
+    pub(crate) tunnels: Mutex<HashMap<String, Arc<client::Tunnel>>>,
+    tunnel_update: tokio::sync::Mutex<()>,
+    /// Process-wide reservations include authenticated AGP handshakes.
+    session_slots: Arc<Semaphore>,
     resolver_cache: Mutex<Option<(String, Arc<Resolver>)>>,
     shutdown: watch::Sender<bool>,
+    pub(crate) edge_hook: std::sync::OnceLock<EdgeHook>,
 }
 
 impl NodeContext {
+    /// Install the enrollment/renewal handler for the public edge (once).
+    pub fn set_edge_hook(&self, hook: EdgeHook) {
+        let _ = self.edge_hook.set(hook);
+    }
+
+    /// Validate replacements before publishing TLS state. Existing sessions
+    /// keep established TLS; future client sessions use the replacement.
+    pub fn reload_certificates(&self) -> Result<(), String> {
+        let cfg = self
+            .gate
+            .current()
+            .ok_or("configuration_unavailable")?
+            .compiled
+            .config
+            .clone();
+        let loaded = load_identity(
+            &cfg,
+            &self.secrets_dir,
+            Arc::clone(self.gate.identity_store()),
+        )
+        .map_err(|_| "replacement_identity_rejected")?;
+        let mut identity = self.identity.write().unwrap_or_else(|e| e.into_inner());
+        if identity.trust_digest != loaded.trust_digest {
+            self.sessions.close_all(ResetReason::PolicyRevoked);
+        }
+        *identity = loaded;
+        self.tunnels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        Ok(())
+    }
+    pub fn current_ca(&self) -> Option<CaBundle> {
+        self.identity
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ca
+            .clone()
+    }
     pub fn obs(&self) -> &dyn Observability {
         self.metrics.as_ref()
     }
@@ -116,7 +175,13 @@ impl NodeContext {
     pub fn gauges(&self) -> CoreGauges {
         CoreGauges {
             sessions_active: self.sessions.count() as u64
-                + self.tunnels.values().filter(|t| t.connected()).count() as u64,
+                + self
+                    .tunnels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .filter(|t| t.connected())
+                    .count() as u64,
             streams_active: self.streams_active.load(Ordering::Relaxed),
             buffer_receive: self.budget.class_used(PoolClass::Receive),
             buffer_transmit: self.budget.class_used(PoolClass::Transmit),
@@ -139,6 +204,57 @@ impl NodeContext {
             keepalive_timeout: Duration::from_secs(u64::from(c.keepalive_interval_seconds).max(10)),
             ..SessionConfig::default()
         }
+    }
+
+    /// Select a tunnel from the admitted outbound, never just its ID. Build
+    /// replacements off the async workers and retain existing streams on
+    /// their old session until they finish. Identity/budget changes still
+    /// use the startup values until the documented restart.
+    pub(crate) async fn tunnel_for(
+        &self,
+        outbound: &aegis_config::OutboundConfig,
+        cfg: &NodeConfig,
+    ) -> Result<Arc<client::Tunnel>, aegis_contracts::reason::OpenFailure> {
+        let cached = || {
+            self.tunnels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&outbound.id)
+                .filter(|t| t.matches(outbound))
+                .cloned()
+        };
+        if let Some(t) = cached() {
+            return Ok(t);
+        }
+        let _update = self.tunnel_update.lock().await;
+        if let Some(t) = cached() {
+            return Ok(t);
+        }
+        let ob = outbound.clone();
+        let startup = self.startup.clone();
+        let secrets = self.secrets_dir.clone();
+        let identity = self
+            .identity
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let budget = Arc::clone(&self.budget);
+        let metrics = Arc::clone(&self.metrics);
+        let tunnel = tokio::task::spawn_blocking(move || {
+            client::Tunnel::new(&ob, &startup, &secrets, &identity, &budget, metrics)
+        })
+        .await
+        .map_err(|_| aegis_contracts::reason::OpenFailure::Unavailable)?
+        .map_err(|_| aegis_contracts::reason::OpenFailure::Unavailable)?;
+        let tunnel = Arc::new(tunnel);
+        let mut cache = self.tunnels.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|id, _| {
+            cfg.outbounds
+                .iter()
+                .any(|ob| ob.id == *id && ob.kind == aegis_config::OutboundKind::AgpTunnel)
+        });
+        cache.insert(outbound.id.clone(), Arc::clone(&tunnel));
+        Ok(tunnel)
     }
 
     /// Resolver for a bundle's DNS policy; `None` when this node must never
@@ -212,33 +328,86 @@ fn load_identity(
 ) -> Result<LoadedIdentity, StartError> {
     let id = &cfg.identity;
     let ie = |e: aegis_identity::IdentityError| StartError::Identity(e.to_string());
+    let material = |cert: &Option<String>,
+                    key: &Option<String>,
+                    bundle: &Option<String>|
+     -> Result<(String, String), StartError> {
+        if let Some(bundle) = bundle {
+            let text = secret::read(dir, bundle)
+                .map_err(|_| StartError::Identity("identity bundle unavailable".into()))?;
+            let manifest: outer_tls::Bundle = serde_json::from_str(&text)
+                .map_err(|_| StartError::Identity("identity bundle invalid".into()))?;
+            Ok((
+                secret::read(dir, &manifest.certificate)
+                    .map_err(|_| StartError::Identity("certificate unavailable".into()))?,
+                secret::read(dir, &manifest.private_key)
+                    .map_err(|_| StartError::Identity("key unavailable".into()))?,
+            ))
+        } else {
+            Ok((
+                read_secret(dir, "identity.certificate", cert)?,
+                read_secret(dir, "identity.private_key", key)?,
+            ))
+        }
+    };
+    let validate_leaf = |cert: &str| -> Result<(), StartError> {
+        let certs = aegis_identity::tls::parse_certs(cert).map_err(ie)?;
+        let peer = aegis_identity::PeerIdentity::from_der(certs[0].as_ref()).map_err(ie)?;
+        if peer.node_id != cfg.node_id
+            || peer.role != Some(cfg.role)
+            || peer.is_expired_at(now_unix())
+        {
+            return Err(StartError::Identity(
+                "local certificate identity or validity rejected".into(),
+            ));
+        }
+        Ok(())
+    };
     match cfg.role {
         Role::Gateway => {
-            let cert = read_secret(dir, "identity.server_identity", &id.server_identity)?;
-            let key = read_secret(dir, "identity.server_private_key", &id.server_private_key)?;
+            let (cert, key) = material(
+                &id.server_identity,
+                &id.server_private_key,
+                &id.material_bundle,
+            )?;
+            validate_leaf(&cert)?;
             let ca = read_secret(dir, "identity.trusted_client_ca", &id.trusted_client_ca)?;
             let server_tls = aegis_identity::server_config(&cert, &key, &ca, store).map_err(ie)?;
-            let ca_bundle = match (&id.ca_certificate, &id.ca_private_key) {
-                (Some(_), Some(_)) => Some(CaBundle {
-                    cert_pem: read_secret(dir, "identity.ca_certificate", &id.ca_certificate)?,
-                    key_pem: read_secret(dir, "identity.ca_private_key", &id.ca_private_key)?,
-                }),
-                _ => None,
+            let ca_bundle = if id.issuer_bundle.is_some() {
+                let (cert_pem, key_pem) = material(&None, &None, &id.issuer_bundle)?;
+                Some(CaBundle { cert_pem, key_pem })
+            } else {
+                match (&id.ca_certificate, &id.ca_private_key) {
+                    (Some(_), Some(_)) => Some(CaBundle {
+                        cert_pem: read_secret(dir, "identity.ca_certificate", &id.ca_certificate)?,
+                        key_pem: read_secret(dir, "identity.ca_private_key", &id.ca_private_key)?,
+                    }),
+                    _ => None,
+                }
             };
+            if let Some(ca) = &ca_bundle {
+                aegis_identity::pki::validate_issuer(ca).map_err(ie)?;
+            }
             Ok(LoadedIdentity {
                 server_tls: Some(server_tls),
                 client_tls: None,
                 ca: ca_bundle,
+                trust_digest: aegis_storage::sha256_hex(ca.as_bytes()),
             })
         }
         Role::Client => {
-            let cert = read_secret(dir, "identity.client_identity", &id.client_identity)?;
-            let key = read_secret(dir, "identity.client_private_key", &id.client_private_key)?;
+            let (cert, key) = material(
+                &id.client_identity,
+                &id.client_private_key,
+                &id.material_bundle,
+            )?;
+            validate_leaf(&cert)?;
             let ca = read_secret(dir, "identity.trusted_server_ca", &id.trusted_server_ca)?;
             Ok(LoadedIdentity {
                 server_tls: None,
                 client_tls: Some(aegis_identity::client_config(&cert, &key, &ca).map_err(ie)?),
                 ca: None,
+                trust_digest: aegis_storage::sha256_hex(ca.as_bytes()),
             })
         }
     }
@@ -359,6 +528,16 @@ pub async fn start(opts: StartOptions) -> Result<NodeRuntime, StartError> {
     }
     let secrets_dir = PathBuf::from(&active.secrets.dir);
     let identity = load_identity(&active, &secrets_dir, Arc::clone(&identity_store))?;
+    let mut outer_tls = HashMap::new();
+    for inbound in &active.inbounds {
+        if let Some(settings) = &inbound.outer_tls {
+            outer_tls.insert(
+                inbound.id.clone(),
+                outer_tls::ReloadingTls::new(secrets_dir.clone(), settings.clone())
+                    .map_err(StartError::Identity)?,
+            );
+        }
+    }
     let budget = Budget::root(active.core.process_buffer_budget_bytes);
     let (shutdown, _) = watch::channel(false);
     let sessions = Arc::new(SessionRegistry::default());
@@ -393,10 +572,14 @@ pub async fn start(opts: StartOptions) -> Result<NodeRuntime, StartError> {
         secrets_dir,
         startup: active.clone(),
         ca,
-        identity,
-        tunnels,
+        identity: RwLock::new(identity),
+        outer_tls,
+        tunnels: Mutex::new(tunnels),
+        tunnel_update: tokio::sync::Mutex::new(()),
+        session_slots: Arc::new(Semaphore::new(active.core.max_sessions as usize)),
         resolver_cache: Mutex::new(None),
         shutdown,
+        edge_hook: std::sync::OnceLock::new(),
     });
     {
         let sessions = Arc::clone(&sessions);

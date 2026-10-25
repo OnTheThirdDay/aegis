@@ -1,4 +1,9 @@
-# PR / main / nightly gates (06 §2, 07 §11). Reference implementation only:
+# Branch / nightly gates (06 §2, 07 §11). Branch flow (docs/RELEASING.md):
+#   work branches -> staging -> main, by pull request only. Every branch push
+#   runs the full gates; pull request events only run branch-policy. main
+#   additionally verifies its content already passed through staging.
+#
+# Reference implementation only:
 # protected environments, Pi/CF lab runners and signing are NOT configured
 # here and remain BLOCKED until provisioned.
 #
@@ -9,7 +14,6 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -27,6 +31,7 @@ env:
 
 jobs:
   lint:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
@@ -41,6 +46,7 @@ jobs:
           cargo run --locked -q -p xtask -- arch-check --self-test
 
   test-linux-x86_64:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
@@ -55,6 +61,7 @@ jobs:
         run: cargo test --locked -p aegis-agp --release
 
   cross-linux-aarch64:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
@@ -69,7 +76,8 @@ jobs:
         run: cargo build --locked --target aarch64-unknown-linux-gnu -p aegisd -p aegisctl
 
   build-probes:
-    # Windows/macOS are compile probes only at M1 (no functional claim).
+    # Windows/macOS compile probes (the client app is built for real by release.yml).
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -82,15 +90,17 @@ jobs:
       - run: cargo check --locked --workspace
 
   supply-chain:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
         with:
           persist-credentials: false
-      - run: cargo install --locked cargo-deny --version 0.18.3
+      - run: cargo install --locked cargo-deny --version 0.20.2
       - run: cargo deny --locked check advisories bans licenses sources
 
   audit:
+    if: github.event_name != 'pull_request'
     # RustSec advisories for direct + transitive deps (TC-S01). Runs on every
     # PR/push and nightly, so advisories published after merge still fail
     # the scheduled run. Unmaintained/yanked warnings are errors.
@@ -104,6 +114,7 @@ jobs:
       - run: cargo audit --deny warnings --file fuzz/Cargo.lock
 
   fuzz-smoke:
+    if: github.event_name != 'pull_request'
     # PR: 60 s per parser target (07 §11). Requires nightly + cargo-fuzz.
     runs-on: ubuntu-24.04
     steps:
@@ -120,10 +131,45 @@ jobs:
             cargo +nightly fuzz run "$t" -- -max_total_time=$secs -rss_limit_mb=2048
           done
 
+  branch-policy:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Only staging may be merged into main
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+        run: |
+          if [ "$BASE" = main ] && [ "$HEAD" != staging ]; then
+            echo "::error::Pull requests into main must come from staging (got '$HEAD'). Merge into staging first."
+            exit 1
+          fi
+          echo "OK: $HEAD -> $BASE"
+
+  main-gate:
+    # Rulesets need a paid plan for private repos, so main enforces the flow
+    # itself: its file tree must equal a commit that exists on staging.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify main only contains staged content
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          if git log origin/staging --format=%T | grep -qx "$tree"; then
+            echo "OK: this exact content exists on staging"
+          else
+            echo "::error::main contains changes that never went through staging. Merge them into staging, then use the release pull request staging -> main."
+            exit 1
+          fi
+
   required:
     # Aggregate gate: fails if any required child failed, was cancelled or
     # skipped. A missing result is never an implicit pass.
-    if: always()
+    if: always() && github.event_name != 'pull_request'
     needs: [lint, test-linux-x86_64, cross-linux-aarch64, build-probes, supply-chain, audit, fuzz-smoke]
     runs-on: ubuntu-24.04
     steps:
@@ -133,3 +179,28 @@ jobs:
         run: |
           echo "$RESULTS"
           if echo "$RESULTS" | grep -qE '"(failure|cancelled|skipped)"'; then exit 1; fi
+
+  # After a release reaches main, move staging up to main so GitHub doesn't
+  # report staging as "behind" by the release merge commit. Fast-forward only;
+  # staging with new work is left alone. GITHUB_TOKEN pushes trigger nothing.
+  sync-staging:
+    needs: [required, main-gate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Fast-forward staging to main
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse origin/staging)" = "$(git rev-parse origin/main)" ]; then
+            echo "staging is already at main."
+          elif git merge-base --is-ancestor origin/staging origin/main; then
+            git push origin "$(git rev-parse origin/main):refs/heads/staging"
+            echo "Fast-forwarded staging to $(git rev-parse --short origin/main)."
+          else
+            echo "staging has commits that aren't on main yet; leaving it as is."
+          fi

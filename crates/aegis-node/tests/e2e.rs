@@ -15,6 +15,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,7 +50,12 @@ async fn echo_server(ip: IpAddr) -> SocketAddr {
 fn write(dir: &Path, rel: &str, content: &str) {
     let p = dir.join(rel);
     std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
-    std::fs::write(p, content).expect("write");
+    std::fs::write(&p, content).expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    }
 }
 
 struct Pki {
@@ -314,6 +320,422 @@ async fn echo_roundtrip(mut s: TcpStream, size: usize) {
     assert_eq!(Sha256::digest(&got), expected, "byte-exact transfer");
 }
 
+async fn controlled_dns(ip: std::net::Ipv4Addr) -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("DNS bind");
+    let address = socket.local_addr().expect("DNS address");
+    tokio::spawn(async move {
+        let mut bytes = [0u8; 512];
+        loop {
+            let Ok((n, peer)) = socket.recv_from(&mut bytes).await else {
+                return;
+            };
+            if n < 17 {
+                continue;
+            }
+            let mut end = 12usize;
+            while end < n && bytes[end] != 0 {
+                end += 1 + usize::from(bytes[end]);
+            }
+            if end + 5 > n {
+                continue;
+            }
+            let qtype = u16::from_be_bytes([bytes[end + 1], bytes[end + 2]]);
+            let answer = qtype == 1;
+            let mut response = bytes[..2].to_vec();
+            response.extend_from_slice(&[0x81, 0x80, 0, 1, 0, u8::from(answer), 0, 0, 0, 0]);
+            response.extend_from_slice(&bytes[12..end + 5]);
+            if answer {
+                response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4]);
+                response.extend_from_slice(&ip.octets());
+            }
+            let _ = socket.send_to(&response, peer).await;
+        }
+    });
+    address
+}
+async fn site_response<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut stream: T) {
+    let mut bytes = [0u8; 4096];
+    let _ = stream.read(&mut bytes).await;
+    let body = b"aegis-http-https-fixture";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+    let _ = stream.shutdown().await;
+}
+async fn site(ip: IpAddr, tls: Option<std::sync::Arc<rustls::ServerConfig>>) -> SocketAddr {
+    let listener = TcpListener::bind((ip, 0)).await.expect("site bind");
+    let address = listener.local_addr().expect("site address");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let tls = tls.clone();
+            tokio::spawn(async move {
+                if let Some(tls) = tls {
+                    if let Ok(stream) = tokio_rustls::TlsAcceptor::from(tls).accept(stream).await {
+                        site_response(stream).await;
+                    }
+                } else {
+                    site_response(stream).await;
+                }
+            });
+        }
+    });
+    address
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_hostname_http_https_across_tls_terminating_edge_requires_registered_mtls() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let Some(IpAddr::V4(ip)) = lan_ip() else {
+            eprintln!("BLOCKED: controlled egress requires IPv4 LAN interface");
+            return;
+        };
+        let directory = tempfile::tempdir().expect("temp");
+        let root = directory.path();
+        let secrets = root.join("secrets");
+        let identity = provision(&secrets);
+        let dns = controlled_dns(ip).await;
+        let web_ca =
+            pki::generate_ca("web site test CA", pki::DEFAULT_CA_VALIDITY).expect("web CA");
+        let (site_cert, site_key) = pki::issue_direct(
+            &web_ca,
+            "website",
+            Role::Gateway,
+            &["site.example.test".into()],
+            DEFAULT_NODE_VALIDITY,
+        )
+        .expect("web cert");
+        let site_tls = aegis_identity::tls::public_server_config(
+            &site_cert,
+            &site_key,
+            "site.example.test",
+            Some(&web_ca.cert_pem),
+        )
+        .expect("target TLS");
+        let http = site(IpAddr::V4(ip), None).await;
+        let https = site(IpAddr::V4(ip), Some(site_tls)).await;
+        let mut gateway =
+            parse_toml(&gateway_toml(root, &format!("{ip}/32"))).expect("gateway config");
+        gateway.schema_version = "0.2".into();
+        gateway.identity.require_enrollment = true;
+        gateway.identity.legacy_identity_until = Some(0);
+        gateway.dns.resolver = Some(aegis_config::ResolverKind::Explicit);
+        gateway.dns.nameservers = vec![dns.to_string()];
+        gateway.dns.ipv6_policy = aegis_config::Ipv6Policy::Block;
+        // The fixture site lives on the LAN: a CIDR-only rule cannot authorize
+        // an unresolved name, so scope the private range to the hostname.
+        gateway.routing.rules.push(aegis_config::RuleConfig {
+            id: "lab-site".into(),
+            matcher: aegis_config::MatchConfig::Table(aegis_config::MatchTable {
+                domains: vec!["site.example.test".into()],
+                cidrs: vec![format!("{ip}/32")],
+                ..Default::default()
+            }),
+            action: aegis_config::RouteActionConfig::Proxy,
+            outbound: Some("egress".into()),
+            priority: None,
+        });
+        let store = db::Store::open(root.join("gw.db")).expect("store");
+        let cert = std::fs::read_to_string(secrets.join("identity/client-cert")).expect("cert");
+        let peer =
+            PeerIdentity::from_der(parse_certs(&cert).expect("PEM")[0].as_ref()).expect("peer");
+        let node_id = db::new_id();
+        store
+            .tx(|c| {
+                db::insert_node(
+                    c,
+                    &db::NodeRow {
+                        id: node_id.clone(),
+                        name: peer.node_id.clone(),
+                        role: "client".into(),
+                        cert_fingerprint: Some(peer.fingerprint_hex()),
+                        cert_serial: Some(peer.serial_hex.clone()),
+                        status: "active".into(),
+                        generation: 1,
+                        not_after: Some(peer.not_after),
+                        created_at: db::now_unix(),
+                    },
+                )?;
+                db::insert_identity(
+                    c,
+                    &peer.fingerprint_hex(),
+                    &node_id,
+                    &peer.serial_hex,
+                    peer.not_before,
+                    peer.not_after,
+                )
+            })
+            .expect("enroll before starting");
+        drop(store);
+        let gateway = start(StartOptions {
+            config: gateway,
+            store_path: root.join("gw.db"),
+            failpoints: None,
+        })
+        .await
+        .expect("gateway");
+        let address = gateway.bound_addr("ingress-ws").expect("WS");
+        let edge_ca =
+            pki::generate_ca("independent edge CA", pki::DEFAULT_CA_VALIDITY).expect("edge CA");
+        let (edge_cert, edge_key) = pki::issue_direct(
+            &edge_ca,
+            "edge",
+            Role::Gateway,
+            &["localhost".into()],
+            DEFAULT_NODE_VALIDITY,
+        )
+        .expect("edge cert");
+        let tls = aegis_identity::tls::public_server_config(
+            &edge_cert,
+            &edge_key,
+            "localhost",
+            Some(&edge_ca.cert_pem),
+        )
+        .expect("edge TLS");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("edge bind");
+        let edge = listener.local_addr().expect("edge address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let tls = std::sync::Arc::clone(&tls);
+                tokio::spawn(async move {
+                    if let Ok(mut incoming) =
+                        tokio_rustls::TlsAcceptor::from(tls).accept(stream).await
+                    {
+                        if let Ok(mut origin) = TcpStream::connect(address).await {
+                            let _ = tokio::io::copy_bidirectional(&mut incoming, &mut origin).await;
+                        }
+                    }
+                });
+            }
+        });
+        write(&secrets, "edge-ca.pem", &edge_ca.cert_pem);
+        let mut client_cfg =
+            parse_toml(&client_toml(root, &secrets, address)).expect("client config");
+        client_cfg.schema_version = "0.2".into();
+        client_cfg.identity.require_enrollment = true;
+        client_cfg.identity.legacy_identity_until = Some(0);
+        client_cfg.outbounds[0].url = Some(format!("wss://localhost:{}/agp", edge.port()));
+        client_cfg.outbounds[0].outer_ca = Some("secret://edge-ca.pem".into());
+        let client = start(StartOptions {
+            config: client_cfg.clone(),
+            store_path: root.join("client.db"),
+            failpoints: None,
+        })
+        .await
+        .expect("client");
+        let socks = client.bound_addr("socks").expect("SOCKS");
+        assert!(
+            client_cfg.dns.resolver.is_none(),
+            "no client destination resolver is configured"
+        );
+        let (mut plain, code) =
+            socks_connect(socks, &format!("site.example.test:{}", http.port()), None).await;
+        assert_eq!(code, 0, "gateway alone resolves controlled hostname");
+        plain
+            .write_all(b"GET / HTTP/1.1\r\nHost: site.example.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("HTTP request");
+        let mut response = String::new();
+        plain
+            .read_to_string(&mut response)
+            .await
+            .expect("HTTP response");
+        assert!(response.ends_with("aegis-http-https-fixture"));
+        let (stream, code) =
+            socks_connect(socks, &format!("site.example.test:{}", https.port()), None).await;
+        assert_eq!(code, 0);
+        let tls = rustls::ClientConfig::builder_with_provider(aegis_identity::tls::provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("versions")
+            .with_root_certificates(
+                aegis_identity::tls::root_store(&web_ca.cert_pem).expect("target roots"),
+            )
+            .with_no_client_auth();
+        let mut stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+            .connect("site.example.test".try_into().expect("SNI"), stream)
+            .await
+            .expect("end-to-end destination HTTPS");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: site.example.test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("HTTPS request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("HTTPS response");
+        assert!(response.ends_with("aegis-http-https-fixture"));
+        // Same trusted CA + correct role/URI is insufficient without enrollment.
+        let rogue_dir = root.join("rogue");
+        let (rogue_cert, rogue_key) = pki::issue_direct(
+            &identity.ca,
+            "rogue",
+            Role::Client,
+            &[],
+            DEFAULT_NODE_VALIDITY,
+        )
+        .expect("rogue CA-issued identity");
+        for (file, value) in [
+            ("identity/client-cert", rogue_cert.as_str()),
+            ("identity/client-key", rogue_key.as_str()),
+            ("identity/server-ca", identity.ca.cert_pem.as_str()),
+            ("edge-ca.pem", edge_ca.cert_pem.as_str()),
+            ("socks-password", "s3cret\n"),
+        ] {
+            write(&rogue_dir, file, value);
+        }
+        let mut rogue = client_cfg;
+        rogue.node_id = "rogue".into();
+        rogue.secrets.dir = rogue_dir.to_string_lossy().into_owned();
+        let rogue = start(StartOptions {
+            config: rogue,
+            store_path: root.join("rogue.db"),
+            failpoints: None,
+        })
+        .await
+        .expect("local rogue process");
+        let (_, code) = socks_connect(
+            rogue.bound_addr("socks").expect("rogue SOCKS"),
+            &format!("site.example.test:{}", http.port()),
+            None,
+        )
+        .await;
+        assert_ne!(code, 0, "edge cannot replace device authorization");
+        rogue.shutdown(Duration::from_secs(1)).await;
+        client.shutdown(Duration::from_secs(1)).await;
+        gateway.shutdown(Duration::from_secs(1)).await;
+    })
+    .await
+    .expect("bounded e2e deadline");
+}
+
+/// Origin that records each request it receives (head + body) and answers
+/// once, then closes.
+async fn recording_origin(ip: IpAddr) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind((ip, 0)).await.expect("origin bind");
+    let address = listener.local_addr().expect("origin address");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let Ok(n) = s.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if got.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                // Give a misbehaving proxy time to push extra bytes.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut extra = [0u8; 1024];
+                if let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_millis(50), s.read(&mut extra)).await
+                {
+                    got.extend_from_slice(&extra[..n]);
+                }
+                log.lock()
+                    .expect("log")
+                    .push(String::from_utf8_lossy(&got).to_string());
+                let _ = s
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    (address, seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_http_forwarding_through_the_tunnel() {
+    let Some(env) = setup().await else { return };
+    let ip = env.echo.ip();
+    let (origin, seen) = recording_origin(ip).await;
+    let http = env.client.bound_addr("http").expect("http inbound");
+    // A keep-alive client pipelines a second request for another path: it
+    // must never reach the origin through the first request's stream.
+    let mut s = TcpStream::connect(http).await.expect("proxy");
+    s.write_all(
+        format!(
+            "GET http://{origin}/one?x=1 HTTP/1.1\r\nHost: {origin}\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\nGET http://{origin}/two HTTP/1.1\r\nHost: {origin}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("request");
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(10), s.read_to_string(&mut response))
+        .await
+        .expect("bounded")
+        .expect("response");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK") && response.ends_with("ok"),
+        "{response}"
+    );
+    // POST body is forwarded exactly.
+    let mut s = TcpStream::connect(http).await.expect("proxy");
+    s.write_all(format!("POST http://{origin}/form HTTP/1.1\r\nHost: {origin}\r\nContent-Length: 5\r\n\r\nhello").as_bytes())
+        .await
+        .expect("post");
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(10), s.read_to_string(&mut response))
+        .await
+        .expect("bounded")
+        .expect("response");
+    assert!(response.ends_with("ok"));
+    // Plain-HTTP requests still obey gateway egress policy.
+    let mut s = TcpStream::connect(http).await.expect("proxy");
+    s.write_all(b"GET http://169.254.169.254/latest HTTP/1.1\r\n\r\n")
+        .await
+        .expect("w");
+    let mut response = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), s.read_to_string(&mut response)).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let seen = seen.lock().expect("log").clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let get = &seen[0];
+    assert!(get.starts_with("GET /one?x=1 HTTP/1.1\r\n"), "{get}");
+    assert!(get.contains("Connection: close\r\n") && get.contains("Accept: */*\r\n"));
+    assert!(!get.to_ascii_lowercase().contains("proxy-"), "{get}");
+    assert!(
+        !get.contains("/two"),
+        "pipelined request leaked to the origin: {get}"
+    );
+    assert!(seen[1].starts_with("POST /form HTTP/1.1\r\n") && seen[1].ends_with("\r\n\r\nhello"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn e2e_socks_http_policy_and_identity() {
     let Some(env) = setup().await else { return };
@@ -415,6 +837,24 @@ async fn e2e_socks_http_policy_and_identity() {
     assert_eq!(coord.run_job(&job.id).expect("run").status, "succeeded");
     let (_, code) = socks_connect(socks, &echo, None).await;
     assert_eq!(code, 2, "tightened ACL applies to the next OPEN");
+    // The same private address encoded as a hostname must not bypass the
+    // public-only rule after resolution, even though egress allows private.
+    let mut named = TcpStream::connect(socks).await.expect("proxy");
+    named.write_all(&[5, 1, 0]).await.expect("greeting");
+    let mut method = [0u8; 2];
+    named.read_exact(&mut method).await.expect("method");
+    assert_eq!(method, [5, 0]);
+    let name = env.echo.ip().to_string();
+    let mut request = vec![5, 1, 0, 3, name.len() as u8];
+    request.extend_from_slice(name.as_bytes());
+    request.extend_from_slice(&env.echo.port().to_be_bytes());
+    named.write_all(&request).await.expect("connect");
+    let mut reply = [0u8; 10];
+    named.read_exact(&mut reply).await.expect("reply");
+    assert_eq!(
+        reply[1], 2,
+        "domain encoding must retain the public constraint"
+    );
     assert_eq!(
         env.gw.ctx.sessions.count(),
         1,
@@ -576,4 +1016,221 @@ async fn restart_restores_active_revision_and_serves() {
     .await;
     assert_eq!(code, 0);
     echo_roundtrip(s, 10_000).await;
+}
+
+fn activate_patch(node: &NodeRuntime, patch: serde_json::Value) {
+    let coord = &node.ctx.coord;
+    let original = coord
+        .store()
+        .read(|c| db::list_profiles(c, None, 10))
+        .expect("profiles")
+        .remove(0);
+    let profile = coord
+        .patch_profile(None, &original.id, &original.etag(), None, Some(&patch))
+        .expect("patch");
+    let report = coord
+        .validate(
+            None,
+            &profile.id,
+            &profile.etag(),
+            &profile.desired_revision_id,
+        )
+        .expect("validate");
+    assert!(report.valid, "{:?}", report.errors);
+    let job = coord
+        .submit_activation(
+            &ActivateRequest {
+                actor_id: None,
+                profile_id: profile.id.clone(),
+                if_match: profile.etag(),
+                idempotency_key: db::new_id(),
+                target_revision_id: report.target_revision_id,
+                config_digest: report.config_digest,
+                validation_id: report.validation_id,
+            },
+            "/test",
+        )
+        .expect("submit");
+    assert_eq!(
+        coord.run_job(&job.id).expect("activate").status,
+        "succeeded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_updates_use_new_endpoint_and_preserve_admitted_streams() {
+    let Some(env) = setup().await else { return };
+    let socks = env.client.bound_addr("socks").expect("socks");
+    let (old_stream, code) = socks_connect(socks, &env.echo.to_string(), None).await;
+    assert_eq!(code, 0);
+    let second_dir = tempfile::tempdir().expect("tmp");
+    let mut config = parse_toml(&gateway_toml(
+        second_dir.path(),
+        &format!("{}/32", env.echo.ip()),
+    ))
+    .expect("config");
+    config.secrets = env.gw.ctx.startup.secrets.clone();
+    let second = start(StartOptions {
+        config,
+        store_path: second_dir.path().join("gw.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("second gateway");
+    let mut outbounds = serde_json::to_value(&env.client.ctx.startup.outbounds).expect("outbounds");
+    outbounds[0]["url"] = json!(format!(
+        "ws://{}/agp",
+        second.bound_addr("ingress-ws").expect("ws")
+    ));
+    activate_patch(&env.client, json!({"outbounds": outbounds}));
+    let (new_stream, code) = socks_connect(socks, &env.echo.to_string(), None).await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        second.ctx.sessions.count(),
+        1,
+        "new admission must use the replacement gateway"
+    );
+    echo_roundtrip(old_stream, 4096).await;
+    echo_roundtrip(new_stream, 4096).await;
+
+    // Changing the TLS name must never reuse an already-authenticated session.
+    outbounds[0]["server_name"] = json!("wrong-gateway.example");
+    activate_patch(&env.client, json!({"outbounds": outbounds}));
+    let (_, code) = socks_connect(socks, &env.echo.to_string(), None).await;
+    assert_ne!(
+        code, 0,
+        "changed TLS name must be verified on a new session"
+    );
+
+    // Failed preparation must not silently fall back to the cached tunnel.
+    outbounds[0]["server_name"] = json!("gateway.aegis.internal");
+    outbounds[0]["outer_ca"] = json!("secret://missing-ca");
+    activate_patch(&env.client, json!({"outbounds": outbounds}));
+    let (_, code) = socks_connect(socks, &env.echo.to_string(), None).await;
+    assert_ne!(code, 0, "unreadable replacement trust anchor fails closed");
+
+    // A newly added outbound also becomes usable without restarting.
+    outbounds[0]["outer_ca"] = serde_json::Value::Null;
+    outbounds[0]["id"] = json!("replacement");
+    activate_patch(
+        &env.client,
+        json!({"outbounds": outbounds, "routing": {"default_outbound": "replacement"}}),
+    );
+    let (stream, code) = socks_connect(socks, &env.echo.to_string(), None).await;
+    assert_eq!(code, 0);
+    echo_roundtrip(stream, 1024).await;
+    env.client.shutdown(Duration::from_millis(100)).await;
+    env.gw.shutdown(Duration::from_millis(100)).await;
+    second.shutdown(Duration::from_millis(100)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_limits_cover_pending_agp_and_live_sessions() {
+    use aegis_buffer::Budget;
+    use aegis_session::{client_handshake, SessionConfig};
+    use aegis_transport_ws::WsClientConfig;
+    use std::sync::Arc;
+    // Exercise the pending limit separately from the global session limit.
+    for (pending, sessions) in [(1, 2), (2, 1)] {
+        let dir = tempfile::tempdir().expect("tmp");
+        let secrets = dir.path().join("secrets");
+        provision(&secrets);
+        let mut config = parse_toml(&gateway_toml(dir.path(), "10.0.0.1/32")).expect("config");
+        config.core.max_sessions = sessions;
+        config.inbounds[0].max_pending_handshakes = pending;
+        let gw = start(StartOptions {
+            config,
+            store_path: dir.path().join("gw.db"),
+            failpoints: None,
+        })
+        .await
+        .expect("gateway");
+        let ws_config = WsClientConfig {
+            url: format!("ws://{}/agp", gw.bound_addr("ingress-ws").expect("ws")),
+            outer_ca_pem: None,
+            outer_server_name: None,
+            connect_timeout: Duration::from_secs(2),
+            handshake_timeout: Duration::from_secs(2),
+            max_message_bytes: 128 * 1024,
+        };
+        let tls_config = aegis_identity::client_config(
+            &std::fs::read_to_string(secrets.join("identity/client-cert")).expect("cert"),
+            &std::fs::read_to_string(secrets.join("identity/client-key")).expect("key"),
+            &std::fs::read_to_string(secrets.join("identity/server-ca")).expect("ca"),
+        )
+        .expect("TLS config");
+        let connect = || async {
+            let ws = aegis_transport_ws::connect(&ws_config)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (tls, _) = aegis_identity::tls::connect(
+                tls_config.clone(),
+                "gateway.aegis.internal",
+                ws,
+                Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            client_handshake(
+                tls,
+                SessionConfig {
+                    node_id: "laptop-1".into(),
+                    ..Default::default()
+                },
+                Budget::root(8 * 1024 * 1024),
+                Arc::new(aegis_contracts::observability::NoopObservability),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        };
+        let ws = aegis_transport_ws::connect(&ws_config).await.expect("ws");
+        let (tls, _) = aegis_identity::tls::connect(
+            tls_config.clone(),
+            "gateway.aegis.internal",
+            ws,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("TLS");
+        // Complete TLS while leaving HELLO pending. Neither quota may be
+        // released just because certificate authentication finished.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(connect().await.is_err(), "pending AGP must reserve quota");
+        let first = client_handshake(
+            tls,
+            SessionConfig {
+                node_id: "laptop-1".into(),
+                ..Default::default()
+            },
+            Budget::root(8 * 1024 * 1024),
+            Arc::new(aegis_contracts::observability::NoopObservability),
+        )
+        .await
+        .expect("AGP");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gw.ctx.sessions.count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registered");
+        let second = connect().await;
+        if sessions == 1 {
+            assert!(second.is_err(), "live session consumes the only slot");
+        } else {
+            assert!(second.is_ok(), "completed AGP releases the pending permit");
+        }
+        drop(second);
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gw.ctx.sessions.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slots released");
+        let replacement = connect().await.expect("reusable quota after close");
+        drop(replacement);
+        gw.shutdown(Duration::from_millis(100)).await;
+    }
 }

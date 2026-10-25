@@ -52,6 +52,7 @@ pub enum AdmitError {
     NoPolicy,
     Revoked,
     Expired,
+    Unauthorized,
     Denied(RouteDecision),
 }
 
@@ -97,6 +98,9 @@ impl AdmissionGate {
             }
             if p.is_expired_at(now_unix) {
                 return Err(AdmitError::Expired);
+            }
+            if !ident.authorizes(p, now_unix) {
+                return Err(AdmitError::Unauthorized);
             }
         }
         let decision = bundle.compiled.router.decide(input);

@@ -298,6 +298,49 @@ impl Coordinator {
         *self.on_revoke.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
+    /// Publish current durable device bindings under the admission writer gate.
+    /// No store access occurs on handshakes or OPEN admission.
+    pub fn refresh_identities(&self) -> CResult<()> {
+        let _writer = self.lock_writer();
+        self.refresh_identities_locked()
+    }
+
+    fn refresh_identities_locked(&self) -> CResult<()> {
+        let (epoch, revoked, bindings) = self.store.read(|c| {
+            Ok((
+                db::get_epoch(c)?,
+                db::revoked_fingerprints(c)?,
+                db::active_identity_bindings(c)?,
+            ))
+        })?;
+        let mut snapshot = IdentitySnapshot::new(
+            epoch as u64,
+            revoked.iter().filter_map(|f| parse_fingerprint(f)),
+        );
+        if let Some(bundle) = self.gate.current() {
+            let id = &bundle.compiled.config.identity;
+            let cutoff = id.legacy_identity_until.unwrap_or(1_800_662_400);
+            if id.require_enrollment {
+                let entries = bindings.into_iter().filter_map(|(fp, name, role)| {
+                    Some((
+                        parse_fingerprint(&fp)?,
+                        name,
+                        match role.as_str() {
+                            "client" => Role::Client,
+                            "gateway" => Role::Gateway,
+                            _ => return None,
+                        },
+                    ))
+                });
+                snapshot = snapshot.with_registry(entries, cutoff);
+            } else {
+                snapshot = snapshot.with_legacy_deadline(cutoff);
+            }
+        }
+        self.gate.publish_identity(snapshot);
+        Ok(())
+    }
+
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, ()> {
         self.writer.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -962,6 +1005,7 @@ impl Coordinator {
             }
             Ok(())
         })?;
+        self.refresh_identities_locked()?;
         self.gate.set_admission(true);
         self.agent.transition(AgentState::Ready);
         self.obs.record(Event::ConfigActivation {
@@ -1151,6 +1195,7 @@ impl Coordinator {
                         reason: "publication failed".into(),
                     });
                 }
+                self.refresh_identities_locked()?;
                 self.gate.set_admission(true);
                 self.agent.transition(AgentState::Ready);
                 Ok(RecoveryOutcome::Restored {

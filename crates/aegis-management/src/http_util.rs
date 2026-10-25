@@ -235,11 +235,22 @@ pub async fn guard(
     next: Next,
 ) -> Response {
     let allowed = ctx.allowed_hosts();
-    let host_ok = req
+    let remote = ctx.remote_console();
+    let host = req
         .headers()
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
-        .is_some_and(|h| allowed.iter().any(|a| a.eq_ignore_ascii_case(h)));
+        .map(str::to_owned);
+    // A loopback console only answers its own names (DNS-rebinding guard).
+    // A remote console is HTTPS-only: the name the operator typed is
+    // accepted, and cross-origin requests are refused below.
+    let host_ok = host.as_deref().is_some_and(|h| {
+        if remote {
+            valid_host_header(h)
+        } else {
+            allowed.iter().any(|a| a.eq_ignore_ascii_case(h))
+        }
+    });
     if !host_ok {
         return finish(
             ApiError::bad_request("host_not_allowed").into_response(),
@@ -247,14 +258,16 @@ pub async fn guard(
         );
     }
     if let Some(origin) = req.headers().get(header::ORIGIN) {
-        let ok = origin
-            .to_str()
-            .ok()
-            .and_then(|o| {
+        let ok = origin.to_str().ok().is_some_and(|o| {
+            if remote {
+                host.as_deref()
+                    .is_some_and(|h| o.eq_ignore_ascii_case(&format!("https://{h}")))
+            } else {
                 o.strip_prefix("http://")
                     .or_else(|| o.strip_prefix("https://"))
-            })
-            .is_some_and(|o| allowed.iter().any(|a| a.eq_ignore_ascii_case(o)));
+                    .is_some_and(|o| allowed.iter().any(|a| a.eq_ignore_ascii_case(o)))
+            }
+        });
         if !ok {
             return finish(
                 ApiError::forbidden()
@@ -276,6 +289,13 @@ pub async fn guard(
     finish(resp, is_api)
 }
 
+fn valid_host_header(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+}
+
 fn finish(mut resp: Response, no_store: bool) -> Response {
     let h = resp.headers_mut();
     let set = |h: &mut HeaderMap, k: &'static str, v: &'static str| {
@@ -289,6 +309,7 @@ fn finish(mut resp: Response, no_store: bool) -> Response {
     set(h, "x-frame-options", "DENY");
     set(h, "x-content-type-options", "nosniff");
     set(h, "referrer-policy", "no-referrer");
+    set(h, "strict-transport-security", "max-age=31536000");
     set(h, "cross-origin-opener-policy", "same-origin");
     set(h, "cross-origin-resource-policy", "same-origin");
     set(

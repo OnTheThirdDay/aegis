@@ -1,0 +1,287 @@
+name: Release
+
+# Publishes builds of the branch flow (see docs/RELEASING.md):
+#   staging  -> image ghcr.io/<owner>/aegis:staging (+ :sha-xxxxxxx) for pre-release testing
+#   main     -> when the workspace version has no tag yet: tag vX.Y.Z, multi-arch image
+#               ghcr.io/<owner>/aegis:X.Y.Z + :latest, and a GitHub Release with the
+#               installer, native gateway packages, client apps and SHA256SUMS
+# Versions are bumped by version.yml, never by hand on main.
+#
+# Supply chain: pin every `uses:` to a reviewed full commit SHA before relying on
+# this for production (06 §2.2). Build provenance is attested for the image and assets.
+
+on:
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CLOUDFLARED_VERSION: "2026.10.0"
+  CLOUDFLARED_SHA256_amd64: d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db
+  CLOUDFLARED_SHA256_arm64: e6422b9d4f72d3194bc5a38676f13667c06666523217b842a877d72a80b5ac08
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      channel: ${{ steps.plan.outputs.channel }}
+      version: ${{ steps.plan.outputs.version }}
+      image: ${{ steps.plan.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          case "$GITHUB_REF" in
+            refs/heads/staging) channel=staging ;;
+            refs/heads/main)
+              if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+                channel=none; echo "v$version is already released; nothing to publish."
+              else
+                channel=release
+                # Same gate as ci.yml: main only releases content that was on staging.
+                # (fetch-depth 0 already brought origin/staging and all tags.)
+                if ! git log origin/staging --format=%T | grep -qx "$(git rev-parse 'HEAD^{tree}')"; then
+                  echo "::error::main contains changes that never went through staging"; exit 1
+                fi
+              fi ;;
+            *) channel=none ;;
+          esac
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "Channel: $channel, version $version"
+
+  gateway:
+    needs: plan
+    if: needs.plan.outputs.channel != 'none'
+    runs-on: ubuntu-22.04 # glibc 2.35: runs on Debian 12+ / Ubuntu 22.04+
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Cross toolchain
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> "$GITHUB_ENV"
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p aegisd -p aegisctl
+      - name: Stage binaries and the pinned cloudflared
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p "out/$ARCH"
+          cp "target/$TARGET/release/aegisd" "target/$TARGET/release/aegisctl" "out/$ARCH/"
+          curl -fsSL -o "out/$ARCH/cloudflared" \
+            "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-$ARCH"
+          sum_var="CLOUDFLARED_SHA256_$ARCH"
+          echo "${!sum_var}  out/$ARCH/cloudflared" | sha256sum -c -
+          chmod 0755 out/"$ARCH"/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gateway-${{ matrix.arch }}
+          path: out/
+          retention-days: 7
+
+  clients:
+    needs: plan
+    if: needs.plan.outputs.channel != 'none'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            asset: aegis-client-windows-x86_64.exe
+            bin: aegis-client.exe
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: aegis-client-macos-arm64
+            bin: aegis-client
+          - os: macos-14
+            target: x86_64-apple-darwin
+            asset: aegis-client-macos-x86_64
+            bin: aegis-client
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: aegis-client-linux-x86_64
+            bin: aegis-client
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p aegis-client
+      - shell: bash
+        run: |
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "out/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-${{ matrix.asset }}
+          path: out/
+          retention-days: 7
+
+  image:
+    needs: [plan, gateway, clients]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gateway-*
+          path: context/bin
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: client-*
+          path: context/clients
+          merge-multiple: true
+      - name: Prepare build context
+        run: |
+          cp deploy/Dockerfile.prebuilt context/Dockerfile
+          chmod 0755 context/bin/*/* context/clients/*
+          find context -type f | sort
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tags
+        id: tags
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+        run: |
+          short=${GITHUB_SHA::7}
+          if [ "$CHANNEL" = release ]; then
+            tags="$IMAGE:$VERSION,$IMAGE:latest,$IMAGE:sha-$short"
+          else
+            tags="$IMAGE:staging,$IMAGE:sha-$short"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ needs.plan.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  release:
+    needs: [plan, gateway, clients, image]
+    if: needs.plan.outputs.channel == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gateway-*
+          path: gateway
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: client-*
+          path: assets
+          merge-multiple: true
+      - name: Assemble release assets
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          IMAGE: ${{ needs.plan.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          chmod 0755 gateway/*/* assets/*
+          for arch in amd64 arm64; do
+            pkg=$(mktemp -d)/aegisnet-gateway
+            mkdir -p "$pkg/bin" "$pkg/clients"
+            cp gateway/$arch/* "$pkg/bin/"
+            cp assets/* "$pkg/clients/"
+            tar -C "$(dirname "$pkg")" -czf "assets/aegisnet-gateway-linux-$arch.tar.gz" aegisnet-gateway
+          done
+          # The installer pins this release's image by digest.
+          sed -e "s|^RELEASE=\"@VERSION@\"|RELEASE=\"v$VERSION\"|" \
+              -e "s|^RELEASE_IMAGE=\"@IMAGE@\"|RELEASE_IMAGE=\"$IMAGE@$DIGEST\"|" \
+              deploy/install.sh > assets/install.sh
+          grep -q "^RELEASE=\"v$VERSION\"" assets/install.sh
+          ( cd assets && sha256sum * > SHA256SUMS )
+          cat assets/SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: assets/*
+      - name: Tag and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          IMAGE: ${{ needs.plan.outputs.image }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<NOTES
+          ## Install or upgrade the gateway
+
+          \`\`\`sh
+          curl -fsSLO https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/install.sh
+          sudo sh install.sh                 # Docker; add --native for a systemd service
+          \`\`\`
+
+          Image: \`$IMAGE:$VERSION\` (\`$IMAGE@$DIGEST\`), linux/amd64 and linux/arm64.
+          Clients: download below or from the gateway's web console. Verify files with \`SHA256SUMS\`
+          or \`gh attestation verify <file> -R $GITHUB_REPOSITORY\`.
+          NOTES
+          gh release create "v$VERSION" assets/* \
+            --target "$GITHUB_SHA" --title "v$VERSION" \
+            --notes-file notes.md --generate-notes

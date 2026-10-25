@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "apps/aegisd", "apps/aegisctl", "xtask"]
+members = ["crates/*", "apps/aegisd", "apps/aegisctl", "apps/aegis-client", "xtask"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -38,6 +38,8 @@ aegis-platform = { path = "crates/aegis-platform" }
 aegis-core = { path = "crates/aegis-core" }
 aegis-node = { path = "crates/aegis-node" }
 aegis-management = { path = "crates/aegis-management" }
+aegis-provision = { path = "crates/aegis-provision" }
+aegis-join = { path = "crates/aegis-join" }
 
 # Third-party candidates (06 §1). Not pre-approved: see docs/DEPENDENCIES.md.
 tokio = { version = "1.54", default-features = false }
@@ -71,7 +73,10 @@ argon2 = "0.5"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tower = { version = "0.5", default-features = false }
 http = "1.1"
+http-body = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# ACME (RFC 8555) client for the appliance's public certificates (ADR-0007).
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring"] }
 proptest = "1.5"
 
 [profile.release]

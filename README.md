@@ -9,9 +9,57 @@ AegisNet is a security-first modular proxy engine written in Rust. It implements
 >
 > See [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for the per-test-ID matrix.
 
+## Quick start (appliance)
+
+**Server: one command.** On a Docker host (Linux, or macOS with Docker Desktop):
+
+```sh
+curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
+sudo sh install.sh              # Docker; add --native for a Linux systemd service
+```
+
+Releases are built and published by GitHub Actions; see [docs/RELEASING.md](docs/RELEASING.md) for the branch flow (work branch → `staging` → `main`), version bumps and verification.
+
+The installer:
+
+- builds and starts a hardened container: read-only filesystem, no capabilities, uid 10001;
+- waits for it to become healthy;
+- prints the console URL, a **one-time admin password** and the console certificate fingerprint.
+
+**Admin: browser only.** Open `https://<server>:8443`, sign in as `admin`, and choose your own password; this is enforced. Then:
+
+1. Set how devices connect, using one of:
+   - the LAN or port-forwarded address;
+   - **Cloudflare Tunnel** (no port forwarding: the console creates the tunnel, DNS record and connector);
+   - a **Let's Encrypt** certificate.
+2. Add users.
+3. Invite devices.
+
+The Integrations page lists the built-in integrations.
+
+**Users** sign in to the same console with a one-time password from the admin. They can invite, see and revoke only their own devices, and download the client.
+
+**Client: portable app.** Run `aegis-client` (no install, no admin rights), paste the invitation code and press **Join and connect**. You then have:
+
+- a local SOCKS5 proxy on `127.0.0.1:1080`;
+- an HTTP proxy on `127.0.0.1:8080`, which handles HTTPS and plain HTTP;
+- optionally, the Windows system proxy set while connected.
+
+`aegisctl join/connect` is the same client for headless machines.
+
+Design and limits: [ADR-0007](docs/adr/0007-appliance-console-and-portable-client.md). Evidence: [SPEC-12 acceptance](docs/SPEC12_ACCEPTANCE.md).
+
 ## What works
 
-- **Data path:** SOCKS5 and HTTP CONNECT on the client → WebSocket (`wss://`, works behind a TLS-terminating edge) → **inner mutual TLS 1.3** (no resumption, tickets or 0-RTT) → **AGP/1** multiplexed streams → gateway → policy-restricted TCP egress.
+- **Appliance:**
+  - first-start self-configuration;
+  - HTTPS web console (admin and user views);
+  - users and roles;
+  - device invitations and edge enrollment with same-key renewal;
+  - automatic certificate renewal;
+  - Cloudflare Tunnel and ACME integrations;
+  - a portable GUI client.
+- **Data path:** SOCKS5, HTTP CONNECT and plain-HTTP forwarding on the client → WebSocket (`wss://`, works behind a TLS-terminating edge) → **inner mutual TLS 1.3** (no resumption, tickets or 0-RTT) → **AGP/1** multiplexed streams → gateway → policy-restricted TCP egress.
 - **Per-OPEN admission:** every new logical stream, including one on a long-lived session, is checked against the *current* policy and the current revocation snapshot. Revoking a node closes its live sessions.
 - **Bounded resources:**
   - receive credit is reserved before it is advertised;
@@ -63,10 +111,12 @@ crates/
   aegis-core             admission gate, activation coordinator, supervision
   aegis-node             composition root (gateway + client runtimes)
   aegis-management       REST API, auth/RBAC/CSRF, IPC handlers
-apps/  aegisd · aegisctl · aegis-ui (static assets)
+  aegis-provision        provisioning saga, Cloudflare API adapter, Compose host path
+  aegis-join             device-side invitation import, enrollment, renewal
+apps/  aegisd (incl. appliance + integrations) · aegisctl · aegis-client (GUI) · aegis-ui (console assets)
 xtask/ architecture/unsafe policy checks
 fuzz/  cargo-fuzz targets (AGP, config, HTTP head, destinations)
-deploy/ Dockerfile (rootless), systemd unit, runnable example configs
+deploy/ install.sh (release installer), build-bundle.sh (offline builds), Dockerfiles (rootless), example configs
 docs/  status matrix, ADR-0005, dependency intake, operations
 ```
 
@@ -74,7 +124,7 @@ docs/  status matrix, ADR-0005, dependency intake, operations
 
 ```sh
 cargo build --locked --workspace
-cargo test --locked --workspace           # 153 tests
+cargo test --locked --workspace           # 202 tests
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo run -p xtask -- arch-check          # crate-graph rules + forbid(unsafe_code)
 cargo +nightly fuzz run agp_decoder       # requires cargo-fuzz
@@ -82,9 +132,9 @@ cargo +nightly fuzz run agp_decoder       # requires cargo-fuzz
 
 The end-to-end test (`crates/aegis-node/tests/e2e.rs`) needs a non-loopback network interface for its egress target, because loopback destinations are correctly denied. Without one it reports itself as `BLOCKED` and skips.
 
-## Quickstart
+## Hand-configured nodes
 
-See [docs/OPERATIONS.md](docs/OPERATIONS.md). In short:
+Without appliance mode, see [docs/OPERATIONS.md](docs/OPERATIONS.md). In short:
 
 ```sh
 aegisctl validate deploy/examples/gateway.toml

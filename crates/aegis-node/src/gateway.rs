@@ -17,6 +17,163 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
+trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
+
+const EDGE_MAX_HEAD: usize = 8 * 1024;
+const EDGE_MAX_BODY: usize = 32 * 1024;
+
+/// Read the HTTP request head. `POST /enroll` and `POST /renew` are answered
+/// here and the connection closed (`None`); anything else is replayed into
+/// the WebSocket upgrade unchanged.
+async fn route_edge(
+    mut io: Box<dyn Duplex>,
+    ws_path: &str,
+    hook: crate::EdgeHook,
+) -> Option<Box<dyn Duplex>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::with_capacity(1024);
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if buf.len() >= EDGE_MAX_HEAD {
+            return None;
+        }
+        let mut chunk = [0u8; 2048];
+        let n = io.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    if !matches!(
+        req.parse(&buf[..head_end]),
+        Ok(httparse::Status::Complete(_))
+    ) {
+        return None;
+    }
+    let route = match (req.method, req.path) {
+        (Some("POST"), Some("/enroll")) => crate::EdgeRequest::Enroll,
+        (Some("POST"), Some("/renew")) => crate::EdgeRequest::Renew,
+        (_, Some(p)) if p == ws_path || p.starts_with(&format!("{ws_path}?")) => {
+            return Some(Box::new(aegis_transport_ws::Prefixed::new(buf, io)));
+        }
+        _ => {
+            let _ = io
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return None;
+        }
+    };
+    let header = |name: &str| {
+        req.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+            .map(str::trim)
+    };
+    let length = header("content-length").and_then(|v| v.parse::<usize>().ok());
+    // Reverse proxies (e.g. a Cloudflare tunnel) may forward the body
+    // chunked; accept exactly `chunked`, never both framings.
+    let chunked = match header("transfer-encoding") {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("chunked") && length.is_none() => true,
+        Some(_) => return None,
+    };
+    let mut body = buf[head_end..].to_vec();
+    if chunked {
+        body = read_chunked(&mut io, body).await?;
+    } else {
+        let Some(length) = length.filter(|l| *l <= EDGE_MAX_BODY) else {
+            let _ = io
+                .write_all(b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            return None;
+        };
+        if body.len() > length {
+            return None;
+        }
+        while body.len() < length {
+            let mut chunk = vec![0u8; (length - body.len()).min(4096)];
+            let n = io.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+    }
+    let (status, payload) = hook(route, body).await;
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        _ => "Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        payload.len()
+    );
+    let _ = io.write_all(head.as_bytes()).await;
+    let _ = io.write_all(&payload).await;
+    let _ = io.shutdown().await;
+    None
+}
+
+/// Decode a chunked body (bounded by `EDGE_MAX_BODY`); trailers ignored.
+async fn read_chunked(io: &mut Box<dyn Duplex>, mut raw: Vec<u8>) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        // Ensure a full size line is buffered.
+        let line_end = loop {
+            if let Some(i) = raw[pos..].windows(2).position(|w| w == b"\r\n") {
+                break pos + i;
+            }
+            if raw.len() > EDGE_MAX_BODY * 2 {
+                return None;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = io.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            raw.extend_from_slice(&chunk[..n]);
+        };
+        let size_text = std::str::from_utf8(&raw[pos..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        pos = line_end + 2;
+        if size == 0 {
+            return Some(out);
+        }
+        if out.len() + size > EDGE_MAX_BODY {
+            return None;
+        }
+        while raw.len() < pos + size + 2 {
+            let mut chunk = [0u8; 4096];
+            let n = io.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        out.extend_from_slice(&raw[pos..pos + size]);
+        if &raw[pos + size..pos + size + 2] != b"\r\n" {
+            return None;
+        }
+        pos += size + 2;
+    }
+}
+
 pub async fn serve(ctx: Arc<NodeContext>, inbound: InboundConfig, listener: TcpListener) {
     let pending = Arc::new(Semaphore::new(inbound.max_pending_handshakes as usize));
     let ws_cfg = WsServerConfig {
@@ -65,10 +222,44 @@ async fn handle_connection(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let started = Instant::now();
-    let Ok(ws) = aegis_transport_ws::accept(tcp, &ws_cfg).await else {
+    let io: Box<dyn Duplex> = if let Some(reload) = ctx.outer_tls.get(&inbound.id).cloned() {
+        let Ok(Ok(config)) = tokio::task::spawn_blocking(move || reload.load()).await else {
+            return;
+        };
+        let handshake = tokio_rustls::TlsAcceptor::from(config).accept(tcp);
+        let Ok(Ok(tls)) = tokio::time::timeout(
+            Duration::from_millis(u64::from(ctx.startup.core.tls_handshake_timeout_ms)),
+            handshake,
+        )
+        .await
+        else {
+            return;
+        };
+        Box::new(tls)
+    } else {
+        Box::new(tcp)
+    };
+    let io: Box<dyn Duplex> = match ctx.edge_hook.get().cloned() {
+        Some(hook) => {
+            let deadline =
+                Duration::from_millis(u64::from(ctx.startup.core.inbound_handshake_timeout_ms));
+            match tokio::time::timeout(deadline, route_edge(io, &ws_cfg.path, hook)).await {
+                Ok(Some(io)) => io,
+                _ => return,
+            }
+        }
+        None => io,
+    };
+    let Ok(ws) = aegis_transport_ws::accept(io, &ws_cfg).await else {
         return;
     };
-    let Some(server_tls) = ctx.identity.server_tls.clone() else {
+    let Some(server_tls) = ctx
+        .identity
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .server_tls
+        .clone()
+    else {
         return;
     };
     let tls_timeout = Duration::from_millis(u64::from(ctx.startup.core.tls_handshake_timeout_ms));
@@ -85,17 +276,18 @@ async fn handle_connection(
             return;
         }
     };
-    drop(permit);
     ctx.obs().record(Event::HandshakeDuration {
         seconds: started.elapsed().as_secs_f64(),
         result: OperationResult::Ok,
     });
-    if ctx.sessions.count() as u32 >= ctx.startup.core.max_sessions {
+    // Reserve atomically before AGP negotiation. A count followed by an
+    // await and later insertion allows concurrent handshakes past the cap.
+    let Ok(_session_slot) = Arc::clone(&ctx.session_slots).try_acquire_owned() else {
         ctx.obs().record(Event::ResourceThrottle {
             reason: ReasonGroup::Quota,
         });
         return;
-    }
+    };
     let budget = ctx.budget.child(ctx.startup.core.peer_buffer_budget_bytes);
     let obs: Arc<dyn aegis_contracts::Observability> = ctx.metrics.clone();
     let (session, mut incoming) = match server_handshake(
@@ -117,6 +309,8 @@ async fn handle_connection(
     };
     let session = Arc::new(session);
     let reg_id = ctx.sessions.insert(peer.fingerprint, Arc::clone(&session));
+    // The pending quota covers the entire WS + mTLS + AGP handshake.
+    drop(permit);
     let peer = Arc::new(peer);
     let inbound_id: Arc<str> = Arc::from(inbound.id.as_str());
     loop {

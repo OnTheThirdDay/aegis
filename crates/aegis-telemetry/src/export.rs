@@ -264,6 +264,26 @@ impl CoarseExporter {
         gauges: GaugeFn,
         interval: Duration,
     ) -> Result<CoarseExporter, String> {
+        Self::spawn_guarded(
+            collector_url,
+            service_name,
+            credential,
+            metrics,
+            gauges,
+            interval,
+            Arc::new(|| true),
+        )
+    }
+
+    pub fn spawn_guarded(
+        collector_url: String,
+        service_name: String,
+        credential: Option<String>,
+        metrics: Arc<LocalMetrics>,
+        gauges: GaugeFn,
+        interval: Duration,
+        approved: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<CoarseExporter, String> {
         crate::settings::validate_collector_url(&collector_url)?;
         crate::settings::validate_service_name(&service_name)?;
         let client = reqwest::Client::builder()
@@ -281,6 +301,9 @@ impl CoarseExporter {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
+                if !approved() {
+                    break;
+                }
                 let payload = build_payload(&service_name, &metrics, gauges());
                 if enforce_allowlist(&payload).is_err() {
                     metrics.telemetry_dropped("invalid");

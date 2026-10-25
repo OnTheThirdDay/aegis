@@ -14,6 +14,7 @@ pub enum SecretError {
     InvalidPath,
     Unreadable(String),
     TooLarge,
+    InsecurePermissions,
 }
 
 impl std::fmt::Display for SecretError {
@@ -24,6 +25,9 @@ impl std::fmt::Display for SecretError {
             // Only the reference (never the value) is echoed.
             SecretError::Unreadable(r) => write!(f, "secret {r} is not readable"),
             SecretError::TooLarge => f.write_str("secret file too large"),
+            SecretError::InsecurePermissions => {
+                f.write_str("secret requires a regular, owner-only file without symlinks")
+            }
         }
     }
 }
@@ -60,11 +64,48 @@ pub fn resolve_path(dir: &Path, reference: &str) -> Result<PathBuf, SecretError>
 /// Read a secret file (bounded at 1 MiB).
 pub fn read(dir: &Path, reference: &str) -> Result<String, SecretError> {
     let path = resolve_path(dir, reference)?;
-    let meta = std::fs::metadata(&path).map_err(|_| SecretError::Unreadable(reference.into()))?;
+    // Every component beneath the trusted root must be real, never a symlink.
+    let mut part = dir.to_path_buf();
+    for segment in parse_ref(reference)?.split('/') {
+        part.push(segment);
+        let m = std::fs::symlink_metadata(&part)
+            .map_err(|_| SecretError::Unreadable(reference.into()))?;
+        if m.file_type().is_symlink() {
+            return Err(SecretError::InsecurePermissions);
+        }
+    }
+    let file = std::fs::File::open(&path).map_err(|_| SecretError::Unreadable(reference.into()))?;
+    let meta = file
+        .metadata()
+        .map_err(|_| SecretError::Unreadable(reference.into()))?;
+    if !meta.is_file() {
+        return Err(SecretError::InsecurePermissions);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let before = std::fs::symlink_metadata(&path)
+            .map_err(|_| SecretError::Unreadable(reference.into()))?;
+        if meta.permissions().mode() & 0o077 != 0
+            || meta.nlink() != 1
+            || meta.ino() != before.ino()
+            || meta.dev() != before.dev()
+        {
+            return Err(SecretError::InsecurePermissions);
+        }
+    }
     if meta.len() > 1024 * 1024 {
         return Err(SecretError::TooLarge);
     }
-    std::fs::read_to_string(&path).map_err(|_| SecretError::Unreadable(reference.into()))
+    use std::io::Read;
+    let mut value = String::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_string(&mut value)
+        .map_err(|_| SecretError::Unreadable(reference.into()))?;
+    if value.len() > 1024 * 1024 {
+        return Err(SecretError::TooLarge);
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

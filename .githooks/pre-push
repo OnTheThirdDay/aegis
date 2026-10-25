@@ -1,0 +1,14 @@
+#!/bin/sh
+# Blocks direct pushes to main and staging; changes reach them through pull requests.
+# Enable once per clone:  git config core.hooksPath .githooks
+# Deliberate override:    git push --no-verify
+while read -r local_ref local_sha remote_ref remote_sha; do
+	case "$remote_ref" in
+	refs/heads/main | refs/heads/staging)
+		echo "pre-push: direct pushes to ${remote_ref#refs/heads/} are not allowed." >&2
+		echo "Push a work branch instead; its pull request is opened automatically (docs/RELEASING.md)." >&2
+		exit 1
+		;;
+	esac
+done
+exit 0

@@ -10,23 +10,20 @@
 <body>
   <a class="skip" href="#main">Skip to content</a>
   <header class="top">
-    <div class="brand">AegisNet <span class="muted">local console</span></div>
+    <div class="brand"><span class="logo" aria-hidden="true"></span>AegisNet</div>
     <div id="badges" class="badges" aria-live="polite"></div>
-    <button id="logout" class="ghost" hidden>Sign out</button>
+    <div id="who" class="who" hidden></div>
+    <button id="logout" class="ghost small" hidden>Sign out</button>
   </header>
-  <nav id="nav" class="tabs" role="tablist" aria-label="Sections" hidden>
-    <button role="tab" data-view="overview" aria-selected="true">Overview</button>
-    <button role="tab" data-view="profiles" aria-selected="false">Configuration</button>
-    <button role="tab" data-view="nodes" aria-selected="false">Nodes &amp; identity</button>
-    <button role="tab" data-view="audit" aria-selected="false">Audit</button>
-  </nav>
-  <main id="main" tabindex="-1">
-    <div id="notice" role="status" aria-live="polite"></div>
-    <section id="view"></section>
-  </main>
+  <div class="shell">
+    <nav id="nav" class="side" aria-label="Sections" hidden></nav>
+    <main id="main" tabindex="-1">
+      <div id="notice" role="status" aria-live="polite"></div>
+      <section id="view"></section>
+    </main>
+  </div>
   <footer class="foot muted">
-    Local management only. No telemetry is exported unless an owner explicitly enables it.
-    This console does not make anonymity or undetectability claims.
+    No telemetry is exported unless an owner explicitly enables it. AegisNet does not claim anonymity or undetectability.
   </footer>
   <script src="/app.js"></script>
 </body>

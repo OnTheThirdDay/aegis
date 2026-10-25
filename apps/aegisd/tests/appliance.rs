@@ -1,0 +1,266 @@
+//! Appliance end-to-end (ADR-0007): initialize an empty data directory, sign
+//! in to the HTTPS console with the generated password, complete the forced
+//! password change, invite a device, enroll it through the TLS edge with the
+//! invitation's pins, open a tunnel session, renew with the same key and
+//! revoke it. Runs fully in-process on loopback.
+#![cfg(unix)]
+
+use aegisd::appliance::{self, InitOptions};
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .expect("free port")
+}
+
+struct Console {
+    http: reqwest::Client,
+    base: String,
+    cookie: Option<String>,
+    csrf: Option<String>,
+}
+
+impl Console {
+    fn new(addr: SocketAddr, web_ca: &str) -> Self {
+        let http = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(web_ca.as_bytes()).expect("ca"))
+            .no_proxy()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("client");
+        Console {
+            http,
+            base: format!("https://127.0.0.1:{}", addr.port()),
+            cookie: None,
+            csrf: None,
+        }
+    }
+
+    async fn call(
+        &mut self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut req = self
+            .http
+            .request(method.clone(), format!("{}/api/v1{path}", self.base));
+        if let Some(c) = &self.cookie {
+            req = req.header("cookie", format!("aegis_session={c}"));
+        }
+        if method != reqwest::Method::GET {
+            if let Some(t) = &self.csrf {
+                req = req.header("x-csrf-token", t);
+            }
+        }
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req.send().await.expect("console reachable over TLS");
+        let status = resp.status().as_u16();
+        if let Some(set) = resp
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(v) = set
+                .split(';')
+                .next()
+                .and_then(|kv| kv.strip_prefix("aegis_session="))
+            {
+                self.cookie = Some(v.to_owned());
+            }
+        }
+        let value: Value = resp.json().await.unwrap_or(Value::Null);
+        if let Some(t) = value["csrf_token"].as_str() {
+            self.csrf = Some(t.to_owned());
+        }
+        (status, value)
+    }
+}
+
+async fn socks_connect(proxy: SocketAddr, host: &str, port: u16) -> u8 {
+    let mut s = TcpStream::connect(proxy).await.expect("socks");
+    s.write_all(&[5, 1, 0]).await.expect("greet");
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r).await.expect("method");
+    let mut req = vec![5, 1, 0, 3, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req).await.expect("connect");
+    let mut head = [0u8; 4];
+    match tokio::time::timeout(Duration::from_secs(15), s.read_exact(&mut head)).await {
+        Ok(Ok(_)) => head[1],
+        _ => 0xEE,
+    }
+}
+
+async fn start_client(dir: &Path) -> aegis_node::NodeRuntime {
+    let device = aegis_join::DeviceDir::new(dir);
+    let _ = std::fs::remove_file(device.store());
+    let cfg = aegis_join::client_config(&device, aegis_join::Ports { socks: 0, http: 0 })
+        .expect("client config");
+    aegis_node::start(aegis_node::StartOptions {
+        config: cfg,
+        store_path: device.store(),
+        failpoints: None,
+    })
+    .await
+    .expect("client start")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let data = tmp.path().join("data");
+        let (console_port, edge_port) = (free_port(), free_port());
+        let opts = InitOptions {
+            public_addresses: vec!["127.0.0.1".into()],
+            public_port: Some(edge_port),
+            console_loopback: true,
+            console_port: Some(console_port),
+            edge_port: Some(edge_port),
+            tunnel_port: Some(0),
+        };
+        let path = appliance::init(&data, &opts).expect("init");
+        let cfg = aegisd::parse_config(&std::fs::read_to_string(path).expect("cfg")).expect("parse");
+        let store = std::path::PathBuf::from(&cfg.management.config_store);
+        let running = aegisd::launch(cfg, store, Some(data.clone())).await.expect("launch");
+        let password = std::fs::read_to_string(data.join(appliance::INITIAL_PASSWORD_FILE))
+            .expect("initial password")
+            .trim()
+            .to_owned();
+        let web_ca = std::fs::read_to_string(data.join("secrets/web-ca.pem")).expect("web ca");
+        let mut c = Console::new(running.console.expect("console"), &web_ca);
+
+        // Plain HTTP on the console port is redirected, never served.
+        let mut plain = TcpStream::connect(("127.0.0.1", console_port)).await.expect("plain");
+        plain
+            .write_all(format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{console_port}\r\n\r\n").as_bytes())
+            .await
+            .expect("write");
+        let mut text = String::new();
+        let _ = plain.read_to_string(&mut text).await;
+        assert!(text.starts_with("HTTP/1.1 308"), "{text}");
+        assert!(text.contains(&format!("Location: https://127.0.0.1:{console_port}/")));
+
+        let (s, _) = c.call(reqwest::Method::GET, "/auth/me", None).await;
+        assert_eq!(s, 401);
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": "wrong-password-x"})))
+            .await;
+        assert_eq!(s, 401, "{v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": password})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["password_change_required"], true);
+        let (s, _) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(s, 403, "restricted session before the forced change");
+        let restricted = c.cookie.clone();
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/auth/password", Some(json!({"current_password": password, "new_password": "short"})))
+            .await;
+        assert_eq!(s, 400, "{v}");
+        let (s, v) = c
+            .call(
+                reqwest::Method::POST,
+                "/auth/password",
+                Some(json!({"current_password": password, "new_password": "a much better passphrase"})),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["password_change_required"], false);
+        assert!(
+            !data.join(appliance::INITIAL_PASSWORD_FILE).exists(),
+            "one-time password file removed"
+        );
+        assert_ne!(c.cookie, restricted, "session rotated");
+        let (s, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["checklist"]["owner_password_changed"], true);
+
+        // Server address -> invitation code.
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/connection", Some(json!({"public_host": "127.0.0.1", "public_port": edge_port})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "laptop"})))
+            .await;
+        assert_eq!(s, 201, "{v}");
+        let code = v["code"].as_str().expect("code").to_owned();
+        let invite = aegis_join::parse_invite(&code).expect("invite parses");
+        assert_eq!(invite.outer_server_name.as_deref(), Some("edge.aegis.internal"));
+
+        // Enroll through the TLS edge (not the console).
+        let dev_dir = tmp.path().join("device");
+        let device_dir = aegis_join::DeviceDir::new(&dev_dir);
+        aegis_join::enroll(&invite, &device_dir).await.expect("enroll");
+        let again = aegis_join::enroll(&invite, &aegis_join::DeviceDir::new(tmp.path().join("replay"))).await;
+        assert!(
+            matches!(again, Err(aegis_join::JoinError::Rejected { status: 401, .. })),
+            "one-use invitation: {again:?}"
+        );
+        let (s, v) = c.call(reqwest::Method::GET, "/devices", None).await;
+        assert_eq!(s, 200);
+        assert_eq!(v["items"][0]["name"], "laptop");
+
+        // Tunnel session: a loopback destination is refused *by the gateway
+        // policy* (0x02), which proves inner mTLS + registry admission.
+        let client = start_client(&dev_dir).await;
+        let socks = client.bound_addr("socks").expect("socks");
+        assert_eq!(socks_connect(socks, "localhost", 9).await, 2);
+        client.shutdown(Duration::from_secs(1)).await;
+
+        // Same-key renewal through the edge.
+        let before = device_dir.certificate_expires_at().expect("expiry");
+        assert!(aegis_join::renew_if_due(&device_dir, true).await.expect("renew"));
+        assert!(device_dir.certificate_expires_at().expect("expiry") >= before);
+        let client = start_client(&dev_dir).await;
+        let socks = client.bound_addr("socks").expect("socks");
+        assert_eq!(socks_connect(socks, "localhost", 9).await, 2, "renewed identity admitted");
+
+        // Revoke: new sessions/streams are refused.
+        let (_, v) = c.call(reqwest::Method::GET, "/devices", None).await;
+        let id = v["items"][0]["id"].as_str().expect("id").to_owned();
+        let etag = v["items"][0]["etag"].as_str().expect("etag").to_owned();
+        let resp = c
+            .http
+            .post(format!("{}/api/v1/devices/{id}/revoke", c.base))
+            .header("cookie", format!("aegis_session={}", c.cookie.clone().expect("cookie")))
+            .header("x-csrf-token", c.csrf.clone().expect("csrf"))
+            .header("if-match", etag)
+            .header("idempotency-key", "revoke-laptop-0001")
+            .send()
+            .await
+            .expect("revoke");
+        assert_eq!(resp.status().as_u16(), 202);
+        let mut revoked = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if socks_connect(socks, "localhost", 9).await != 2 {
+                revoked = true;
+                break;
+            }
+        }
+        assert!(revoked, "revoked device can no longer open streams");
+        assert!(
+            aegis_join::renew_if_due(&device_dir, true).await.is_err(),
+            "revoked device cannot renew"
+        );
+        client.shutdown(Duration::from_secs(1)).await;
+        running.shutdown().await;
+    })
+    .await
+    .expect("bounded appliance e2e");
+}

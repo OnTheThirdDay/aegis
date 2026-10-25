@@ -14,9 +14,12 @@ use aegis_session::{
 };
 use bytes::{Bytes, BytesMut};
 use rand::RngCore;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
 fn obs() -> Arc<dyn Observability> {
     Arc::new(NoopObservability)
@@ -426,7 +429,16 @@ struct Raw {
 impl Raw {
     async fn send(&mut self, f: Frame) {
         let mut b = BytesMut::new();
-        encode_frame(&mut b, &f).expect("encode");
+        // Deliberately bypass the production encoder to inject invalid peer
+        // controls. The production encoder now rejects these malformed values.
+        aegis_agp::encode_header(
+            &mut b,
+            f.frame_type,
+            f.flags,
+            f.stream_id,
+            f.payload.len() as u32,
+        );
+        b.extend_from_slice(&f.payload);
         let _ = self.io.write_all(&b).await;
     }
 
@@ -780,4 +792,276 @@ async fn ping_flood_terminates_session() {
         .await
         .expect("flood terminates session");
     assert_eq!(session.close_reason(), Some(SessionError::ControlOverload));
+}
+
+#[tokio::test]
+async fn fragmented_data_stays_within_reserved_receive_storage() {
+    // A non-power-of-two window catches containers that round capacity up.
+    let window = 65_537;
+    let config = SessionConfig {
+        stream_window: window,
+        ..cfg("gw-1")
+    };
+    let (mut raw, session, mut incoming) = raw_against_server(config).await;
+    raw.send(open_frame(1)).await;
+    let mut stream = incoming
+        .next()
+        .await
+        .expect("open")
+        .accept()
+        .expect("accept");
+    let _ = raw.recv_significant().await.expect("ack");
+    let allocated = session.stats().recv_allocated;
+    assert_eq!(allocated, u64::from(window));
+    assert!(allocated <= session.stats().recv_reserved);
+
+    let mut batch = BytesMut::new();
+    for _ in 0..1024 {
+        encode_frame(
+            &mut batch,
+            &Frame::new(FrameType::Data, 1, Bytes::from_static(b"a")),
+        )
+        .expect("encode");
+    }
+    for _ in 0..64 {
+        raw.io.write_all(&batch).await.expect("tiny frames");
+    }
+    raw.send(Frame::new(FrameType::Data, 1, Bytes::from_static(b"a")))
+        .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while session.stats().recv_buffered != u64::from(window) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all frames consumed");
+    assert_eq!(
+        session.stats().recv_allocated,
+        allocated,
+        "frame count never grows allocation"
+    );
+
+    // Consume enough to grant more credit, then refill across the ring boundary.
+    let mut first = vec![0; 32_769];
+    stream.read_exact(&mut first).await.expect("read prefix");
+    assert!(first.iter().all(|&b| b == b'a'));
+    for size in [16_384, 16_384, 1] {
+        raw.send(Frame::new(
+            FrameType::Data,
+            1,
+            Bytes::from(vec![b'b'; size]),
+        ))
+        .await;
+    }
+    let mut rest = vec![0; window as usize];
+    stream
+        .read_exact(&mut rest)
+        .await
+        .expect("read wrapped buffer");
+    assert!(rest[..32_768].iter().all(|&b| b == b'a'));
+    assert!(rest[32_768..].iter().all(|&b| b == b'b'));
+    assert_eq!(session.stats().recv_allocated, allocated);
+    assert_eq!(session.stats().recv_buffered, 0);
+}
+
+#[derive(Default)]
+struct WriteGate {
+    // 0 = normal, 1 = blocked write, 2 = blocked flush, 3 = blocked shutdown.
+    mode: AtomicUsize,
+    allowance: AtomicUsize,
+    blocked: tokio::sync::Notify,
+    dropped: AtomicBool,
+}
+
+struct GatedTransport {
+    io: DuplexStream,
+    gate: Arc<WriteGate>,
+}
+
+impl Drop for GatedTransport {
+    fn drop(&mut self) {
+        self.gate.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl AsyncRead for GatedTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for GatedTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.gate.mode.load(Ordering::SeqCst) == 1 {
+            let allowance = self.gate.allowance.load(Ordering::SeqCst);
+            if allowance == 0 {
+                self.gate.blocked.notify_one();
+                return Poll::Pending;
+            }
+            let result = Pin::new(&mut self.io).poll_write(cx, &buf[..buf.len().min(allowance)]);
+            if let Poll::Ready(Ok(n)) = result {
+                self.gate.allowance.fetch_sub(n, Ordering::SeqCst);
+            }
+            result
+        } else {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.gate.mode.load(Ordering::SeqCst) == 2 {
+            self.gate.blocked.notify_one();
+            Poll::Pending
+        } else {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.gate.mode.load(Ordering::SeqCst) == 3 {
+            self.gate.blocked.notify_one();
+            Poll::Pending
+        } else {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+}
+
+async fn gated_server(
+    config: SessionConfig,
+) -> (Raw, Session, Incoming, Arc<Budget>, Arc<WriteGate>) {
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let gate = Arc::new(WriteGate::default());
+    let transport = GatedTransport {
+        io: b,
+        gate: Arc::clone(&gate),
+    };
+    let budget = Budget::root(8 * 1024 * 1024);
+    let server_budget = Arc::clone(&budget);
+    let server = tokio::spawn(async move {
+        server_handshake(transport, config, server_budget, obs(), "client-1").await
+    });
+    let mut raw = Raw {
+        io: a,
+        dec: Decoder::new(65_536),
+        buf: BytesMut::new(),
+    };
+    raw.send(Frame::new(
+        FrameType::Hello,
+        0,
+        hello("client-1").encode().expect("hello"),
+    ))
+    .await;
+    let _ = raw.recv().await.expect("ack");
+    let (session, incoming) = server.await.expect("join").expect("handshake");
+    (raw, session, incoming, budget, gate)
+}
+
+async fn released(budget: &Budget, gate: &WriteGate) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while budget.used() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("closed session must release reservations");
+    assert!(
+        gate.dropped.load(Ordering::SeqCst),
+        "transport dropped while peer remains connected"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_cancels_blocked_write_and_flush_without_appending_goaway() {
+    for mode in [1, 2] {
+        let (mut raw, session, incoming, budget, gate) = gated_server(cfg("gw-1")).await;
+        gate.allowance.store(5, Ordering::SeqCst);
+        gate.mode.store(mode, Ordering::SeqCst);
+        raw.send(Frame::new(
+            FrameType::Ping,
+            0,
+            Bytes::from_static(b"12345678"),
+        ))
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), gate.blocked.notified())
+            .await
+            .expect("writer blocked");
+        session.close(ResetReason::PolicyRevoked);
+        drop(incoming);
+        drop(session);
+        released(&budget, &gate).await;
+        let mut wire = Vec::new();
+        raw.io.read_to_end(&mut wire).await.expect("EOF");
+        if mode == 1 {
+            assert_eq!(wire.len(), 5, "no GOAWAY may follow an incomplete frame");
+        } else {
+            let mut wire = BytesMut::from(wire.as_slice());
+            assert_eq!(
+                raw.dec
+                    .decode(&mut wire)
+                    .expect("decode")
+                    .expect("pong")
+                    .frame_type,
+                FrameType::Pong
+            );
+            assert!(
+                wire.is_empty(),
+                "no further writes after cancelling a flush"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn incoming_keepalives_do_not_extend_a_blocked_write_deadline() {
+    let config = SessionConfig {
+        keepalive_timeout: Duration::from_millis(100),
+        ..cfg("gw-1")
+    };
+    let (mut raw, session, incoming, budget, gate) = gated_server(config).await;
+    gate.mode.store(1, Ordering::SeqCst);
+    raw.send(Frame::new(
+        FrameType::Ping,
+        0,
+        Bytes::from_static(b"12345678"),
+    ))
+    .await;
+    gate.blocked.notified().await;
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        raw.send(Frame::new(
+            FrameType::Ping,
+            0,
+            Bytes::from_static(b"12345678"),
+        ))
+        .await;
+    }
+    tokio::time::timeout(Duration::from_millis(50), session.closed())
+        .await
+        .expect("write deadline enforced");
+    assert_eq!(session.close_reason(), Some(SessionError::WriteTimeout));
+    drop(incoming);
+    drop(session);
+    released(&budget, &gate).await;
+    drop(raw);
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_write_flush_and_shutdown_have_a_deadline() {
+    for mode in [1, 2, 3] {
+        let (_raw, session, incoming, budget, gate) = gated_server(cfg("gw-1")).await;
+        gate.mode.store(mode, Ordering::SeqCst);
+        session.close(ResetReason::Shutdown);
+        drop(incoming);
+        drop(session);
+        released(&budget, &gate).await;
+    }
 }

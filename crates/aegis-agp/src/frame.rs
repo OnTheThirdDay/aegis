@@ -221,7 +221,42 @@ pub fn encode_frame(dst: &mut BytesMut, frame: &Frame) -> Result<(), ProtocolErr
             cap: MAX_PAYLOAD,
         });
     }
-    encode_header(dst, frame.frame_type, frame.flags, frame.stream_id, len);
+    let mut header = BytesMut::with_capacity(HEADER_LEN);
+    encode_header(
+        &mut header,
+        frame.frame_type,
+        frame.flags,
+        frame.stream_id,
+        len,
+    );
+    let raw: &[u8; HEADER_LEN] = header
+        .as_ref()
+        .try_into()
+        .map_err(|_| ProtocolError::BadMagic)?;
+    Header::parse(raw, MAX_PAYLOAD)?;
+    // Encoders must not emit noncanonical controls that decoders reject.
+    match frame.frame_type {
+        FrameType::Hello | FrameType::HelloAck => {
+            crate::control::Hello::decode(frame.payload.clone())?;
+        }
+        FrameType::Open => {
+            crate::control::OpenRequest::decode(frame.payload.clone())?;
+        }
+        FrameType::OpenAck => {
+            crate::control::OpenAck::decode(&frame.payload)?;
+        }
+        FrameType::Reset => {
+            crate::control::decode_reset(&frame.payload)?;
+        }
+        FrameType::WindowUpdate => {
+            crate::control::decode_window_update(&frame.payload)?;
+        }
+        FrameType::GoAway => {
+            crate::control::GoAway::decode(frame.payload.clone())?;
+        }
+        _ => {}
+    }
+    dst.extend_from_slice(&header);
     dst.extend_from_slice(&frame.payload);
     Ok(())
 }

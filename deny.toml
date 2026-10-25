@@ -22,15 +22,29 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # Boost: permissive, OSI-approved (Windows clipboard crates of the GUI client).
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
+# Fonts embedded in the GUI client only (not in aegisd/aegisctl).
+exceptions = [
+    { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
+
+# First-party crates are unpublished (license = "UNLICENSED").
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace path dependencies are not registry wildcards.
+allow-wildcard-paths = true
 deny = [
-    # No dynamic plugin loading (02 §3 T0/T1 only).
-    { name = "libloading" },
+    # No dynamic plugin loading (02 §3 T0/T1 only). The GUI client's windowing
+    # stack loads *system* graphics/display libraries (OpenGL, X11, Wayland)
+    # through these wrappers only; aegisd and aegisctl do not link it.
+    { name = "libloading", wrappers = ["dlib", "glutin", "x11rb"] },
     # OTLP is hand-encoded; the OTel SDK requires its own review (05 §1).
     { name = "opentelemetry" },
 ]

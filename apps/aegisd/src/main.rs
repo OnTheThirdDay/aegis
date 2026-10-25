@@ -1,34 +1,48 @@
 //! `aegisd` — AegisNet service.
 //!
 //! Privacy defaults (11 §3): no routine stdout/stderr logs. The only console
-//! output is a short, secret-free fatal startup code; use
+//! output is a short, secret-free fatal startup code (plus one secret-free
+//! line when an appliance data directory is first initialized); use
 //! `aegisctl validate <config>` for configuration details and the
 //! authenticated local API/IPC for status.
+//!
+//! Appliance mode: `aegisd --data-dir DIR` initializes an empty directory
+//! into a complete gateway with an HTTPS web console (ADR-0007).
 #![forbid(unsafe_code)]
 
+#[cfg(unix)]
 use aegis_management::ManagementContext;
-use aegis_node::{start, StartOptions};
-use std::path::{Path, PathBuf};
+use aegisd::{appliance, parse_config};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(unix)]
 use std::sync::Arc;
-use std::time::Duration;
 
 struct Args {
-    config: PathBuf,
+    config: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     store: Option<PathBuf>,
     check: bool,
 }
 
 fn parse_args() -> Result<Args, &'static str> {
     let mut args = Args {
-        config: PathBuf::from("/etc/aegisnet/config.toml"),
+        config: None,
+        data_dir: std::env::var_os("AEGIS_DATA_DIR").map(PathBuf::from),
         store: None,
         check: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--config" | "-c" => args.config = it.next().ok_or("--config needs a path")?.into(),
+            "--config" | "-c" => {
+                args.config = Some(it.next().ok_or("--config needs a path")?.into())
+            }
+            "--data-dir" => {
+                args.data_dir = Some(it.next().ok_or("--data-dir needs a path")?.into())
+            }
             "--store" => args.store = Some(it.next().ok_or("--store needs a path")?.into()),
             "--check" => args.check = true,
             "--version" => {
@@ -36,7 +50,7 @@ fn parse_args() -> Result<Args, &'static str> {
                 std::process::exit(0);
             }
             "--help" | "-h" => {
-                println!("usage: aegisd [--config PATH] [--store PATH] [--check] [--version]");
+                println!("usage: aegisd [--data-dir DIR | --config PATH] [--store PATH] [--check] [--version]");
                 std::process::exit(0);
             }
             _ => return Err("unknown argument"),
@@ -98,10 +112,7 @@ async fn serve_ipc(ctx: Arc<ManagementContext>, path: PathBuf) -> std::io::Resul
                 Ok(v) => v,
                 Err(_) => serde_json::json!({}),
             };
-            let resp =
-                tokio::task::spawn_blocking(move || aegis_management::ipc::handle(&ctx, &req))
-                    .await
-                    .unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "internal"}));
+            let resp = aegis_management::ipc::dispatch(ctx, req).await;
             let mut out = serde_json::to_vec(&resp).unwrap_or_default();
             out.push(b'\n');
             let _ = stream.write_all(&out).await;
@@ -136,10 +147,37 @@ fn main() -> ExitCode {
     let Ok(args) = parse_args() else {
         return fatal("E_USAGE");
     };
-    let Ok(text) = std::fs::read_to_string(&args.config) else {
+    let appliance_dir = if args.config.is_none() {
+        args.data_dir.clone()
+    } else {
+        None
+    };
+    let config_path = match (&args.config, &appliance_dir) {
+        (Some(c), _) => c.clone(),
+        (None, Some(dir)) => {
+            let path = appliance::config_path(dir);
+            if !path.exists() {
+                if args.check {
+                    return fatal("E_CONFIG_UNREADABLE");
+                }
+                if let Err(code) = appliance::init(dir, &appliance::InitOptions::from_env()) {
+                    return fatal(&code);
+                }
+                // Secret-free notice; the password stays in a 0600 file.
+                eprintln!(
+                    "aegisd: initialized {}; console https://<this-host>:{}; read the one-time admin password with `aegisctl initial-password`",
+                    dir.display(),
+                    appliance::CONSOLE_PORT
+                );
+            }
+            path
+        }
+        (None, None) => PathBuf::from("/etc/aegisnet/config.toml"),
+    };
+    let Ok(text) = std::fs::read_to_string(&config_path) else {
         return fatal("E_CONFIG_UNREADABLE");
     };
-    let Ok(cfg) = aegis_config::parse_toml(&text) else {
+    let Ok(cfg) = parse_config(&text) else {
         return fatal("E_CONFIG_INVALID");
     };
     if args.check {
@@ -159,51 +197,16 @@ fn main() -> ExitCode {
         return fatal("E_RUNTIME");
     };
     rt.block_on(async move {
-        let node = match start(StartOptions {
-            config: cfg.clone(),
-            store_path: store_path.clone(),
-            failpoints: None,
-        })
-        .await
-        {
-            Ok(n) => n,
-            Err(e) => return fatal(e.code()),
+        let running = match aegisd::launch(cfg, store_path.clone(), appliance_dir).await {
+            Ok(r) => r,
+            Err(code) => return fatal(code),
         };
-        let ctx = Arc::clone(&node.ctx);
-        let gauges_ctx = Arc::clone(&ctx);
-        let mut mgmt_ctx = None;
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        if cfg.management.enabled {
-            let Ok(bind) = cfg.management.bind.parse() else {
-                return fatal("E_CONFIG_INVALID");
-            };
-            let listener = match tokio::net::TcpListener::bind(bind).await {
-                Ok(l) => l,
-                Err(_) => return fatal("E_BIND"),
-            };
-            let m = ManagementContext::new(
-                Arc::clone(&ctx.coord),
-                Arc::clone(&ctx.metrics),
-                Arc::new(move || gauges_ctx.gauges()),
-                Arc::clone(&ctx.diagnostics),
-                ctx.ca.clone(),
-                ctx.secrets_dir.clone(),
-                bind,
-                cfg.management.allowed_hosts.clone(),
-            );
-            let mut rx = stop_rx.clone();
-            tokio::spawn(aegis_management::serve(
-                Arc::clone(&m),
-                listener,
-                async move {
-                    let _ = rx.wait_for(|s| *s).await;
-                },
-            ));
-            mgmt_ctx = Some(m);
-        }
         #[cfg(unix)]
-        if let Some(m) = &mgmt_ctx {
-            let path = cfg
+        if let Some(m) = &running.mgmt {
+            let path = running
+                .node
+                .ctx
+                .startup
                 .management
                 .ipc_socket
                 .clone()
@@ -211,13 +214,8 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|| default_ipc_path(&store_path));
             tokio::spawn(serve_ipc(Arc::clone(m), path));
         }
-        let _ = &mgmt_ctx;
         shutdown_signal().await;
-        let _ = stop_tx.send(true);
-        node.shutdown(Duration::from_secs(u64::from(
-            cfg.core.shutdown_grace_seconds,
-        )))
-        .await;
+        running.shutdown().await;
         ExitCode::SUCCESS
     })
 }

@@ -7,6 +7,7 @@ fn client(url: String) -> WsClientConfig {
     WsClientConfig {
         url,
         outer_ca_pem: None,
+        outer_server_name: None,
         connect_timeout: Duration::from_secs(5),
         handshake_timeout: Duration::from_secs(5),
         max_message_bytes: 128 * 1024,

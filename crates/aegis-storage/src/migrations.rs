@@ -4,9 +4,10 @@ use crate::{Result, StoreError};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        r#"
 CREATE TABLE principals (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
@@ -170,7 +171,57 @@ BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_events
 BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 "#,
-)];
+    ),
+    (
+        2,
+        r#"
+ALTER TABLE enrollment_tokens ADD COLUMN node_name TEXT;
+ALTER TABLE enrollment_tokens ADD COLUMN server_names_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE telemetry_settings ADD COLUMN consent_json TEXT;
+CREATE TABLE provision_plans (
+ id TEXT PRIMARY KEY, digest TEXT NOT NULL, actor_id TEXT NOT NULL,
+ desired_json TEXT NOT NULL, expected_revision TEXT, state TEXT NOT NULL,
+ generation INTEGER NOT NULL DEFAULT 1, step TEXT NOT NULL DEFAULT 'planned',
+ inventory_json TEXT NOT NULL DEFAULT '{}', error_code TEXT,
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX provision_single_apply ON provision_plans((1))
+ WHERE state IN ('applying','verifying','compensating');
+CREATE TABLE provision_events (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, plan_id TEXT NOT NULL REFERENCES provision_plans(id),
+ state TEXT NOT NULL, step TEXT NOT NULL, occurred_at INTEGER NOT NULL, code TEXT
+);
+CREATE TABLE provider_credentials (
+ provider TEXT PRIMARY KEY, secret_ref TEXT NOT NULL, fingerprint TEXT NOT NULL,
+ generation INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+-- Shape-only pre-SPEC-12 consent cannot authorize an export after upgrade.
+UPDATE telemetry_settings SET generation=generation+1,
+ settings_json=json_set(settings_json,'$.export_enabled',json('false'),'$.export_profile','off')
+ WHERE json_extract(settings_json,'$.export_enabled')=1;
+CREATE TABLE certificate_renewals (
+ actor_id TEXT NOT NULL, node_id TEXT NOT NULL, key_hash TEXT NOT NULL,
+ request_digest TEXT NOT NULL, response_json TEXT NOT NULL,
+ PRIMARY KEY(actor_id,node_id,key_hash)
+);
+"#,
+    ),
+    (
+        3,
+        r#"
+ALTER TABLE principals ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE nodes ADD COLUMN owner_principal_id TEXT;
+CREATE TABLE app_settings (
+ key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE integrations (
+ id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0,
+ settings_json TEXT NOT NULL DEFAULT '{}', status_json TEXT NOT NULL DEFAULT '{}',
+ generation INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL
+);
+"#,
+    ),
+];
 
 fn checksum(sql: &str) -> String {
     hex::encode(Sha256::digest(sql.as_bytes()))

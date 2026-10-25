@@ -103,7 +103,23 @@ pub fn validate_collector_url(url: &str) -> Result<(), String> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("collector_url contains invalid characters".into());
     }
+    let parsed = reqwest::Url::parse(url).map_err(|_| "collector_url is invalid")?;
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("collector_url is invalid".into());
+    }
     Ok(())
+}
+
+pub fn canonical_collector_url(url: &str) -> Result<String, String> {
+    validate_collector_url(url)?;
+    Ok(reqwest::Url::parse(url)
+        .map_err(|_| "collector_url is invalid")?
+        .to_string())
 }
 
 pub fn validate_service_name(name: &str) -> Result<(), String> {

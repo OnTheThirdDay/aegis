@@ -35,6 +35,10 @@ Exact versions are locked in `Cargo.lock`. Run `cargo deny check` and `cargo tre
 | reqwest 0.12 | opt-in OTLP export only | rustls-tls-webpki-roots; https_only, no proxy, no redirects | hyper-util client | pending |
 | serde / serde_json / toml 0.8 | typed config & API | toml `parse` only | — | pending |
 | sha2, hex, base64, subtle, rand 0.8, uuid, time, ipnet, httparse, bytes, futures-util | utilities | minimal | — | pending |
+| instant-acme 0.8.5 | ACME client (appliance certificates) | `ring` only; no hyper-rustls/aws-lc — HTTP via our reqwest client | lego container (needs Docker authority), acme2 | pending |
+| eframe/egui 0.37 | portable GUI client only (not linked into aegisd) | `glow`, `default_fonts`, `x11` | Tauri/WebView2 (larger toolchain), native Win32 | pending |
+| http-body 1.0 | request body access for the ACME HTTP adapter | — | — | pending |
+| cloudflared 2026.10.0 (binary, not a crate) | Cloudflare Tunnel connector in the appliance image | supervised child, `--token-file`, output discarded | none (official connector required) | SHA-256 pinned at image build and verified again before each start |
 | proptest (dev) | property tests | default | quickcheck | pending |
 | libfuzzer-sys (fuzz only) | fuzzing | — | — | pending |
 

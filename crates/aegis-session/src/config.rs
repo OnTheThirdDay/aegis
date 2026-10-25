@@ -7,6 +7,7 @@ use std::time::Duration;
 pub struct SessionConfig {
     /// This endpoint's node identity, bound to its mTLS certificate.
     pub node_id: String,
+    pub expected_peer_node_id: Option<String>,
     /// Upper bound on concurrent streams (incl. closing records) we accept.
     pub max_streams: u32,
     /// Per-stream receive window we advertise (16 KiB – 1 MiB).
@@ -21,6 +22,7 @@ pub struct SessionConfig {
     pub control_queue_frames: usize,
     pub handshake_timeout: Duration,
     pub keepalive_interval: Duration,
+    /// Deadline for both a keepalive response and a transport write/flush.
     pub keepalive_timeout: Duration,
     pub reset_drain_timeout: Duration,
     /// Peer PING/PONG frames tolerated per second (burst = 2x).
@@ -33,6 +35,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         SessionConfig {
             node_id: "node".into(),
+            expected_peer_node_id: None,
             max_streams: 64,
             stream_window: 64 * 1024,
             session_window: 2 * 1024 * 1024,

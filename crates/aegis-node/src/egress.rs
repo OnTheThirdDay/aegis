@@ -14,7 +14,9 @@ use tokio::net::TcpStream;
 pub fn admit_failure(e: &AdmitError) -> OpenFailure {
     match e {
         AdmitError::Closed | AdmitError::NoPolicy => OpenFailure::Unavailable,
-        AdmitError::Revoked | AdmitError::Expired => OpenFailure::Unauthorized,
+        AdmitError::Revoked | AdmitError::Expired | AdmitError::Unauthorized => {
+            OpenFailure::Unauthorized
+        }
         AdmitError::Denied(_) => OpenFailure::Denied,
     }
 }

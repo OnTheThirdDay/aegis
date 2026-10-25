@@ -41,6 +41,9 @@ pub struct NodeConfig {
 fn d_true() -> bool {
     true
 }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -103,6 +106,11 @@ pub struct ManagementConfig {
     /// Additional Host header values accepted (beyond the bind address and
     /// `localhost:<port>`).
     pub allowed_hosts: Vec<String>,
+    /// HTTPS for the console: `secret://` reference to a JSON bundle
+    /// `{"certificate": "secret://..", "private_key": "secret://.."}`.
+    /// Required for any non-loopback bind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<String>,
 }
 
 impl Default for ManagementConfig {
@@ -115,6 +123,7 @@ impl Default for ManagementConfig {
             config_store: "/var/lib/aegisnet/state.db".into(),
             ipc_socket: None,
             allowed_hosts: Vec::new(),
+            tls: None,
         }
     }
 }
@@ -151,6 +160,10 @@ impl PeerAuth {
 pub struct IdentityConfig {
     #[serde(with = "peer_auth_str")]
     pub peer_auth: PeerAuth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer_bundle: Option<String>,
     // Gateway material.
     pub server_identity: Option<String>,
     pub server_private_key: Option<String>,
@@ -166,6 +179,12 @@ pub struct IdentityConfig {
     /// exists so such a profile fails loudly instead of being ignored.
     pub verify_peer: Option<bool>,
     pub node_certificate_days: Option<u32>,
+    /// Explicit migration: v0.1 keeps legacy CA authorization until cutoff;
+    /// new v0.2 deployments require registry authorization.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_enrollment: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_identity_until: Option<i64>,
 }
 
 mod peer_auth_str {
@@ -238,6 +257,17 @@ pub struct InboundConfig {
     pub auth: Option<InboundAuth>,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Optional native public/direct TLS, outside the mandatory inner mTLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_tls: Option<OuterTlsConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OuterTlsConfig {
+    pub bundle: String,
+    pub server_name: String,
+    pub trusted_ca: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +303,11 @@ pub struct OutboundConfig {
     /// agp_tunnel: extra outer-TLS trust anchor (secret:// reference).
     #[serde(default)]
     pub outer_ca: Option<String>,
+    /// agp_tunnel: verify the outer certificate against this name instead of
+    /// the URL host. Requires `outer_ca`, which then becomes the only outer
+    /// trust anchor (public roots are not consulted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_server_name: Option<String>,
     /// agp_tunnel: acknowledge a plaintext `ws://` outer hop to a non-loopback
     /// host (inner mTLS still protects data). Never implied.
     #[serde(default)]

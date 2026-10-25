@@ -1,0 +1,4 @@
+# Shell scripts and hooks must keep LF endings on every platform.
+*.sh text eol=lf
+.githooks/* text eol=lf
+*.yml text eol=lf

@@ -624,6 +624,7 @@ fn tc_a04_stale_restore_rejected() {
 
 fn peer(fp: u8) -> PeerIdentity {
     PeerIdentity {
+        san_identity: true,
         node_id: "client-1".into(),
         role: Some(Role::Client),
         fingerprint: [fp; 32],

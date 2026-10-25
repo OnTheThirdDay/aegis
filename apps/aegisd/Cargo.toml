@@ -11,7 +11,31 @@ workspace = true
 
 [dependencies]
 aegis-config = { workspace = true }
+aegis-contracts = { workspace = true }
+aegis-core = { workspace = true }
+aegis-identity = { workspace = true }
 aegis-node = { workspace = true }
 aegis-management = { workspace = true }
+aegis-provision = { workspace = true }
+aegis-storage = { workspace = true }
+rand = { workspace = true }
+instant-acme = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+time = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "signal", "time", "macros", "sync"] }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+aegis-join = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+tempfile = "3"

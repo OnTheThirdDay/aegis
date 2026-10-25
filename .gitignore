@@ -30,3 +30,7 @@ rustc-ice-*.txt
 *.db-wal
 *.db-shm
 *.pem
+
+/aegis-spec
+# Offline builds (deploy/build-bundle.sh)
+/dist

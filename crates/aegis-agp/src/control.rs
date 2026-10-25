@@ -154,6 +154,7 @@ impl Hello {
     /// Select the version and features for a HELLO_ACK. Unknown critical
     /// features cause rejection; unknown optional features are ignored.
     pub fn negotiate(&self, supported: &[u16]) -> Result<(u8, Vec<u16>), ProtocolError> {
+        self.check()?;
         if self.protocol_min > VERSION_MAJOR || self.protocol_max < VERSION_MAJOR {
             return Err(ProtocolError::UnsupportedVersion(self.protocol_max));
         }
@@ -200,12 +201,18 @@ impl OpenRequest {
                 b.put_slice(&v4.octets());
             }
             Host::Ip(IpAddr::V6(v6)) => {
+                if canonical_ip(IpAddr::V6(*v6)) != IpAddr::V6(*v6) {
+                    return Err(ProtocolError::Malformed("non-canonical mapped address"));
+                }
                 b.put_u8(ATYP_V6);
                 b.put_slice(&v6.octets());
             }
             Host::Domain(d) => {
                 if d.is_empty() || d.len() > 253 {
                     return Err(ProtocolError::Malformed("domain length"));
+                }
+                if normalize_domain(d).as_ref() != Ok(d) {
+                    return Err(ProtocolError::Malformed("non-canonical domain"));
                 }
                 b.put_u8(ATYP_DOMAIN);
                 b.put_u8(d.len() as u8);

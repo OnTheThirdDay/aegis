@@ -10,6 +10,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+httparse = { workspace = true }
 aegis-contracts = { workspace = true }
 aegis-buffer = { workspace = true }
 aegis-agp = { workspace = true }
@@ -28,6 +30,9 @@ aegis-storage = { workspace = true }
 aegis-core = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 rustls = { workspace = true }
+tokio-rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros"] }

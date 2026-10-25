@@ -82,6 +82,9 @@ impl AsyncRead for MuxStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = self.get_mut();
         let shared = Arc::clone(&this.shared);
         let mut st = shared.lock();
@@ -92,14 +95,8 @@ impl AsyncRead for MuxStream {
         if e.state == StreamState::Reset {
             return Poll::Ready(Err(reset_err(e.reset_reason)));
         }
-        if let Some(front) = e.rx.front_mut() {
-            let n = front.len().min(buf.remaining());
-            buf.put_slice(&front[..n]);
-            if n == front.len() {
-                e.rx.pop_front();
-            } else {
-                let _ = front.split_to(n);
-            }
+        let n = e.rx.read_into(buf);
+        if n > 0 {
             if let Err(err) = shared.on_consumed(&mut st, this.id, n as u32) {
                 shared.fail(&mut st, err);
             }

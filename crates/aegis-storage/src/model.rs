@@ -704,6 +704,12 @@ pub fn revoked_fingerprints(c: &Connection) -> Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+pub fn active_identity_bindings(c: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = c.prepare("SELECT i.fingerprint,n.name,n.role FROM trusted_identities i JOIN nodes n ON n.id=i.node_id WHERE i.status='active' AND n.status IN ('active','rotating')")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn insert_enrollment_token(
     c: &Connection,
     id: &str,
@@ -824,6 +830,221 @@ pub fn get_principal(c: &Connection, id: &str) -> Result<PrincipalRow> {
         status,
         roles,
     })
+}
+
+/// Summary row for user administration (never includes the password hash).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PrincipalSummary {
+    pub id: String,
+    pub username: String,
+    pub status: String,
+    pub roles: Vec<String>,
+    pub must_change_password: bool,
+    pub created_at: i64,
+}
+
+pub fn list_principals(c: &Connection) -> Result<Vec<PrincipalSummary>> {
+    let mut stmt = c.prepare(
+        "SELECT id, username, status, must_change_password, created_at FROM principals ORDER BY created_at, id LIMIT 500",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(id, username, status, must, created_at)| {
+            Ok(PrincipalSummary {
+                roles: roles_of(c, &id)?,
+                id,
+                username,
+                status,
+                must_change_password: must != 0,
+                created_at,
+            })
+        })
+        .collect()
+}
+
+pub fn must_change_password(c: &Connection, id: &str) -> Result<bool> {
+    let v: i64 = c.query_row(
+        "SELECT must_change_password FROM principals WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok(v != 0)
+}
+
+/// Replace a password hash; `must_change` forces a change at next sign-in.
+pub fn set_password(c: &Connection, id: &str, hash: &str, must_change: bool) -> Result<()> {
+    let n = c.execute(
+        "UPDATE principals SET password_hash = ?2, must_change_password = ?3 WHERE id = ?1",
+        params![id, hash, i64::from(must_change)],
+    )?;
+    if n != 1 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+pub fn set_principal_status(c: &Connection, id: &str, status: &str) -> Result<()> {
+    let n = c.execute(
+        "UPDATE principals SET status = ?2 WHERE id = ?1",
+        params![id, status],
+    )?;
+    if n != 1 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+pub fn set_principal_roles(c: &Connection, id: &str, roles: &[String]) -> Result<()> {
+    c.execute("DELETE FROM principal_roles WHERE principal_id = ?1", [id])?;
+    for role in roles {
+        c.execute(
+            "INSERT INTO principal_roles (principal_id, role) VALUES (?1, ?2)",
+            params![id, role],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn count_active_owners(c: &Connection) -> Result<i64> {
+    Ok(c.query_row(
+        "SELECT COUNT(*) FROM principals p JOIN principal_roles r ON r.principal_id = p.id WHERE r.role = 'owner' AND p.status = 'active'",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+// ---------------------------------------------------------------------------
+// Appliance settings and integrations
+// ---------------------------------------------------------------------------
+
+pub fn get_setting(c: &Connection, key: &str) -> Result<Option<serde_json::Value>> {
+    let v: Option<String> = c
+        .query_row(
+            "SELECT value_json FROM app_settings WHERE key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    v.map(|s| serde_json::from_str(&s).map_err(|_| StoreError::Corrupt("setting".into())))
+        .transpose()
+}
+
+pub fn put_setting(c: &Connection, key: &str, value: &serde_json::Value) -> Result<()> {
+    c.execute(
+        "INSERT INTO app_settings (key, value_json, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+        params![key, value.to_string(), now_unix()],
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct IntegrationRow {
+    pub id: String,
+    pub enabled: bool,
+    pub settings: serde_json::Value,
+    pub status: serde_json::Value,
+    pub generation: i64,
+    pub updated_at: i64,
+}
+
+pub fn get_integration(c: &Connection, id: &str) -> Result<Option<IntegrationRow>> {
+    let row = c
+        .query_row(
+            "SELECT enabled, settings_json, status_json, generation, updated_at FROM integrations WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(enabled, settings, status, generation, updated_at)| {
+        Ok(IntegrationRow {
+            id: id.to_owned(),
+            enabled: enabled != 0,
+            settings: serde_json::from_str(&settings)
+                .map_err(|_| StoreError::Corrupt("integration".into()))?,
+            status: serde_json::from_str(&status)
+                .map_err(|_| StoreError::Corrupt("integration".into()))?,
+            generation,
+            updated_at,
+        })
+    })
+    .transpose()
+}
+
+/// Upsert an integration record; returns the new generation.
+pub fn put_integration(
+    c: &Connection,
+    id: &str,
+    enabled: bool,
+    settings: &serde_json::Value,
+    status: &serde_json::Value,
+) -> Result<i64> {
+    c.execute(
+        "INSERT INTO integrations (id, enabled, settings_json, status_json, generation, updated_at) VALUES (?1, ?2, ?3, ?4, 1, ?5)
+         ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, settings_json = excluded.settings_json,
+           status_json = excluded.status_json, generation = integrations.generation + 1, updated_at = excluded.updated_at",
+        params![id, i64::from(enabled), settings.to_string(), status.to_string(), now_unix()],
+    )?;
+    Ok(c.query_row(
+        "SELECT generation FROM integrations WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Record which principal owns an enrolled device.
+pub fn set_node_owner(c: &Connection, node_id: &str, principal: Option<&str>) -> Result<()> {
+    c.execute(
+        "UPDATE nodes SET owner_principal_id = ?2 WHERE id = ?1",
+        params![node_id, principal],
+    )?;
+    Ok(())
+}
+
+pub fn node_owner(c: &Connection, node_id: &str) -> Result<Option<String>> {
+    Ok(c.query_row(
+        "SELECT owner_principal_id FROM nodes WHERE id = ?1",
+        [node_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Devices enrolled through invitations created by `owner` (newest first).
+pub fn list_owned_nodes(c: &Connection, owner: &str) -> Result<Vec<NodeRow>> {
+    let mut stmt = c.prepare(&format!(
+        "SELECT {NODE_COLS} FROM nodes WHERE owner_principal_id = ?1 ORDER BY created_at DESC, id LIMIT 200"
+    ))?;
+    let rows = stmt.query_map([owner], node_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Enrollment token creator (the device's future owner).
+pub fn enrollment_token_creator(c: &Connection, verifier: &str) -> Result<Option<String>> {
+    Ok(c.query_row(
+        "SELECT created_by FROM enrollment_tokens WHERE verifier_hash = ?1",
+        [verifier],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()?
+    .flatten())
 }
 
 pub fn insert_bootstrap_token(c: &Connection, verifier: &str, expires: i64) -> Result<()> {

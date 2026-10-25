@@ -1,0 +1,29 @@
+[package]
+name = "aegis-join"
+description = "Device-side invitation import, CSR enrollment, same-key renewal and client profile generation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aegis-config = { workspace = true }
+aegis-contracts = { workspace = true }
+aegis-identity = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+httparse = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }
+tempfile = "3"

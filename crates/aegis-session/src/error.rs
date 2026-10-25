@@ -9,6 +9,8 @@ pub enum SessionError {
     Io(std::io::ErrorKind),
     HandshakeTimeout,
     KeepaliveTimeout,
+    /// The transport could not write and flush a batch within the keepalive deadline.
+    WriteTimeout,
     ResetDrainTimeout,
     /// Peer HELLO identity does not match the authenticated certificate.
     IdentityMismatch,
@@ -28,6 +30,7 @@ impl SessionError {
             SessionError::Io(_) | SessionError::PeerClosed => ReasonGroup::Transport,
             SessionError::HandshakeTimeout
             | SessionError::KeepaliveTimeout
+            | SessionError::WriteTimeout
             | SessionError::ResetDrainTimeout => ReasonGroup::Timeout,
             SessionError::IdentityMismatch => ReasonGroup::Auth,
             SessionError::Budget => ReasonGroup::Quota,
@@ -43,6 +46,7 @@ impl fmt::Display for SessionError {
             SessionError::Io(k) => write!(f, "transport I/O error: {k:?}"),
             SessionError::HandshakeTimeout => f.write_str("handshake timed out"),
             SessionError::KeepaliveTimeout => f.write_str("keepalive timed out"),
+            SessionError::WriteTimeout => f.write_str("transport write timed out"),
             SessionError::ResetDrainTimeout => f.write_str("peer failed to acknowledge reset"),
             SessionError::IdentityMismatch => {
                 f.write_str("HELLO node_id does not match peer certificate")

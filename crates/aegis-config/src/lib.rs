@@ -23,7 +23,22 @@ use std::fmt;
 
 /// Maximum accepted configuration document size (before decoding).
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[&str] = &["0.1"];
+pub const SUPPORTED_SCHEMA_VERSIONS: &[&str] = &["0.1", "0.2"];
+
+/// Explicit, offline dry-run migration. The caller publishes the returned
+/// profile through the existing revision coordinator; seed edits have no effect
+/// on initialized stores. Keep the source revision for a compensating restore.
+pub fn migrate_v02(cfg: &NodeConfig) -> (NodeConfig, Vec<String>) {
+    let mut next = cfg.clone();
+    next.schema_version = "0.2".into();
+    next.identity.require_enrollment = true;
+    next.identity.legacy_identity_until = Some(1_800_662_400); // 2027-01-23 UTC
+    (next, vec![
+        "Register every existing client certificate before activation; unregistered CA certificates lose access.".into(),
+        "Legacy CN/OU identities expire at the fixed migration deadline; renew to URI SAN first.".into(),
+        "Existing SQLite state is authoritative; activate this as a new revision. DNS endpoints and inner names are preserved.".into(),
+    ])
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {

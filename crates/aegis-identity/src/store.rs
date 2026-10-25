@@ -5,7 +5,9 @@
 //! revocation information. Publication bumps the security epoch; rollback of
 //! routing configuration can never roll it back.
 
-use std::collections::HashSet;
+use crate::tls::PeerIdentity;
+use aegis_contracts::Role;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -13,6 +15,8 @@ pub struct IdentitySnapshot {
     /// Monotonic security epoch.
     pub epoch: u64,
     revoked: HashSet<[u8; 32]>,
+    enrolled: Option<HashMap<[u8; 32], (String, Role)>>,
+    legacy_until: Option<i64>,
 }
 
 impl IdentitySnapshot {
@@ -20,6 +24,8 @@ impl IdentitySnapshot {
         IdentitySnapshot {
             epoch,
             revoked: revoked.into_iter().collect(),
+            enrolled: None,
+            legacy_until: None,
         }
     }
 
@@ -31,6 +37,38 @@ impl IdentitySnapshot {
         self.revoked.len()
     }
 
+    pub fn with_registry(
+        mut self,
+        entries: impl IntoIterator<Item = ([u8; 32], String, Role)>,
+        legacy_until: i64,
+    ) -> Self {
+        self.enrolled = Some(
+            entries
+                .into_iter()
+                .map(|(fp, name, role)| (fp, (name, role)))
+                .collect(),
+        );
+        self.legacy_until = Some(legacy_until);
+        self
+    }
+
+    pub fn with_legacy_deadline(mut self, until: i64) -> Self {
+        self.legacy_until = Some(until);
+        self
+    }
+
+    pub fn authorizes(&self, peer: &PeerIdentity, now: i64) -> bool {
+        !self.is_revoked(&peer.fingerprint)
+            && !peer.is_expired_at(now)
+            && (self.enrolled.is_some() || self.legacy_until.is_none_or(|until| now < until))
+            && (peer.san_identity || self.legacy_until.is_none_or(|until| now < until))
+            && self.enrolled.as_ref().is_none_or(|registry| {
+                registry
+                    .get(&peer.fingerprint)
+                    .is_some_and(|(name, role)| name == &peer.node_id && Some(*role) == peer.role)
+            })
+    }
+
     /// A new snapshot with additional revocations at a durably assigned
     /// epoch (never lower than the current one).
     pub fn with_revoked_at(
@@ -40,20 +78,20 @@ impl IdentitySnapshot {
     ) -> Self {
         let mut revoked = self.revoked.clone();
         revoked.extend(fingerprints);
-        IdentitySnapshot {
-            epoch: epoch.max(self.epoch),
-            revoked,
-        }
+        let mut next = self.clone();
+        next.epoch = epoch.max(self.epoch);
+        next.revoked = revoked;
+        next
     }
 
     /// A new snapshot with additional revocations and the next epoch.
     pub fn with_revoked(&self, fingerprints: impl IntoIterator<Item = [u8; 32]>) -> Self {
         let mut revoked = self.revoked.clone();
         revoked.extend(fingerprints);
-        IdentitySnapshot {
-            epoch: self.epoch + 1,
-            revoked,
-        }
+        let mut next = self.clone();
+        next.epoch += 1;
+        next.revoked = revoked;
+        next
     }
 }
 

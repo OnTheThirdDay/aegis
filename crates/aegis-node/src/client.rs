@@ -32,6 +32,7 @@ struct TunnelState {
 }
 
 pub struct Tunnel {
+    outbound: OutboundConfig,
     ws: WsClientConfig,
     server_name: String,
     tls: Arc<rustls::ClientConfig>,
@@ -63,9 +64,11 @@ impl Tunnel {
             .ok_or_else(|| "client identity not loaded".to_string())?;
         let c = &cfg.core;
         Ok(Tunnel {
+            outbound: ob.clone(),
             ws: WsClientConfig {
                 url: ob.url.clone().unwrap_or_default(),
                 outer_ca_pem,
+                outer_server_name: ob.outer_server_name.clone(),
                 connect_timeout: Duration::from_millis(u64::from(c.connect_timeout_ms)),
                 handshake_timeout: Duration::from_millis(u64::from(c.tls_handshake_timeout_ms)),
                 max_message_bytes: 128 * 1024,
@@ -101,12 +104,16 @@ impl Tunnel {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn matches(&self, outbound: &OutboundConfig) -> bool {
+        &self.outbound == outbound
+    }
+
     async fn connect_once(&self) -> Result<Session, ReasonGroup> {
         let started = Instant::now();
         let ws = aegis_transport_ws::connect(&self.ws)
             .await
             .map_err(|_| ReasonGroup::Transport)?;
-        let (tls_stream, _gateway) = tls::connect(
+        let (tls_stream, gateway) = tls::connect(
             Arc::clone(&self.tls),
             &self.server_name,
             ws,
@@ -115,9 +122,11 @@ impl Tunnel {
         .await
         .map_err(|_| ReasonGroup::Tls)?;
         let obs: Arc<dyn Observability> = self.obs.clone();
+        let mut session_cfg = self.session_cfg.clone();
+        session_cfg.expected_peer_node_id = Some(gateway.node_id);
         let session = client_handshake(
             tls_stream,
-            self.session_cfg.clone(),
+            session_cfg,
             self.budget.child(self.peer_budget),
             obs,
         )
@@ -241,7 +250,7 @@ async fn route(
     ));
     match ob.kind {
         OutboundKind::AgpTunnel => {
-            let tunnel = ctx.tunnels.get(&outbound).ok_or(OpenFailure::Unavailable)?;
+            let tunnel = ctx.tunnel_for(ob, &admitted.bundle.compiled.config).await?;
             tunnel.open(dest, timeout).await.map(Upstream::Mux)
         }
         OutboundKind::DirectTcp => dial_direct(ctx, &admitted, dest, inbound, None, timeout)
@@ -268,6 +277,94 @@ async fn run_relay(ctx: &NodeContext, mut local: TcpStream, mut upstream: Upstre
                 reason: ReasonGroup::Other,
             });
         }
+    }
+}
+
+/// Forward one plain-HTTP request: the rebuilt head and exactly the declared
+/// body go upstream; afterwards only the response flows back (client bytes
+/// are discarded) until the origin closes, so a reused client connection can
+/// never send a second request to this destination. Upgrades relay both
+/// directions.
+async fn run_forward(
+    ctx: &NodeContext,
+    mut local: TcpStream,
+    mut upstream: Upstream,
+    request: aegis_inbound_http::Forward,
+    leftover: bytes::Bytes,
+) {
+    use tokio::io::AsyncReadExt;
+    ctx.obs().record(Event::StreamOpened);
+    let _active = ActiveGuard::new(&ctx.streams_active);
+    let idle = Duration::from_secs(u64::from(ctx.startup.core.idle_timeout_seconds));
+    let outcome = async {
+        upstream.write_all(&request.head).await?;
+        let first = leftover
+            .len()
+            .min(usize::try_from(request.body_len).unwrap_or(usize::MAX));
+        upstream.write_all(&leftover[..first]).await?;
+        let mut remaining = request.body_len - first as u64;
+        let mut buf = vec![0u8; 16 * 1024];
+        while remaining > 0 {
+            let want = buf
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            let n = tokio::time::timeout(idle, local.read(&mut buf[..want]))
+                .await
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            upstream.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
+        }
+        upstream.flush().await?;
+        if request.upgrade {
+            return Ok(Some(relay(&mut local, &mut upstream, idle).await));
+        }
+        let (mut local_read, mut local_write) = local.split();
+        let response = async {
+            loop {
+                let n = tokio::time::timeout(idle, upstream.read(&mut buf))
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+                if n == 0 {
+                    break;
+                }
+                local_write.write_all(&buf[..n]).await?;
+            }
+            local_write.flush().await?;
+            Ok::<_, std::io::Error>(())
+        };
+        let discard = async {
+            let mut sink = [0u8; 4096];
+            while let Ok(n) = local_read.read(&mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            r = response => r.map(|_| None),
+            _ = discard => Ok(None),
+        }
+    }
+    .await;
+    let outcome = match outcome {
+        Ok(Some(relayed)) => relayed,
+        Ok(None) => RelayOutcome::Completed,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => RelayOutcome::IdleTimeout,
+        Err(e) => RelayOutcome::Error(e.kind()),
+    };
+    match upstream {
+        Upstream::Mux(m) => finish_mux(m, outcome, ctx.obs()),
+        Upstream::Tcp(_) => ctx.obs().record(Event::StreamClosed {
+            result: match outcome {
+                RelayOutcome::Completed => OperationResult::Ok,
+                RelayOutcome::IdleTimeout => OperationResult::Timeout,
+                RelayOutcome::Error(_) => OperationResult::Error,
+            },
+            reason: ReasonGroup::Other,
+        }),
     }
 }
 
@@ -383,9 +480,24 @@ pub async fn serve_http(
         let id = Arc::clone(&id);
         tokio::spawn(async move {
             let _ = tcp.set_nodelay(true);
-            let Ok((dest, leftover)) = aegis_inbound_http::read_request(&mut tcp, &cfg).await
-            else {
+            let Ok((request, leftover)) = aegis_inbound_http::read_any(&mut tcp, &cfg).await else {
                 return;
+            };
+            let dest = match request {
+                aegis_inbound_http::Request::Connect(d) => d,
+                aegis_inbound_http::Request::Forward(f) => {
+                    match route(&ctx, &f.dest, &id).await {
+                        Ok(up) => run_forward(&ctx, tcp, up, f, leftover).await,
+                        Err(e) => {
+                            ctx.obs().record(Event::StreamClosed {
+                                result: OperationResult::Denied,
+                                reason: e.group(),
+                            });
+                            let _ = aegis_inbound_http::respond_failure(&mut tcp, e).await;
+                        }
+                    }
+                    return;
+                }
             };
             match route(&ctx, &dest, &id).await {
                 Ok(mut up) => {

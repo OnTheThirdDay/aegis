@@ -14,5 +14,17 @@ aegis-config = { workspace = true }
 aegis-contracts = { workspace = true }
 aegis-identity = { workspace = true }
 aegis-node = { workspace = true }
+aegis-join = { workspace = true }
+aegis-provision = { workspace = true }
+aegis-storage = { workspace = true }
+aegis-core = { workspace = true }
+aegis-platform = { workspace = true }
+aegis-management = { workspace = true }
+aegis-telemetry = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "process", "signal", "net", "macros"] }
+zeroize.workspace = true
 serde_json = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,10 +1,15 @@
 //! `/api/v1` routes.
 
+mod appliance;
 mod auth;
+mod devices;
+pub mod edge;
 mod nodes;
 mod profiles;
+mod provision;
 mod system;
 pub mod telemetry;
+mod users;
 mod vpn;
 
 use crate::auth::Principal;
@@ -12,7 +17,7 @@ use crate::http_util::{ApiError, MAX_BODY};
 use crate::ManagementContext;
 use aegis_core::rfc3339;
 use aegis_storage::JobRow;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post, put};
 use axum::Router;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -21,7 +26,37 @@ pub type Ctx = Arc<ManagementContext>;
 
 pub fn routes(_ctx: Ctx) -> Router<Ctx> {
     Router::new()
+        .route(
+            "/api/v1/provision/plans",
+            get(provision::list).post(provision::plan),
+        )
+        .route("/api/v1/provision/plans/{id}", get(provision::get))
+        .route("/api/v1/provision/plans/{id}/apply", post(provision::apply))
+        .route(
+            "/api/v1/provision/plans/{id}/recover",
+            post(provision::recover),
+        )
         .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/password", post(auth::change_password))
+        .route("/api/v1/users", get(users::list).post(users::create))
+        .route("/api/v1/users/{id}", patch(users::update))
+        .route(
+            "/api/v1/users/{id}/reset-password",
+            post(users::reset_password),
+        )
+        .route("/api/v1/devices", get(devices::list))
+        .route("/api/v1/devices/invite", post(devices::invite))
+        .route("/api/v1/devices/{id}/revoke", post(devices::revoke))
+        .route("/api/v1/system/info", get(appliance::info))
+        .route("/api/v1/system/connection", put(appliance::put_connection))
+        .route("/api/v1/system/web-ca.pem", get(appliance::web_ca))
+        .route("/api/v1/system/downloads", get(appliance::downloads))
+        .route("/downloads/{name}", get(appliance::download_file))
+        .route("/api/v1/integrations", get(appliance::integrations))
+        .route(
+            "/api/v1/integrations/{id}/{action}",
+            post(appliance::integration_action),
+        )
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/bootstrap/claim", post(auth::bootstrap_claim))
@@ -36,6 +71,7 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
         )
         .route("/api/v1/nodes/{id}", get(nodes::get_one))
         .route("/api/v1/nodes/{id}/revoke", post(nodes::revoke))
+        .route("/api/v1/nodes/{id}/renew", post(nodes::renew))
         .route(
             "/api/v1/profiles",
             get(profiles::list).post(profiles::create),

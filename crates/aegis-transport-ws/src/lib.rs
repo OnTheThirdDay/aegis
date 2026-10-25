@@ -153,6 +153,59 @@ where
     Ok(WsDuplex::new(ws))
 }
 
+/// A stream whose first bytes were already read (e.g. to route a request by
+/// path); they are replayed before the rest of the underlying stream.
+pub struct Prefixed<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S> Prefixed<S> {
+    pub fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Prefixed {
+            prefix,
+            pos: 0,
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.pos < this.prefix.len() {
+            let n = (this.prefix.len() - this.pos).min(buf.remaining());
+            buf.put_slice(&this.prefix[this.pos..this.pos + n]);
+            this.pos += n;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -165,6 +218,10 @@ pub struct WsClientConfig {
     /// Extra trust anchor for the outer TLS hop (PEM). Public roots are used
     /// otherwise.
     pub outer_ca_pem: Option<String>,
+    /// Verify the outer certificate against this name instead of the URL
+    /// host. With it, `outer_ca_pem` is the only trust anchor: a pinned
+    /// private outer CA never widens to public roots.
+    pub outer_server_name: Option<String>,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
     pub max_message_bytes: usize,
@@ -254,9 +311,20 @@ impl AsyncWrite for OuterStream {
     }
 }
 
-fn outer_tls_config(extra_ca: Option<&str>) -> Result<Arc<rustls::ClientConfig>, WsError> {
+fn outer_tls_config(
+    extra_ca: Option<&str>,
+    pinned_only: bool,
+) -> Result<Arc<rustls::ClientConfig>, WsError> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if pinned_only {
+        if extra_ca.is_none() {
+            return Err(WsError::Config(
+                "outer_server_name requires a pinned outer CA".into(),
+            ));
+        }
+    } else {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
     if let Some(pem) = extra_ca {
         for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
             let cert = cert.map_err(|_| WsError::Config("invalid outer CA PEM".into()))?;
@@ -288,9 +356,14 @@ pub async fn connect(cfg: &WsClientConfig) -> Result<WsDuplex<OuterStream>, WsEr
     .map_err(WsError::Connect)?;
     let _ = tcp.set_nodelay(true);
     let outer = if url.tls {
-        let config = outer_tls_config(cfg.outer_ca_pem.as_deref())?;
-        let name = ServerName::try_from(url.host.clone())
-            .map_err(|_| WsError::InvalidUrl("invalid TLS server name"))?;
+        let config =
+            outer_tls_config(cfg.outer_ca_pem.as_deref(), cfg.outer_server_name.is_some())?;
+        let name = ServerName::try_from(
+            cfg.outer_server_name
+                .clone()
+                .unwrap_or_else(|| url.host.clone()),
+        )
+        .map_err(|_| WsError::InvalidUrl("invalid TLS server name"))?;
         let tls = tokio::time::timeout(
             cfg.handshake_timeout,
             tokio_rustls::TlsConnector::from(config).connect(name, tcp),

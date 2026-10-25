@@ -1,7 +1,9 @@
 use super::Ctx;
+use crate::auth::Principal;
 use crate::http_util::{json, read_json, ApiError, ApiResult};
 use crate::ManagementContext;
 use aegis_core::rfc3339;
+use aegis_storage as db;
 use axum::body::Body;
 use axum::extract::State;
 use http::{header, HeaderMap, Method, StatusCode};
@@ -28,17 +30,56 @@ pub async fn login(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Ap
     }
     let c = ctx.clone();
     let (token, p) = super::blocking(move || c.login(&b.username, &b.password)).await?;
-    let cookie = ManagementContext::session_cookie(&token, crate::auth::SESSION_TTL.as_secs());
-    Ok(json(
-        StatusCode::OK,
-        &json!({
-            "principal_id": p.id,
-            "scopes": p.scopes,
-            "expires_at": rfc3339(p.expires_at),
-            "csrf_token": p.csrf_token,
-        }),
-        &[(header::SET_COOKIE, cookie)],
-    ))
+    session_response(&ctx, &token, &p).await
+}
+
+async fn session_response(ctx: &Ctx, token: &str, p: &Principal) -> ApiResult {
+    let cookie = ManagementContext::session_cookie(token, crate::auth::SESSION_TTL.as_secs());
+    let body = principal_json(ctx, p).await?;
+    Ok(json(StatusCode::OK, &body, &[(header::SET_COOKIE, cookie)]))
+}
+
+async fn principal_json(ctx: &Ctx, p: &Principal) -> Result<serde_json::Value, ApiError> {
+    let c = ctx.clone();
+    let id = p.id.clone();
+    let row =
+        super::blocking(move || Ok(c.coord.store().read(|c| db::get_principal(c, &id))?)).await?;
+    Ok(json!({
+        "principal_id": p.id,
+        "username": row.username,
+        "roles": row.roles,
+        "scopes": p.scopes,
+        "expires_at": rfc3339(p.expires_at),
+        "csrf_token": p.csrf_token,
+        "password_change_required": p.password_change_required(),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordBody {
+    current_password: String,
+    new_password: String,
+}
+
+/// Change the caller's own password (also completes a forced change).
+pub async fn change_password(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::POST)?;
+    if p.kind != crate::auth::CredentialKind::Cookie {
+        return Err(ApiError::forbidden().detail("sign in interactively to change a password"));
+    }
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let b: PasswordBody =
+        serde_json::from_value(v).map_err(|_| ApiError::bad_request("invalid_body"))?;
+    if b.current_password.len() > 1024 || b.new_password.len() > 1024 {
+        return Err(ApiError::bad_request("invalid_body"));
+    }
+    let c = ctx.clone();
+    let id = p.id.clone();
+    let (token, next) =
+        super::blocking(move || c.change_password(&id, &b.current_password, &b.new_password))
+            .await?;
+    session_response(&ctx, &token, &next).await
 }
 
 pub async fn logout(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
@@ -54,16 +95,8 @@ pub async fn logout(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
 
 pub async fn me(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
     let p = ctx.authenticate(&headers, &Method::GET)?;
-    Ok(json(
-        StatusCode::OK,
-        &json!({
-            "principal_id": p.id,
-            "scopes": p.scopes,
-            "expires_at": rfc3339(p.expires_at),
-            "csrf_token": p.csrf_token,
-        }),
-        &[],
-    ))
+    let body = principal_json(&ctx, &p).await?;
+    Ok(json(StatusCode::OK, &body, &[]))
 }
 
 #[derive(Deserialize)]
@@ -81,9 +114,15 @@ pub async fn bootstrap_claim(State(ctx): State<Ctx>, headers: HeaderMap, body: B
     if b.bootstrap_token.is_empty() || b.bootstrap_token.len() > 256 {
         return Err(ApiError::bad_request("invalid_body"));
     }
+    let permit = ctx.begin_bootstrap_claim()?;
     let c = ctx.clone();
     let id = super::blocking(move || {
-        c.claim_bootstrap(&b.bootstrap_token, &b.owner_username, &b.owner_password)
+        c.claim_bootstrap_admitted(
+            &b.bootstrap_token,
+            &b.owner_username,
+            &b.owner_password,
+            permit,
+        )
     })
     .await?;
     Ok(json(StatusCode::CREATED, &json!({"principal_id": id}), &[]))

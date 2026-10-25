@@ -242,16 +242,23 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
     }
     check_core(&cfg.core, &mut ctx);
 
-    // Management plane: loopback only in this build (no management TLS).
+    // Management plane: loopback by default. A non-loopback console needs
+    // both an explicit opt-in and HTTPS (ADR-0007).
     let mgmt = &cfg.management;
     if mgmt.enabled {
         match mgmt.bind.parse::<SocketAddr>() {
             Ok(a) if is_loopback_bind(&a) => {}
-            Ok(_) => ctx.err("management.bind must be loopback: remote management requires TLS, which this build does not provide"),
+            Ok(_) if mgmt.remote_access_enabled && mgmt.tls.is_some() => {}
+            Ok(_) => ctx.err("management.bind must be loopback unless remote_access_enabled=true and management.tls is configured"),
             Err(_) => ctx.err("management.bind is not a valid socket address"),
         }
-        if mgmt.remote_access_enabled {
-            ctx.err("management.remote_access_enabled=true requires TLS-protected remote management, which this build does not provide");
+        if mgmt.remote_access_enabled && mgmt.tls.is_none() {
+            ctx.err("management.remote_access_enabled=true requires management.tls");
+        }
+        if let Some(tls) = &mgmt.tls {
+            if let Err(e) = secret::parse_ref(tls) {
+                ctx.err(format!("management.tls: {e}"));
+            }
         }
         if mgmt.config_store.is_empty() {
             ctx.err("management.config_store is required");
@@ -267,6 +274,18 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
 
     // Identity material: references only, never inline values.
     let id = &cfg.identity;
+    if cfg.schema_version == "0.2" && !id.require_enrollment {
+        ctx.err("schema 0.2 requires identity.require_enrollment=true");
+    }
+    if id
+        .legacy_identity_until
+        .is_some_and(|t| !(0..=1_800_662_400).contains(&t))
+    {
+        ctx.err("identity.legacy_identity_until must not exceed 2027-01-23 UTC");
+    }
+    if !id.require_enrollment {
+        ctx.warn("legacy CA authorization is deprecated and ends 2027-01-23 UTC; migrate to schema 0.2 and register existing devices");
+    }
     if id.verify_peer == Some(false) {
         ctx.err(
             "identity.verify_peer=false: disabling peer certificate verification is never allowed",
@@ -274,8 +293,16 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
     }
     match role {
         Role::Gateway => {
-            ctx.secret("identity.server_identity", &id.server_identity, true);
-            ctx.secret("identity.server_private_key", &id.server_private_key, true);
+            ctx.secret(
+                "identity.server_identity",
+                &id.server_identity,
+                id.material_bundle.is_none(),
+            );
+            ctx.secret(
+                "identity.server_private_key",
+                &id.server_private_key,
+                id.material_bundle.is_none(),
+            );
             ctx.secret("identity.trusted_client_ca", &id.trusted_client_ca, true);
             ctx.secret("identity.ca_certificate", &id.ca_certificate, false);
             ctx.secret("identity.ca_private_key", &id.ca_private_key, false);
@@ -290,8 +317,16 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
             }
         }
         Role::Client => {
-            ctx.secret("identity.client_identity", &id.client_identity, true);
-            ctx.secret("identity.client_private_key", &id.client_private_key, true);
+            ctx.secret(
+                "identity.client_identity",
+                &id.client_identity,
+                id.material_bundle.is_none(),
+            );
+            ctx.secret(
+                "identity.client_private_key",
+                &id.client_private_key,
+                id.material_bundle.is_none(),
+            );
             ctx.secret("identity.trusted_server_ca", &id.trusted_server_ca, true);
             if id.server_identity.is_some()
                 || id.server_private_key.is_some()
@@ -301,6 +336,23 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
                 ctx.err("gateway identity fields are not valid on a client");
             }
         }
+    }
+    ctx.secret("identity.material_bundle", &id.material_bundle, false);
+    ctx.secret("identity.issuer_bundle", &id.issuer_bundle, false);
+    if id.material_bundle.is_some()
+        && (id.server_identity.is_some()
+            || id.server_private_key.is_some()
+            || id.client_identity.is_some()
+            || id.client_private_key.is_some())
+    {
+        ctx.err("identity material bundle and individual leaf references are mutually exclusive");
+    }
+    if id.issuer_bundle.is_some()
+        && (role != Role::Gateway || id.ca_certificate.is_some() || id.ca_private_key.is_some())
+    {
+        ctx.err(
+            "issuer bundle is gateway-only and cannot be combined with legacy issuer references",
+        );
     }
     if id.node_certificate_days.is_some_and(|d| d == 0 || d > 90) {
         ctx.err("identity.node_certificate_days must be 1..=90");
@@ -317,6 +369,24 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
     let mut ws_count = 0;
     let mut local_count = 0;
     for ib in &cfg.inbounds {
+        if let Some(tls) = &ib.outer_tls {
+            if ib.kind != InboundKind::Websocket {
+                ctx.err("outer_tls requires websocket ingress");
+            }
+            if secret::parse_ref(&tls.bundle).is_err()
+                || aegis_contracts::destination::normalize_domain(&tls.server_name).as_ref()
+                    != Ok(&tls.server_name)
+            {
+                ctx.err("invalid outer TLS bundle or server DNS name");
+            }
+            if tls
+                .trusted_ca
+                .as_ref()
+                .is_some_and(|ca| secret::parse_ref(ca).is_err())
+            {
+                ctx.err("invalid outer TLS trust reference");
+            }
+        }
         if !valid_id(&ib.id) || !ids.insert(ib.id.clone()) {
             ctx.err(format!("inbound id {:?} is invalid or duplicated", ib.id));
         }
@@ -501,6 +571,20 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
                     &ob.outer_ca,
                     false,
                 );
+                if let Some(name) = &ob.outer_server_name {
+                    if ob.outer_ca.is_none() {
+                        ctx.err(format!(
+                            "outbound {}: outer_server_name requires outer_ca (a pinned outer trust anchor)",
+                            ob.id
+                        ));
+                    }
+                    if aegis_contracts::destination::normalize_domain(name).as_ref() != Ok(name) {
+                        ctx.err(format!(
+                            "outbound {}: outer_server_name must be a canonical DNS name",
+                            ob.id
+                        ));
+                    }
+                }
                 if let Err(e) = reg.require_capability(ModuleIds::WEBSOCKET, Capability::ByteStream)
                 {
                     ctx.err(format!("outbound {}: {e}", ob.id));

@@ -18,13 +18,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::time::Instant;
 
 /// Largest batch the writer assembles before issuing one transport write.
 const WRITE_BATCH: usize = 64 * 1024;
 const TIMER_TICK: Duration = Duration::from_millis(250);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
@@ -41,6 +42,8 @@ pub struct PeerInfo {
 pub struct SessionStats {
     pub streams: usize,
     pub recv_reserved: u64,
+    /// Backing storage for receive rings, bounded by `recv_reserved`.
+    pub recv_allocated: u64,
     pub recv_outstanding: u64,
     pub recv_buffered: u64,
     pub recv_pending_grant: u64,
@@ -58,10 +61,61 @@ pub(crate) enum ResetPhase {
     },
 }
 
+/// One fixed allocation per stream, independent of peer DATA fragmentation.
+/// The session's receive reservation and stream-count limit cover these rings
+/// before any stream credit is advertised.
+#[derive(Debug)]
+pub(crate) struct ReceiveBuffer {
+    bytes: Box<[u8]>,
+    start: usize,
+    len: usize,
+}
+
+impl ReceiveBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            bytes: vec![0; capacity].into_boxed_slice(),
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn append(&mut self, data: &[u8]) -> bool {
+        if data.len() > self.capacity() - self.len {
+            return false;
+        }
+        let end = (self.start + self.len) % self.capacity();
+        let first = data.len().min(self.capacity() - end);
+        self.bytes[end..end + first].copy_from_slice(&data[..first]);
+        self.bytes[..data.len() - first].copy_from_slice(&data[first..]);
+        self.len += data.len();
+        true
+    }
+
+    pub fn read_into(&mut self, out: &mut ReadBuf<'_>) -> usize {
+        let n = self.len.min(out.remaining());
+        let first = n.min(self.capacity() - self.start);
+        out.put_slice(&self.bytes[self.start..self.start + first]);
+        out.put_slice(&self.bytes[..n - first]);
+        self.start = (self.start + n) % self.capacity();
+        self.len -= n;
+        n
+    }
+
+    fn clear(&mut self) {
+        self.start = 0;
+        self.len = 0;
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Entry {
     pub state: StreamState,
-    pub rx: VecDeque<Bytes>,
+    pub rx: ReceiveBuffer,
     pub rx_buffered: u32,
     pub rx_outstanding: u32,
     pub pending_grant: u32,
@@ -91,7 +145,7 @@ impl Entry {
     ) -> Self {
         Entry {
             state,
-            rx: VecDeque::new(),
+            rx: ReceiveBuffer::new(rx_window as usize),
             rx_buffered: 0,
             rx_outstanding: rx_window,
             pending_grant: 0,
@@ -321,9 +375,9 @@ impl Shared {
                 Some(ResetReason::ProtocolError)
             }
             SessionError::Closed(r) => Some(*r),
-            SessionError::ResetDrainTimeout | SessionError::KeepaliveTimeout => {
-                Some(ResetReason::Timeout)
-            }
+            SessionError::ResetDrainTimeout
+            | SessionError::KeepaliveTimeout
+            | SessionError::WriteTimeout => Some(ResetReason::Timeout),
             _ => None,
         };
         if let Some(reason) = reason {
@@ -345,7 +399,7 @@ impl Shared {
         }
         st.ready.clear();
         st.incoming_tx = None;
-        let _ = self.closed_tx.send(true);
+        self.closed_tx.send_replace(true);
         self.writer.notify_one();
         self.obs.record(Event::SessionClosed);
     }
@@ -512,6 +566,7 @@ impl Session {
         SessionStats {
             streams: st.streams.len(),
             recv_reserved: st.recv_reserved,
+            recv_allocated: st.streams.values().map(|e| e.rx.capacity() as u64).sum(),
             recv_outstanding: st.recv_outstanding,
             recv_buffered: st.recv_buffered,
             recv_pending_grant: st.recv_pending_grant,
@@ -749,6 +804,15 @@ where
             )));
         }
         let ack = Hello::decode(frame.payload)?;
+        if cfg
+            .expected_peer_node_id
+            .as_ref()
+            .is_some_and(|expected| expected != &ack.node_id)
+        {
+            return Err(SessionError::Protocol(ProtocolError::Violation(
+                "HELLO_ACK identity mismatch",
+            )));
+        }
         if ack.protocol_min != VERSION_MAJOR || ack.protocol_max != VERSION_MAJOR {
             return Err(SessionError::Protocol(ProtocolError::UnsupportedVersion(
                 ack.protocol_max,
@@ -1213,9 +1277,9 @@ fn on_data(
         shared.writer.notify_one();
         return Ok(());
     }
-    // Copy into an exact-size buffer so queued data never pins a larger
-    // read allocation beyond what was reserved.
-    e.rx.push_back(Bytes::copy_from_slice(&payload));
+    if !e.rx.append(&payload) {
+        return Err(violation("DATA exceeds receive buffer capacity"));
+    }
     e.rx_buffered += n;
     if let Some(w) = e.read_waker.take() {
         w.wake();
@@ -1419,6 +1483,7 @@ fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result
 
 async fn writer_task<W: AsyncWrite + Unpin>(shared: Arc<Shared>, mut wr: W) {
     let mut out = BytesMut::with_capacity(WRITE_BATCH + aegis_agp::MAX_FRAME_LEN);
+    let mut closed_rx = shared.closed_tx.subscribe();
     loop {
         out.clear();
         let finished = {
@@ -1435,30 +1500,45 @@ async fn writer_task<W: AsyncWrite + Unpin>(shared: Arc<Shared>, mut wr: W) {
                 false
             }
         };
-        if !out.is_empty() {
-            let res = async {
+        if finished {
+            // A final GOAWAY is best-effort. Bound the entire operation,
+            // including its write/flush, rather than just shutdown.
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
                 wr.write_all(&out).await?;
-                wr.flush().await
-            }
+                wr.flush().await?;
+                wr.shutdown().await
+            })
             .await;
+            return;
+        }
+        if !out.is_empty() {
+            let res = tokio::select! {
+                // Preserve a complete ready write before observing closure.
+                // If it stalls, cancellation drops the transport immediately:
+                // appending GOAWAY after a partially written frame is unsafe.
+                biased;
+                r = tokio::time::timeout(shared.cfg.keepalive_timeout, async {
+                    wr.write_all(&out).await?;
+                    wr.flush().await
+                }) => r,
+                _ = closed_rx.wait_for(|c| *c) => return,
+            };
             match res {
-                Ok(()) => shared.obs.record(Event::TransportBytes {
+                Ok(Ok(())) => shared.obs.record(Event::TransportBytes {
                     direction: aegis_contracts::observability::Direction::Up,
                     bytes: out.len() as u64,
                 }),
-                Err(e) => {
-                    {
-                        let mut st = shared.lock();
-                        shared.fail(&mut st, SessionError::Io(e.kind()));
-                    }
-                    let _ = wr.shutdown().await;
+                Ok(Err(e)) => {
+                    let mut st = shared.lock();
+                    shared.fail(&mut st, SessionError::Io(e.kind()));
+                    return;
+                }
+                Err(_) => {
+                    let mut st = shared.lock();
+                    shared.fail(&mut st, SessionError::WriteTimeout);
                     return;
                 }
             }
-        }
-        if finished {
-            let _ = tokio::time::timeout(Duration::from_secs(2), wr.shutdown()).await;
-            return;
         }
         if out.is_empty() {
             shared.writer.notified().await;

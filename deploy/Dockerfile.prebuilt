@@ -1,17 +1,47 @@
-# Thin runtime image around binaries built elsewhere (e.g. on an
-# x86_64-unknown-linux-gnu host with glibc <= 2.36). Same runtime contract
-# as deploy/Dockerfile: rootless uid 10001, no TUN, no NET_ADMIN.
+# AegisNet appliance image from prebuilt binaries — built by the release
+# workflow (.github/workflows/release.yml) for linux/amd64 and linux/arm64,
+# or locally from `deploy/build-bundle.sh` output.
 #
-# Build context must contain bin/aegisd and bin/aegisctl.
+# Build context:
+#   bin/<amd64|arm64>/aegisd  aegisctl  cloudflared
+#   clients/                  (client app builds offered in the console)
+#
+# Runtime contract: unprivileged uid 10001, read-only root filesystem, no
+# capabilities, one volume for all state. The console (8443) is HTTPS-only;
+# devices connect to the edge (8444); 8080 answers ACME HTTP-01 challenges
+# only while a certificate is being issued.
+#
 # Pin the base image to a reviewed digest before release use.
 FROM debian:bookworm-slim
+ARG TARGETARCH
+# cloudflared 2026.10.0 release checksums (re-verified at runtime by aegisd).
+ARG CLOUDFLARED_SHA256_amd64=d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db
+ARG CLOUDFLARED_SHA256_arm64=e6422b9d4f72d3194bc5a38676f13667c06666523217b842a877d72a80b5ac08
 RUN groupadd --system --gid 10001 aegisnet \
     && useradd --system --uid 10001 --gid 10001 --home-dir /var/lib/aegisnet --shell /usr/sbin/nologin aegisnet \
+    && apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
     && install -d -o 10001 -g 10001 -m 0700 /var/lib/aegisnet \
-    && install -d -m 0755 /etc/aegisnet
-COPY bin/aegisd bin/aegisctl /usr/local/bin/
+    && install -d -m 0755 /usr/share/aegisnet/clients
+COPY bin/${TARGETARCH}/aegisd bin/${TARGETARCH}/aegisctl bin/${TARGETARCH}/cloudflared /usr/local/bin/
+RUN set -e; \
+    case "$TARGETARCH" in \
+      amd64) sum="$CLOUDFLARED_SHA256_amd64" ;; \
+      arm64) sum="$CLOUDFLARED_SHA256_arm64" ;; \
+      *) echo "unsupported architecture $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "$sum  /usr/local/bin/cloudflared" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/aegisd /usr/local/bin/aegisctl /usr/local/bin/cloudflared
+COPY clients/ /usr/share/aegisnet/clients/
+ENV AEGIS_DATA_DIR=/var/lib/aegisnet
 USER 10001:10001
 VOLUME ["/var/lib/aegisnet"]
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+EXPOSE 8443 8444 8080
+# Health uses the owner-only local IPC socket; there is deliberately no
+# unauthenticated HTTP health endpoint.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/usr/local/bin/aegisctl", "--socket", "/var/lib/aegisnet/aegisd.sock", "health"]
-ENTRYPOINT ["/usr/local/bin/aegisd", "--config", "/etc/aegisnet/config.toml"]
+ENTRYPOINT ["/usr/local/bin/aegisd"]
+LABEL org.opencontainers.image.title="AegisNet gateway" \
+      org.opencontainers.image.source="https://github.com/OnTheThirdDay/aegis"

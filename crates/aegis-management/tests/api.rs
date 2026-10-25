@@ -696,7 +696,7 @@ async fn tc_priv06_export_requires_permission_etag_and_preview() {
         &t.app,
         req(
             "GET",
-            "/api/v1/telemetry/preview?service_name=network-runtime",
+            "/api/v1/telemetry/preview?service_name=network-runtime&collector_url=https%3A%2F%2F127.0.0.1%3A9%2Fv1%2Fmetrics",
         )
         .header(header::COOKIE, &cookie)
         .body(Body::empty())
@@ -800,7 +800,7 @@ async fn enrollment_redeem_is_one_use() {
             .header("x-csrf-token", &csrf)
             .header(header::CONTENT_TYPE, "application/json")
             .body(json_body(
-                &json!({"role": "agent", "expires_in_seconds": 120}),
+                &json!({"role": "agent", "expires_in_seconds": 120, "node_name":"laptop-9"}),
             ))
             .expect("req"),
     )

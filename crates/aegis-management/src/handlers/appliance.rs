@@ -1,0 +1,329 @@
+//! Appliance console endpoints: setup status, server address, web CA
+//! download and built-in integrations ("plugins"). Integration work runs in
+//! the composition root behind [`crate::ApplianceServices`]; this module
+//! only authenticates, authorizes, validates and audits.
+
+use super::devices::{connection, valid_public_host, Connection};
+use super::{blocking, Ctx};
+use crate::auth::Permission;
+use crate::http_util::{json, read_json, ApiError, ApiResult};
+use aegis_storage::{self as db, AuditInsert};
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::response::IntoResponse;
+use http::{header, HeaderMap, Method, StatusCode};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+/// Setup checklist and runtime summary for the dashboard.
+pub async fn info(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::GET)?;
+    if p.password_change_required() {
+        return Err(ApiError::forbidden().detail("password change required"));
+    }
+    let c = ctx.clone();
+    let (conn, owners_pending, devices) = blocking(move || {
+        let conn = connection(&c)?;
+        let store = c.coord.store();
+        let pending = store.read_as(|c| -> Result<i64, ApiError> {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM principals p JOIN principal_roles r ON r.principal_id = p.id WHERE r.role = 'owner' AND p.must_change_password = 1",
+                [],
+                |r| r.get(0),
+            ).map_err(db::StoreError::from)?)
+        })?;
+        let devices = store.read_as(|c| -> Result<i64, ApiError> {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE role = 'client' AND status IN ('active','rotating')",
+                [],
+                |r| r.get(0),
+            ).map_err(db::StoreError::from)?)
+        })?;
+        Ok((conn, pending, devices))
+    })
+    .await?;
+    let appliance = ctx.appliance();
+    Ok(json(
+        StatusCode::OK,
+        &json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "appliance": appliance.is_some(),
+            "console_certificate_sha256": ctx.console_fingerprint(),
+            "connection": conn,
+            "checklist": {
+                "owner_password_changed": owners_pending == 0,
+                "server_address_set": conn.public_host.is_some(),
+                "devices_enrolled": devices,
+            },
+            "runtime": appliance.map(|a| a.status()).unwrap_or(Value::Null),
+            "health": ctx.coord.health(),
+        }),
+        &[],
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionBody {
+    public_host: String,
+    public_port: u16,
+}
+
+/// Set the address devices use to reach this server in direct mode.
+pub async fn put_connection(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::PUT)?;
+    p.require(Permission::SystemConfigure)?;
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let b: ConnectionBody =
+        serde_json::from_value(v).map_err(|_| ApiError::bad_request("invalid_body"))?;
+    let host = b.public_host.trim().to_ascii_lowercase();
+    if !valid_public_host(&host) || b.public_port == 0 {
+        return Err(ApiError::bad_request("invalid_public_address")
+            .detail("enter an IP address or DNS name and a port"));
+    }
+    let c = ctx.clone();
+    let actor = p.id.clone();
+    let h = host.clone();
+    let updated = blocking(move || {
+        let mut conn = connection(&c)?;
+        if conn.mode.as_deref().is_some_and(|m| m != "direct") {
+            return Err(ApiError::conflict("integration_controls_address").detail(
+                "a Cloudflare or public-certificate integration manages the device address; disable it first",
+            ));
+        }
+        conn = Connection {
+            mode: Some("direct".into()),
+            public_host: Some(h.clone()),
+            public_port: Some(b.public_port),
+            outer_trust: Some("pinned".into()),
+            inner_server_name: conn.inner_server_name,
+        };
+        let value = serde_json::to_value(&conn).map_err(|_| ApiError::unavailable())?;
+        c.coord.store().tx(|tx| {
+            db::put_setting(tx, "connection", &value)?;
+            db::append_audit(
+                tx,
+                AuditInsert {
+                    actor_id: Some(&actor),
+                    action: "system.connection_updated",
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata: json!({}),
+                },
+            )
+        })?;
+        Ok(conn)
+    })
+    .await?;
+    if let Some(a) = ctx.appliance() {
+        let (names, ips): (Vec<String>, Vec<std::net::IpAddr>) =
+            match host.parse::<std::net::IpAddr>() {
+                Ok(ip) => (vec![], vec![ip]),
+                Err(_) => (vec![host.clone()], vec![]),
+            };
+        let a2 = a.clone();
+        blocking(move || {
+            a2.set_public_addresses(&names, &ips)
+                .map_err(|_| ApiError::conflict("certificate_reissue_failed"))
+        })
+        .await?;
+    }
+    Ok(json(StatusCode::OK, &json!({"connection": updated}), &[]))
+}
+
+/// The local web CA certificate (public), so browsers and clients can trust
+/// the console and edge without warnings.
+pub async fn web_ca(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::GET)?;
+    if p.password_change_required() {
+        return Err(ApiError::forbidden().detail("password change required"));
+    }
+    let pem = aegis_config::secret::read(&ctx.secrets_dir, "secret://web-ca.pem")
+        .map_err(|_| ApiError::not_found())?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-pem-file"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"aegisnet-web-ca.pem\"",
+            ),
+        ],
+        pem,
+    )
+        .into_response())
+}
+
+pub async fn integrations(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::GET)?;
+    p.require(Permission::ProvisionRead)?;
+    let status = ctx.appliance().map(|a| a.status()).unwrap_or(Value::Null);
+    Ok(json(
+        StatusCode::OK,
+        &json!({
+            "appliance": !status.is_null(),
+            "integrations": status.get("integrations").cloned().unwrap_or(json!([])),
+            "third_party_plugins": "Every integration is built in and reviewed. Third-party plugins are not supported, so no external code ever runs inside the gateway.",
+        }),
+        &[],
+    ))
+}
+
+pub async fn integration_action(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path((id, action)): Path<(String, String)>,
+    body: Body,
+) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::POST)?;
+    p.require(Permission::ProviderConfigure)?;
+    if !id.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        || !action.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        || id.len() > 32
+        || action.len() > 32
+    {
+        return Err(ApiError::not_found());
+    }
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let appliance = ctx
+        .appliance()
+        .ok_or_else(|| ApiError::conflict("appliance_mode_required"))?;
+    match appliance.integration(&id, &action, &p.id, v).await {
+        Ok(v) => Ok(json(StatusCode::OK, &v, &[])),
+        Err((status, code)) => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+            Err(ApiError::new(status, "integration_failed").detail(code))
+        }
+    }
+}
+
+const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
+fn download_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn download_label(name: &str) -> String {
+    let n = name.to_ascii_lowercase();
+    let os = if n.contains("windows") || n.ends_with(".exe") {
+        "Windows"
+    } else if n.contains("macos") || n.contains("darwin") {
+        "macOS"
+    } else if n.contains("linux") {
+        "Linux"
+    } else {
+        return name.to_owned();
+    };
+    let arch = if n.contains("arm64") || n.contains("aarch64") {
+        " (ARM64)"
+    } else if n.contains("x86_64") || n.contains("x64") || n.contains("amd64") {
+        " (x64)"
+    } else {
+        ""
+    };
+    format!("AegisNet client for {os}{arch}")
+}
+
+fn downloads_dir(ctx: &crate::ManagementContext) -> Option<std::path::PathBuf> {
+    ctx.downloads_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Client builds offered for download (empty when none are bundled).
+pub async fn downloads(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::GET)?;
+    if p.password_change_required() {
+        return Err(ApiError::forbidden().detail("password change required"));
+    }
+    let c = ctx.clone();
+    let items = blocking(move || {
+        let Some(dir) = downloads_dir(&c) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !download_name_ok(&name) || !meta.is_file() || meta.len() > MAX_DOWNLOAD_BYTES {
+                continue;
+            }
+            let cached = c
+                .download_digests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&name)
+                .filter(|(size, _)| *size == meta.len())
+                .map(|(_, d)| d.clone());
+            let digest = match cached {
+                Some(d) => d,
+                None => {
+                    let Ok(bytes) = std::fs::read(entry.path()) else {
+                        continue;
+                    };
+                    let d = db::sha256_hex(&bytes);
+                    c.download_digests
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(name.clone(), (meta.len(), d.clone()));
+                    d
+                }
+            };
+            out.push(json!({
+                "name": name,
+                "label": download_label(&name),
+                "size": meta.len(),
+                "sha256": digest,
+            }));
+        }
+        out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(out)
+    })
+    .await?;
+    Ok(json(StatusCode::OK, &json!({ "items": items }), &[]))
+}
+
+pub async fn download_file(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::GET)?;
+    if p.password_change_required() || !download_name_ok(&name) {
+        return Err(ApiError::not_found());
+    }
+    let dir = downloads_dir(&ctx).ok_or_else(ApiError::not_found)?;
+    let path = dir.join(&name);
+    let meta = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|_| ApiError::not_found())?;
+    if !meta.is_file() || meta.len() > MAX_DOWNLOAD_BYTES {
+        return Err(ApiError::not_found());
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ApiError::not_found())?;
+    let disposition = format!("attachment; filename=\"{name}\"");
+    let mut resp = axum::response::Response::new(axum::body::Body::from(bytes));
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(v) = http::HeaderValue::from_str(&disposition) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok(resp)
+}

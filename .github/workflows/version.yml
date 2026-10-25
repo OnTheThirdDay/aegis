@@ -1,0 +1,90 @@
+name: Version bump
+
+# Starts a release (see docs/RELEASING.md). Actions -> Version bump -> Run workflow:
+#   1. reads the workspace version from Cargo.toml and bumps it (patch/minor/major,
+#      or an explicit version);
+#   2. commits Cargo.toml + Cargo.lock on branch release/vX.Y.Z (cut from staging);
+#   3. opens a pull request into staging.
+# After it is merged and the staging build is green, the release pull request
+# staging -> main carries it to main, where release.yml tags and publishes vX.Y.Z.
+#
+# Token: PR_TOKEN (fine-grained, this repo: Contents read/write, Pull requests
+# read/write) so the pushed branch and pull request run CI. Without it the built-in
+# token is used; CI then runs once the change reaches staging.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increase
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Or an exact version (e.g. 1.2.0); overrides the choice above
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: staging
+          fetch-depth: 0
+          token: ${{ secrets.PR_TOKEN || github.token }}
+      - name: Compute the next version
+        id: v
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXACT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          IFS=. read -r major minor patch <<< "$current"
+          if [ -n "$EXACT" ]; then
+            next=${EXACT#v}
+          else
+            case "$BUMP" in
+              major) next="$((major + 1)).0.0" ;;
+              minor) next="$major.$((minor + 1)).0" ;;
+              *)     next="$major.$minor.$((patch + 1))" ;;
+            esac
+          fi
+          if ! printf '%s' "$next" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$next' is not a version like 1.2.3"; exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$next" >/dev/null; then
+            echo "::error::v$next is already released"; exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$current" "$next" | sort -V | tail -1)" != "$next" ] || [ "$current" = "$next" ]; then
+            echo "::error::$next is not newer than $current"; exit 1
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+      - name: Commit the bump on release/v${{ steps.v.outputs.next }}
+        env:
+          NEXT: ${{ steps.v.outputs.next }}
+          CURRENT: ${{ steps.v.outputs.current }}
+        run: |
+          set -euo pipefail
+          sed -i "/^\[workspace.package\]/,/^\[/s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+          # Refresh only the workspace members' entries in Cargo.lock.
+          cargo metadata --format-version 1 > /dev/null
+          git diff --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "release/v$NEXT"
+          git commit -am "Release v$NEXT"
+          git push origin "release/v$NEXT"
+      - name: Open the pull request into staging
+        env:
+          GH_TOKEN: ${{ secrets.PR_TOKEN || github.token }}
+          NEXT: ${{ steps.v.outputs.next }}
+        run: |
+          gh pr create --base staging --head "release/v$NEXT" --title "Release v$NEXT" \
+            --body "Bumps the version to **$NEXT**. After merging, the release pull request \`staging\` → \`main\` publishes \`v$NEXT\` (tag, image, GitHub Release) when merged."
