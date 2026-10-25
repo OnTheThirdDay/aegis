@@ -91,7 +91,7 @@ pub fn allowed_dimension_values(key: &str) -> Option<&'static [&'static str]> {
 mod tests {
     use super::*;
 
-    const CATALOG: &str = include_str!("../../../aegis-spec/schemas/telemetry-catalog.yaml");
+    const CATALOG: &str = include_str!("telemetry-catalog.yaml");
 
     #[test]
     fn mirrors_spec_catalog() {
