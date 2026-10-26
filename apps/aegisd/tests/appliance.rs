@@ -416,3 +416,67 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
     .await
     .expect("bounded appliance e2e");
 }
+
+/// Start an appliance whose stored configuration carries `core` (TOML).
+async fn launch_with_core(data: &Path, core: &str) -> aegisd::Running {
+    let opts = InitOptions {
+        public_addresses: vec!["127.0.0.1".into()],
+        console_loopback: true,
+        console_port: Some(free_port()),
+        edge_port: Some(free_port()),
+        tunnel_port: Some(0),
+        ..Default::default()
+    };
+    let path = if data.join("config.toml").exists() {
+        data.join("config.toml")
+    } else {
+        let p = appliance::init(data, &opts).expect("init");
+        let mut text = std::fs::read_to_string(&p).expect("cfg");
+        text.push_str(core);
+        std::fs::write(&p, text).expect("write");
+        p
+    };
+    let cfg = aegisd::parse_config(&std::fs::read_to_string(path).expect("cfg")).expect("parse");
+    let store = std::path::PathBuf::from(&cfg.management.config_store);
+    aegisd::launch(cfg, store, Some(data.to_path_buf()))
+        .await
+        .expect("launch")
+}
+
+fn revisions(data: &Path) -> i64 {
+    let store = aegis_storage::Store::open(data.join("state.db")).expect("store");
+    store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get::<_, i64>(0))?))
+        .expect("count")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_session_limits_are_upgraded_once_and_operator_values_kept() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Pre-0.2 defaults: 31 concurrent connections per device.
+        let legacy = "\n[core]\nmax_streams_per_session = 64\nstream_buffer_budget_bytes = 65536\nsession_window_bytes = 2097152\npeer_buffer_budget_bytes = 8388608\nprocess_buffer_budget_bytes = 33554432\n";
+        let data = tmp.path().join("legacy");
+        let running = launch_with_core(&data, legacy).await;
+        let core = &running.node.ctx.startup.core;
+        assert_eq!(core.max_streams_per_session, 512, "upgraded and restarted");
+        assert_eq!(core.stream_buffer_budget_bytes, 256 * 1024);
+        assert_eq!(core.session_window_bytes, 8 * 1024 * 1024);
+        let after = revisions(&data);
+        running.shutdown().await;
+        let running = launch_with_core(&data, "").await;
+        assert_eq!(running.node.ctx.startup.core.max_streams_per_session, 512);
+        assert_eq!(revisions(&data), after, "no second upgrade");
+        running.shutdown().await;
+
+        // An operator's own limits are not touched.
+        let custom = "\n[core]\nmax_streams_per_session = 64\nsession_window_bytes = 4194304\npeer_buffer_budget_bytes = 8388608\nprocess_buffer_budget_bytes = 33554432\n";
+        let data = tmp.path().join("custom");
+        let running = launch_with_core(&data, custom).await;
+        assert_eq!(running.node.ctx.startup.core.max_streams_per_session, 64);
+        assert_eq!(running.node.ctx.startup.core.session_window_bytes, 4 * 1024 * 1024);
+        running.shutdown().await;
+    })
+    .await
+    .expect("bounded");
+}

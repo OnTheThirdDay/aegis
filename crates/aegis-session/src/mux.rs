@@ -47,6 +47,8 @@ pub struct SessionStats {
     pub recv_outstanding: u64,
     pub recv_buffered: u64,
     pub recv_pending_grant: u64,
+    /// Sum of the streams' current receive windows.
+    pub stream_windows: u64,
     pub send_session_credit: u64,
     pub control_queued: usize,
     pub closed: bool,
@@ -61,9 +63,10 @@ pub(crate) enum ResetPhase {
     },
 }
 
-/// One fixed allocation per stream, independent of peer DATA fragmentation.
-/// The session's receive reservation and stream-count limit cover these rings
-/// before any stream credit is advertised.
+/// Receive ring of one stream. It holds no memory while empty, grows only
+/// as DATA arrives (never beyond the stream's current window) and is
+/// released again once drained, so idle streams cost nothing. The session's
+/// receive reservation bounds the total through the credit invariant.
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
     bytes: Box<[u8]>,
@@ -71,10 +74,13 @@ pub(crate) struct ReceiveBuffer {
     len: usize,
 }
 
+/// Smallest ring allocated when data arrives.
+const RX_MIN_ALLOC: usize = 16 * 1024;
+
 impl ReceiveBuffer {
-    fn new(capacity: usize) -> Self {
+    fn new() -> Self {
         Self {
-            bytes: vec![0; capacity].into_boxed_slice(),
+            bytes: Box::default(),
             start: 0,
             len: 0,
         }
@@ -84,12 +90,29 @@ impl ReceiveBuffer {
         self.bytes.len()
     }
 
-    fn append(&mut self, data: &[u8]) -> bool {
-        if data.len() > self.capacity() - self.len {
+    /// Append `data` if the total buffered stays within `limit` bytes.
+    fn append(&mut self, data: &[u8], limit: usize) -> bool {
+        let needed = self.len + data.len();
+        if needed > limit {
             return false;
         }
-        let end = (self.start + self.len) % self.capacity();
-        let first = data.len().min(self.capacity() - end);
+        if data.is_empty() {
+            return true;
+        }
+        if needed > self.capacity() {
+            let cap = needed.max(self.capacity() * 2).max(RX_MIN_ALLOC).min(limit);
+            let mut grown = vec![0; cap].into_boxed_slice();
+            if self.len > 0 {
+                let first = self.len.min(self.capacity() - self.start);
+                grown[..first].copy_from_slice(&self.bytes[self.start..self.start + first]);
+                grown[first..self.len].copy_from_slice(&self.bytes[..self.len - first]);
+            }
+            self.bytes = grown;
+            self.start = 0;
+        }
+        let cap = self.capacity();
+        let end = (self.start + self.len) % cap;
+        let first = data.len().min(cap - end);
         self.bytes[end..end + first].copy_from_slice(&data[..first]);
         self.bytes[..data.len() - first].copy_from_slice(&data[first..]);
         self.len += data.len();
@@ -98,15 +121,22 @@ impl ReceiveBuffer {
 
     pub fn read_into(&mut self, out: &mut ReadBuf<'_>) -> usize {
         let n = self.len.min(out.remaining());
+        if n == 0 {
+            return 0;
+        }
         let first = n.min(self.capacity() - self.start);
         out.put_slice(&self.bytes[self.start..self.start + first]);
         out.put_slice(&self.bytes[..n - first]);
         self.start = (self.start + n) % self.capacity();
         self.len -= n;
+        if self.len == 0 {
+            self.clear();
+        }
         n
     }
 
     fn clear(&mut self) {
+        self.bytes = Box::default();
         self.start = 0;
         self.len = 0;
     }
@@ -119,6 +149,9 @@ pub(crate) struct Entry {
     pub rx_buffered: u32,
     pub rx_outstanding: u32,
     pub pending_grant: u32,
+    /// Current receive window (`buffered + outstanding + pending_grant`
+    /// while open): starts at the initial window and grows while busy.
+    pub window: u32,
     pub remote_fin: bool,
     pub tx: BytesMut,
     pub tx_cap: usize,
@@ -132,7 +165,8 @@ pub(crate) struct Entry {
     pub write_waker: Option<Waker>,
     pub open_waiter: Option<oneshot::Sender<OpenAck>>,
     pub handle_alive: bool,
-    _tx_reservation: Reservation,
+    /// Backs `tx`; grows as data is written, up to `tx_cap`.
+    pub tx_reservation: Reservation,
 }
 
 impl Entry {
@@ -145,10 +179,11 @@ impl Entry {
     ) -> Self {
         Entry {
             state,
-            rx: ReceiveBuffer::new(rx_window as usize),
+            rx: ReceiveBuffer::new(),
             rx_buffered: 0,
             rx_outstanding: rx_window,
             pending_grant: 0,
+            window: rx_window,
             remote_fin: false,
             tx: BytesMut::new(),
             tx_cap,
@@ -162,7 +197,7 @@ impl Entry {
             write_waker: None,
             open_waiter: None,
             handle_alive: true,
-            _tx_reservation: reservation,
+            tx_reservation: reservation,
         }
     }
 
@@ -196,6 +231,9 @@ pub(crate) struct State {
     pub recv_outstanding: u64,
     pub recv_buffered: u64,
     pub recv_pending_grant: u64,
+    /// Sum of all stream windows; kept within
+    /// `SessionConfig::stream_windows_budget(recv_reserved)`.
+    pub stream_windows: u64,
     /// Next client stream ID to allocate (client role); `None` = exhausted.
     pub next_local_id: Option<u32>,
     /// Highest client stream ID seen (server role); 0 = none yet.
@@ -234,8 +272,19 @@ impl Shared {
         self.peer.max_frame_payload.min(self.cfg.max_frame_payload) as usize
     }
 
-    fn stream_grant_threshold(&self) -> u32 {
-        (self.cfg.stream_window / 4).max(1)
+    /// Whether one more stream can be admitted: below `limit` streams and
+    /// its initial window within the stream-window budget.
+    pub(crate) fn admits(&self, st: &State, limit: u32) -> bool {
+        (st.streams.len() as u32) < limit
+            && st.stream_windows + u64::from(self.cfg.initial_stream_window)
+                <= self.cfg.stream_windows_budget(st.recv_reserved)
+    }
+
+    /// Initial transmit reservation of a stream.
+    pub(crate) fn initial_tx(&self) -> u32 {
+        self.cfg
+            .initial_stream_window
+            .min(self.cfg.stream_tx_buffer)
     }
 
     fn session_grant_threshold(st: &State) -> u64 {
@@ -285,16 +334,31 @@ impl Shared {
     pub fn on_consumed(&self, st: &mut State, id: u32, n: u32) -> Result<(), SessionError> {
         st.recv_buffered -= u64::from(n);
         st.recv_pending_grant += u64::from(n);
-        let threshold = self.stream_grant_threshold();
+        let quota = self.cfg.stream_window;
+        let budget = self.cfg.stream_windows_budget(st.recv_reserved);
         let mut grant = None;
         if let Some(e) = st.streams.get_mut(&id) {
             e.rx_buffered -= n;
             if !e.remote_fin {
                 e.pending_grant += n;
-                if e.pending_grant >= threshold {
-                    grant = Some(e.pending_grant);
-                    e.rx_outstanding += e.pending_grant;
+                if e.pending_grant >= (e.window / 4).max(1) {
+                    // The sender used most of its credit before we could
+                    // replenish it: it is limited by our window, so double
+                    // it (up to the per-stream quota, within the budget).
+                    let mut grow = 0;
+                    if e.rx_outstanding < e.window / 2 && e.window < quota {
+                        let room = budget.saturating_sub(st.stream_windows);
+                        grow = e
+                            .window
+                            .min(quota - e.window)
+                            .min(u32::try_from(room).unwrap_or(u32::MAX));
+                    }
+                    e.window += grow;
+                    st.stream_windows += u64::from(grow);
+                    let amount = e.pending_grant + grow;
+                    e.rx_outstanding += amount;
                     e.pending_grant = 0;
+                    grant = Some(amount);
                 }
             }
         }
@@ -352,7 +416,7 @@ impl Shared {
     /// Remove an entry, returning any buffered receive capacity.
     pub fn remove_entry(&self, st: &mut State, id: u32) {
         self.discard_rx(st, id);
-        st.streams.remove(&id);
+        take_stream(st, id);
         st.ready.retain(|r| *r != id);
         if st.owner_dropped && st.streams.is_empty() && st.closed.is_none() {
             self.fail(st, SessionError::Closed(ResetReason::Shutdown));
@@ -405,6 +469,13 @@ impl Shared {
     }
 }
 
+/// How long an open waits for a free stream slot in a full session, and how
+/// often it looks.
+const SLOT_WAIT: Duration = Duration::from_secs(10);
+const SLOT_POLL: Duration = Duration::from_millis(25);
+/// Pause before retrying an open the peer refused as over quota.
+const SLOT_RETRY: Duration = Duration::from_millis(100);
+
 /// A live AGP session. Dropping the handle closes the session once all of its
 /// streams are gone.
 pub struct Session {
@@ -416,12 +487,70 @@ impl Session {
         &self.shared.peer
     }
 
+    /// Allocate a stream and queue its OPEN (session lock held; the caller
+    /// checked the stream limit). `tx` receives the OPEN_ACK.
+    fn open_locked(
+        &self,
+        st: &mut State,
+        payload: &Bytes,
+        tx: &mut Option<oneshot::Sender<OpenAck>>,
+    ) -> Result<u32, OpenError> {
+        let shared = &self.shared;
+        let id = st.next_local_id.ok_or(OpenError::IdsExhausted)?;
+        let reservation = shared
+            .budget
+            .try_reserve(u64::from(shared.initial_tx()), PoolClass::Transmit)
+            .map_err(|_| OpenError::Quota)?;
+        st.next_local_id = id.checked_add(2);
+        let mut entry = Entry::new(
+            StreamState::Opening,
+            shared.cfg.initial_stream_window,
+            shared.peer.stream_window,
+            shared.cfg.stream_tx_buffer as usize,
+            reservation,
+        );
+        entry.open_waiter = tx.take();
+        st.stream_windows += u64::from(shared.cfg.initial_stream_window);
+        st.streams.insert(id, entry);
+        if let Err(e) = shared.push_control(st, Frame::new(FrameType::Open, id, payload.clone())) {
+            shared.fail(st, e.clone());
+            return Err(OpenError::Session(e));
+        }
+        shared.writer.notify_one();
+        Ok(id)
+    }
+
     /// Open a logical stream (client role). Succeeds only once the gateway
     /// reports a connected destination.
     pub async fn open(
         &self,
         destination: Destination,
         timeout: Duration,
+    ) -> Result<MuxStream, OpenError> {
+        // The peer may count a stream we already released (its side closes a
+        // moment later) and refuse an open as over quota: treat that like our
+        // own full session and retry within the same slot wait.
+        let slot_deadline = tokio::time::Instant::now() + timeout.min(SLOT_WAIT);
+        loop {
+            match self
+                .open_once(destination.clone(), timeout, slot_deadline)
+                .await
+            {
+                Err(OpenError::Rejected(OpenFailure::Quota))
+                    if tokio::time::Instant::now() + SLOT_RETRY < slot_deadline =>
+                {
+                    tokio::time::sleep(SLOT_RETRY).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn open_once(
+        &self,
+        destination: Destination,
+        timeout: Duration,
+        slot_deadline: tokio::time::Instant,
     ) -> Result<MuxStream, OpenError> {
         let shared = &self.shared;
         if !shared.is_client {
@@ -438,41 +567,38 @@ impl Session {
         .encode()
         .map_err(|_| OpenError::Rejected(OpenFailure::Unsupported))?;
         let (tx, rx) = oneshot::channel();
-        let id = {
-            let mut st = shared.lock();
-            if let Some(e) = &st.closed {
-                return Err(OpenError::Session(e.clone()));
+        // A full session (browsers open connections in bursts) waits briefly
+        // for a stream to finish rather than refusing at once: an immediate
+        // refusal is retried at once by the application, which keeps the
+        // session full.
+        let mut tx = Some(tx);
+        let id = loop {
+            // The lock is held only inside this block, never across the wait.
+            let opened = {
+                let mut st = shared.lock();
+                if let Some(e) = &st.closed {
+                    return Err(OpenError::Session(e.clone()));
+                }
+                if st.goaway_received.is_some() || st.goaway_sent {
+                    return Err(OpenError::GoingAway);
+                }
+                let limit = shared.peer.max_streams.min(shared.local_max_streams);
+                if !shared.admits(&st, limit) {
+                    None
+                } else {
+                    Some(self.open_locked(&mut st, &payload, &mut tx)?)
+                }
+            };
+            match opened {
+                Some(id) => break id,
+                None if tokio::time::Instant::now() >= slot_deadline => {
+                    return Err(OpenError::Quota)
+                }
+                None => tokio::time::sleep(SLOT_POLL).await,
             }
-            if st.goaway_received.is_some() || st.goaway_sent {
-                return Err(OpenError::GoingAway);
-            }
-            let limit = shared.peer.max_streams.min(shared.local_max_streams);
-            if st.streams.len() as u32 >= limit {
-                return Err(OpenError::Quota);
-            }
-            let id = st.next_local_id.ok_or(OpenError::IdsExhausted)?;
-            let reservation = shared
-                .budget
-                .try_reserve(u64::from(shared.cfg.stream_tx_buffer), PoolClass::Transmit)
-                .map_err(|_| OpenError::Quota)?;
-            st.next_local_id = id.checked_add(2);
-            let mut entry = Entry::new(
-                StreamState::Opening,
-                shared.cfg.stream_window,
-                shared.peer.stream_window,
-                shared.cfg.stream_tx_buffer as usize,
-                reservation,
-            );
-            entry.open_waiter = Some(tx);
-            st.streams.insert(id, entry);
-            if let Err(e) = shared.push_control(&mut st, Frame::new(FrameType::Open, id, payload)) {
-                shared.fail(&mut st, e.clone());
-                return Err(OpenError::Session(e));
-            }
-            shared.writer.notify_one();
-            id
         };
         let started = std::time::Instant::now();
+
         let outcome = tokio::time::timeout(timeout, rx).await;
         let elapsed = started.elapsed().as_secs_f64();
         let result = match outcome {
@@ -570,6 +696,7 @@ impl Session {
             recv_outstanding: st.recv_outstanding,
             recv_buffered: st.recv_buffered,
             recv_pending_grant: st.recv_pending_grant,
+            stream_windows: st.stream_windows,
             send_session_credit: st.send_session_credit,
             control_queued: st.control.len(),
             closed: st.closed.is_some(),
@@ -678,7 +805,7 @@ fn reject_inner(shared: &Shared, id: u32, failure: OpenFailure) {
         .get(&id)
         .is_some_and(|e| e.state == StreamState::Opening);
     if opening {
-        st.streams.remove(&id);
+        take_stream(&mut st, id);
         let frame = Frame::new(FrameType::OpenAck, id, OpenAck::Failure(failure).encode());
         if let Err(e) = shared.push_control(&mut st, frame) {
             shared.fail(&mut st, e);
@@ -704,19 +831,29 @@ impl Drop for IncomingOpen {
 // Handshake
 // ---------------------------------------------------------------------------
 
+/// Remove a stream entry, releasing its share of the stream-window budget.
+fn take_stream(st: &mut State, id: u32) -> Option<Entry> {
+    let e = st.streams.remove(&id)?;
+    st.stream_windows -= u64::from(e.window);
+    Some(e)
+}
+
 fn reserve(
     budget: &Arc<Budget>,
     cfg: &SessionConfig,
 ) -> Result<(Reservation, Reservation), SessionError> {
-    let min = u64::from(cfg.stream_window) * 2;
-    let rx = budget
-        .try_reserve_range(min, u64::from(cfg.session_window), PoolClass::Receive)
-        .map_err(|_| SessionError::Budget)?;
+    // The small, fixed control reservation first: a tight budget then
+    // yields a smaller receive window rather than a failed handshake.
     let control_bytes = u64::from(cfg.max_frame_payload)
         + aegis_agp::HEADER_LEN as u64
         + (cfg.control_queue_frames as u64) * 32;
     let ctl = budget
         .try_reserve(control_bytes, PoolClass::Control)
+        .map_err(|_| SessionError::Budget)?;
+    // Room for one stream plus the working share (see effective_max_streams).
+    let min = u64::from(cfg.stream_window) + u64::from(cfg.initial_stream_window);
+    let rx = budget
+        .try_reserve_range(min, u64::from(cfg.session_window), PoolClass::Receive)
         .map_err(|_| SessionError::Budget)?;
     Ok((rx, ctl))
 }
@@ -757,7 +894,7 @@ fn local_hello(cfg: &SessionConfig, window: u32, max_streams: u32) -> Hello {
         protocol_max: VERSION_MAJOR,
         node_id: cfg.node_id.clone(),
         max_streams,
-        initial_stream_window: cfg.stream_window,
+        initial_stream_window: cfg.initial_stream_window,
         initial_session_window: window,
         max_frame_payload: cfg.max_frame_payload,
         features: Vec::new(),
@@ -939,6 +1076,7 @@ where
         recv_outstanding: reserved,
         recv_buffered: 0,
         recv_pending_grant: 0,
+        stream_windows: 0,
         next_local_id: Some(1),
         last_peer_id: 0,
         goaway_sent: false,
@@ -1114,7 +1252,7 @@ fn handle_frame(
                     .map(|(sid, _)| *sid)
                     .collect();
                 for sid in unprocessed {
-                    if let Some(mut e) = st.streams.remove(&sid) {
+                    if let Some(mut e) = take_stream(st, sid) {
                         if let Some(w) = e.open_waiter.take() {
                             let _ = w.send(OpenAck::Failure(OpenFailure::Unavailable));
                         }
@@ -1156,7 +1294,7 @@ fn on_open(
     if st.goaway_sent {
         return reject(st, OpenFailure::Unavailable);
     }
-    if st.streams.len() as u32 >= shared.local_max_streams {
+    if !shared.admits(st, shared.local_max_streams) {
         shared.obs.record(Event::ResourceThrottle {
             reason: aegis_contracts::ReasonGroup::Quota,
         });
@@ -1164,7 +1302,7 @@ fn on_open(
     }
     let Ok(reservation) = shared
         .budget
-        .try_reserve(u64::from(shared.cfg.stream_tx_buffer), PoolClass::Transmit)
+        .try_reserve(u64::from(shared.initial_tx()), PoolClass::Transmit)
     else {
         shared.obs.record(Event::ResourceThrottle {
             reason: aegis_contracts::ReasonGroup::Quota,
@@ -1176,11 +1314,12 @@ fn on_open(
     };
     let entry = Entry::new(
         StreamState::Opening,
-        shared.cfg.stream_window,
+        shared.cfg.initial_stream_window,
         shared.peer.stream_window,
         shared.cfg.stream_tx_buffer as usize,
         reservation,
     );
+    st.stream_windows += u64::from(shared.cfg.initial_stream_window);
     st.streams.insert(id, entry);
     let incoming = IncomingOpen {
         shared: Arc::clone(shared),
@@ -1197,7 +1336,7 @@ fn on_open(
             // We hold the state lock: suppress Drop's re-entrant rejection
             // and reject inline instead.
             back.responded = true;
-            st.streams.remove(&id);
+            take_stream(st, id);
             reject(st, OpenFailure::Quota)
         }
     }
@@ -1236,7 +1375,7 @@ fn on_open_ack(
         }
         OpenAck::Failure(f) => {
             let waiter = e.open_waiter.take();
-            st.streams.remove(&id);
+            take_stream(st, id);
             if let Some(w) = waiter {
                 let _ = w.send(OpenAck::Failure(f));
             }
@@ -1277,7 +1416,7 @@ fn on_data(
         shared.writer.notify_one();
         return Ok(());
     }
-    if !e.rx.append(&payload) {
+    if !e.rx.append(&payload, e.window as usize) {
         return Err(violation("DATA exceeds receive buffer capacity"));
     }
     e.rx_buffered += n;
@@ -1454,6 +1593,13 @@ fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result
             let chunk = e.tx.split_to(n).freeze();
             e.send_credit -= n as u64;
             st.send_session_credit -= n as u64;
+            if e.tx.is_empty() {
+                let keep = u64::from(shared.initial_tx());
+                let held = e.tx_reservation.bytes();
+                if held > keep {
+                    e.tx_reservation.shrink(held - keep);
+                }
+            }
             encode_frame(out, &Frame::new(FrameType::Data, id, chunk))?;
             if let Some(w) = e.write_waker.take() {
                 w.wake();
@@ -1597,7 +1743,9 @@ mod tests {
     #[test]
     fn effective_streams_reserve_working_share() {
         let cfg = SessionConfig::default();
-        assert_eq!(cfg.effective_max_streams(2 * 1024 * 1024), 31);
+        // (8 MiB - 256 KiB working share) / 16 KiB initial windows.
+        assert_eq!(cfg.effective_max_streams(8 * 1024 * 1024), 496);
+        assert_eq!(cfg.effective_max_streams(2 * 1024 * 1024), 112);
         assert_eq!(cfg.effective_max_streams(128 * 1024), 1);
         let small = SessionConfig {
             max_streams: 4,
