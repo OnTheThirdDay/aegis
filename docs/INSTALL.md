@@ -153,12 +153,13 @@ The browser's traffic goes to your own computer, through the encrypted SSH conne
    - **DNS validation** works through the Cloudflare API instead, so it does not need port 80.
    - The certificate renews automatically. Devices invited earlier keep working.
 
-4. **Users** (optional): add people with the role **User**. They get a one-time password, sign in to the same console, and can invite and remove only their own devices.
+4. **Users** (optional): add people with the role **User**. They get a one-time password and sign in at the **user portal**, shown at the top of the Users page: `https://<device address>/portal/`, for example `https://aegis.example.com/portal/` with Cloudflare Tunnel. There they choose their own password, invite and remove their own devices, and download the client app; they never need the console. The portal is on the same public address as devices, so it works with `--tunnel-only` too. Administrators can't sign in there, and the portal can be switched off on the Users page.
+   - A tunnel set up with an earlier version needs its routes updated once for the portal: **Connectivity → Cloudflare Tunnel**, paste the token, press **Update routes for the user portal**.
 5. **Devices → Invite a device**: enter a device name and press **Create invitation**. Send the code (or the downloaded `.aegis` file) to the device's owner.
 
 ## 5. Connect a device
 
-1. Download the client app from the console (**Devices → Client apps**). It is portable: no installation and no admin rights needed.
+1. Download the client app from the console or the user portal (**Devices → Client apps**). It is portable: no installation and no admin rights needed.
    - macOS builds are unsigned: the first time, right-click → Open, or run `xattr -d com.apple.quarantine aegis-client-macos-*`.
 2. Open it, press **Paste** (or drop the `.aegis` file on the window), then **Join and connect**.
 3. Point apps at the local proxy:

@@ -49,6 +49,7 @@ pub async fn info(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
             "version": env!("CARGO_PKG_VERSION"),
             "appliance": appliance.is_some(),
             "tunnel_only": ctx.tunnel_only(),
+            "portal": crate::portal::status_json(&ctx),
             "console_certificate_sha256": ctx.console_fingerprint(),
             "connection": conn,
             "checklist": {
@@ -203,6 +204,42 @@ pub async fn integration_action(
             Err(ApiError::new(status, "integration_failed").detail(code))
         }
     }
+}
+
+/// Switch the user portal on or off (`{"enabled": bool}`).
+pub async fn put_portal(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::PUT)?;
+    p.require(Permission::SystemConfigure)?;
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let on = v
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad_request("invalid_body"))?;
+    let (c, actor) = (ctx.clone(), p.id.clone());
+    blocking(move || {
+        c.coord.store().tx(|tx| {
+            db::put_setting(tx, "portal", &json!({"enabled": on}))?;
+            db::append_audit(
+                tx,
+                AuditInsert {
+                    actor_id: Some(&actor),
+                    action: if on {
+                        "portal.enabled"
+                    } else {
+                        "portal.disabled"
+                    },
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata: json!({}),
+                },
+            )
+        })?;
+        Ok(())
+    })
+    .await?;
+    Ok(json(StatusCode::OK, &crate::portal::status_json(&ctx), &[]))
 }
 
 /// Device CA custody: take the root key offline, renew the issuer with it,

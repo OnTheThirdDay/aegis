@@ -2,7 +2,7 @@
 
 mod appliance;
 mod auth;
-mod devices;
+pub(crate) mod devices;
 pub mod diagnostics;
 pub mod edge;
 mod nodes;
@@ -51,6 +51,7 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
         .route("/api/v1/system/info", get(appliance::info))
         .route("/api/v1/system/connection", put(appliance::put_connection))
         .route("/api/v1/system/web-ca.pem", get(appliance::web_ca))
+        .route("/api/v1/system/portal", put(appliance::put_portal))
         .route(
             "/api/v1/system/device-ca/{action}",
             post(appliance::device_ca),

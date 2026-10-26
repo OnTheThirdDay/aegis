@@ -59,6 +59,9 @@ fn provider_error(e: Error) -> (u16, String) {
     (status, explain(e.0))
 }
 
+/// Version of the tunnel routes AegisNet writes; 2 adds the user portal.
+const ROUTES_VERSION: u64 = 2;
+
 /// Human-readable, secret-free explanation of a provider/saga error code.
 pub fn explain(code: &str) -> String {
     let text = match code {
@@ -173,6 +176,9 @@ impl CloudflareIntegration {
         }
         v["error"] = status["error"].clone();
         v["warning"] = status["warning"].clone();
+        // Set up before the user portal existed: its routes still lack /portal
+        // until re-verified with the token ("Test again").
+        v["portal_routes"] = json!(settings["routes"].as_u64() >= Some(ROUTES_VERSION));
         v["hostname"] = settings["hostname"].clone();
         v["plan_id"] = settings["plan_id"].clone();
         if let Some(h) = settings["hostname"].as_str() {
@@ -427,7 +433,14 @@ impl CloudflareIntegration {
                 .await;
             progress.abort();
             drop(cf);
-            let settings = Self::record(&app).map(|r| r.settings).unwrap_or(json!({}));
+            let mut settings = Self::record(&app).map(|r| r.settings).unwrap_or(json!({}));
+            if result.is_ok()
+                || matches!(&result, Err(e) if e.0 == aegis_provision::DATA_PATH_UNVERIFIED_FROM_HOST)
+            {
+                // Verification brought the tunnel's routes up to date,
+                // including the user portal (ROUTES_VERSION).
+                settings["routes"] = json!(ROUTES_VERSION);
+            }
             let warning = |code: &str| {
                 let mut message = explain(code);
                 if let Some(d) = detail.lock().unwrap_or_else(|p| p.into_inner()).take() {

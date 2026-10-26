@@ -18,22 +18,58 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
-trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
+use crate::EdgeIo as Duplex;
 
 const EDGE_MAX_HEAD: usize = 8 * 1024;
 /// Room for a device's compressed diagnostic report (sent on `/renew`); the
 /// pending-handshake cap and the handshake deadline bound what this costs.
 const EDGE_MAX_BODY: usize = 2 * 1024 * 1024;
 
+/// What the edge does with a connection after reading its first request.
+enum EdgeRoute {
+    /// Continue with the WebSocket upgrade (head replayed).
+    Upgrade(Box<dyn Duplex>),
+    /// Hand the connection to the user portal (head replayed).
+    Portal(Box<dyn Duplex>),
+    /// Answered (or refused) and closed.
+    Done,
+}
+
+fn is_portal_path(p: &str) -> bool {
+    p == "/portal" || p.starts_with("/portal/") || p.starts_with("/portal?")
+}
+
 /// Read the HTTP request head. `POST /enroll` and `POST /renew` are answered
-/// here and the connection closed (`None`); anything else is replayed into
-/// the WebSocket upgrade unchanged.
+/// here and the connection closed; `/portal` goes to the user portal (when
+/// installed); anything else is replayed into the WebSocket upgrade.
 async fn route_edge(
     mut io: Box<dyn Duplex>,
     ws_path: &str,
     hook: crate::EdgeHook,
-) -> Option<Box<dyn Duplex>> {
+    portal: bool,
+) -> EdgeRoute {
+    match route_edge_inner(&mut io, ws_path, hook, portal).await {
+        Some(Replay::Upgrade(buf)) => {
+            EdgeRoute::Upgrade(Box::new(aegis_transport_ws::Prefixed::new(buf, io)))
+        }
+        Some(Replay::Portal(buf)) => {
+            EdgeRoute::Portal(Box::new(aegis_transport_ws::Prefixed::new(buf, io)))
+        }
+        None => EdgeRoute::Done,
+    }
+}
+
+enum Replay {
+    Upgrade(Vec<u8>),
+    Portal(Vec<u8>),
+}
+
+async fn route_edge_inner(
+    io: &mut Box<dyn Duplex>,
+    ws_path: &str,
+    hook: crate::EdgeHook,
+    portal: bool,
+) -> Option<Replay> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = Vec::with_capacity(1024);
     let head_end = loop {
@@ -62,7 +98,10 @@ async fn route_edge(
         (Some("POST"), Some("/enroll")) => crate::EdgeRequest::Enroll,
         (Some("POST"), Some("/renew")) => crate::EdgeRequest::Renew,
         (_, Some(p)) if p == ws_path || p.starts_with(&format!("{ws_path}?")) => {
-            return Some(Box::new(aegis_transport_ws::Prefixed::new(buf, io)));
+            return Some(Replay::Upgrade(buf));
+        }
+        (_, Some(p)) if portal && is_portal_path(p) => {
+            return Some(Replay::Portal(buf));
         }
         _ => {
             let _ = io
@@ -90,7 +129,7 @@ async fn route_edge(
     };
     let mut body = buf[head_end..].to_vec();
     if chunked {
-        body = read_chunked(&mut io, body).await?;
+        body = read_chunked(io, body).await?;
     } else {
         let Some(length) = length.filter(|l| *l <= EDGE_MAX_BODY) else {
             let _ = io
@@ -248,8 +287,23 @@ async fn handle_connection(
         Some(hook) => {
             let deadline =
                 Duration::from_millis(u64::from(ctx.startup.core.inbound_handshake_timeout_ms));
-            match tokio::time::timeout(deadline, route_edge(io, &ws_cfg.path, hook)).await {
-                Ok(Some(io)) => io,
+            let portal = ctx.portal_hook.get().cloned();
+            let routed = tokio::time::timeout(
+                deadline,
+                route_edge(io, &ws_cfg.path, hook, portal.is_some()),
+            )
+            .await;
+            match routed {
+                Ok(EdgeRoute::Upgrade(io)) => io,
+                Ok(EdgeRoute::Portal(io)) => {
+                    // A web session, not a tunnel: no handshake slot, and its
+                    // own limits (the portal bounds connections and idle time).
+                    drop(permit);
+                    if let Some(serve) = portal {
+                        serve(io).await;
+                    }
+                    return;
+                }
                 _ => return,
             }
         }

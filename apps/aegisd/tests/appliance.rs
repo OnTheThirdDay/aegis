@@ -297,6 +297,79 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         assert_eq!(v["gateway"]["state"], "off");
         assert_eq!(v["devices"].as_array().map(Vec::len), Some(0));
 
+        // User portal on the public edge: end users sign in and manage their
+        // own devices; administrators and everything else are refused.
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/users", Some(json!({"username": "alice", "roles": ["user"]})))
+            .await;
+        assert_eq!(s, 201, "{v}");
+        let alice_pw = v["temporary_password"].as_str().expect("temporary password").to_owned();
+        let mut portal = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        portal.base = format!("https://127.0.0.1:{edge_port}/portal");
+        let page = portal.http.get(format!("{}/", portal.base)).send().await.expect("portal page");
+        assert_eq!(page.status().as_u16(), 200);
+        assert!(page.text().await.expect("html").contains("src=\"/portal/app.js\""));
+        let (s, v) = portal
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": "a much better passphrase"})))
+            .await;
+        assert_eq!(s, 403, "administrators are refused on the portal: {v}");
+        let (s, v) = portal
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "alice", "password": alice_pw})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["password_change_required"], true);
+        let (s, v) = portal
+            .call(
+                reqwest::Method::POST,
+                "/auth/password",
+                Some(json!({"current_password": alice_pw, "new_password": "alice's own passphrase"})),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (s, v) = portal.call(reqwest::Method::GET, "/devices", None).await;
+        assert_eq!(s, 200, "{v}");
+        let (s, v) = portal
+            .call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "alice-phone"})))
+            .await;
+        assert_eq!(s, 201, "users invite their own devices on the portal: {v}");
+        assert!(v["code"].as_str().is_some_and(|c| c.starts_with("aegis1:")));
+        let (s, v) = portal.call(reqwest::Method::GET, "/system/downloads", None).await;
+        assert_eq!(s, 200, "{v}");
+        let (s, _) = portal.call(reqwest::Method::GET, "/users", None).await;
+        assert_eq!(s, 404, "console routes don't exist on the portal");
+        let (s, _) = portal.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(s, 404);
+        let resp = portal
+            .http
+            .get(format!("{}/api/v1/devices", portal.base))
+            .header("authorization", "Bearer anything")
+            .send()
+            .await
+            .expect("token request");
+        assert_eq!(resp.status().as_u16(), 403, "API tokens are refused on the portal");
+        let resp = portal
+            .http
+            .get(format!("{}/", portal.base))
+            .header("host", "evil.example")
+            .send()
+            .await
+            .expect("foreign host");
+        assert_eq!(resp.status().as_u16(), 400);
+        // The console shows the portal and can switch it off.
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["portal"]["enabled"], true, "{v}");
+        assert!(v["portal"]["url"].as_str().is_some_and(|u| u.ends_with("/portal/")), "{v}");
+        let (s, _) = c
+            .call(reqwest::Method::PUT, "/system/portal", Some(json!({"enabled": false})))
+            .await;
+        assert_eq!(s, 200);
+        let page = portal.http.get(format!("{}/", portal.base)).send().await.expect("portal off");
+        assert_eq!(page.status().as_u16(), 404);
+        let (s, _) = c
+            .call(reqwest::Method::PUT, "/system/portal", Some(json!({"enabled": true})))
+            .await;
+        assert_eq!(s, 200);
+
         // Address change: the device learns the gateway's new endpoint on
         // connect and adopts it only after the pinned gateway answers there.
         assert_eq!(aegis_join::fetch_endpoint(&device_dir).await.expect("query"), None, "unchanged");

@@ -174,6 +174,14 @@ pub async fn launch(
                 }
             })
         }));
+        // Users sign in to the self-service portal on the same public edge.
+        let mc = Arc::clone(&m);
+        ctx.set_portal_hook(Arc::new(move |io| {
+            Box::pin(aegis_management::portal::serve_connection(
+                Arc::clone(&mc),
+                io,
+            ))
+        }));
     }
     if let (Some(dir), aegis_contracts::Role::Gateway) = (&appliance_dir, cfg.role) {
         let app =

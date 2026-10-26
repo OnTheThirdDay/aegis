@@ -173,6 +173,9 @@ struct Limiter {
 pub struct AuthState {
     sessions: Mutex<HashMap<String, AdminSession>>,
     limiter: Mutex<Limiter>,
+    /// Sign-in attempts through the user portal, counted apart so they can
+    /// never lock an administrator out of the console.
+    portal_limiter: Mutex<Limiter>,
     bootstrap_limiter: Mutex<Limiter>,
     bootstrap_slots: Arc<Semaphore>,
     enrollment_limiter: Mutex<Limiter>,
@@ -184,6 +187,7 @@ impl Default for AuthState {
         Self {
             sessions: Mutex::new(HashMap::new()),
             limiter: Mutex::new(Limiter::default()),
+            portal_limiter: Mutex::new(Limiter::default()),
             bootstrap_limiter: Mutex::new(Limiter::default()),
             // Only one owner can be created. Bound both queued blocking jobs
             // and Argon2 memory, even when a caller abandons its HTTP request.
@@ -379,7 +383,11 @@ impl ManagementContext {
     }
 
     fn rate_limited(&self, username: &str) -> bool {
-        let mut l = self.auth.limiter.lock().unwrap_or_else(|e| e.into_inner());
+        Self::limited_in(&self.auth.limiter, username)
+    }
+
+    fn limited_in(limiter: &Mutex<Limiter>, username: &str) -> bool {
+        let mut l = limiter.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         // Global bucket: 30 attempts per minute.
         match l.window_start {
@@ -396,7 +404,11 @@ impl ManagementContext {
     }
 
     fn record_failure(&self, username: &str) {
-        let mut l = self.auth.limiter.lock().unwrap_or_else(|e| e.into_inner());
+        Self::failure_in(&self.auth.limiter, username);
+    }
+
+    fn failure_in(limiter: &Mutex<Limiter>, username: &str) {
+        let mut l = limiter.lock().unwrap_or_else(|e| e.into_inner());
         let e = l
             .failures
             .entry(username.to_owned())
@@ -408,9 +420,21 @@ impl ManagementContext {
         e.1 = Instant::now();
     }
 
-    /// Password login → cookie session + CSRF token.
-    pub fn login(&self, username: &str, password: &str) -> Result<(String, Principal), ApiError> {
-        if self.rate_limited(username) {
+    /// Password login → cookie session + CSRF token. Through the user
+    /// `portal`, only end users may sign in, and attempts are limited
+    /// separately from the console.
+    pub fn login(
+        &self,
+        username: &str,
+        password: &str,
+        portal: bool,
+    ) -> Result<(String, Principal), ApiError> {
+        let limiter = if portal {
+            &self.auth.portal_limiter
+        } else {
+            &self.auth.limiter
+        };
+        if Self::limited_in(limiter, username) {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
         }
         let principal = self
@@ -429,7 +453,7 @@ impl ManagementContext {
         };
         let audit_actor = principal.as_ref().map(|p| p.id.clone());
         if !ok {
-            self.record_failure(username);
+            Self::failure_in(limiter, username);
             let _ = self.coord.store().tx(|c| {
                 db::append_audit(
                     c,
@@ -447,6 +471,30 @@ impl ManagementContext {
             return Err(ApiError::unauthenticated().detail("invalid credentials"));
         }
         let p = principal.ok_or_else(ApiError::unauthenticated)?;
+        // Checked after the password, so the portal never reveals which
+        // accounts are administrators.
+        if portal
+            && !Self::scopes_for(&p.roles)
+                .iter()
+                .all(|s| s == "devices:self")
+        {
+            let _ = self.coord.store().tx(|c| {
+                db::append_audit(
+                    c,
+                    AuditInsert {
+                        actor_id: Some(&p.id),
+                        action: "auth.login",
+                        target_type: "session",
+                        target_id: None,
+                        decision: "denied",
+                        revision_digest: None,
+                        metadata: serde_json::json!({"portal": true, "reason": "administrator"}),
+                    },
+                )
+            });
+            return Err(ApiError::forbidden()
+                .detail("administrators sign in on the console, not the user portal"));
+        }
         let must_change = self
             .coord
             .store()
