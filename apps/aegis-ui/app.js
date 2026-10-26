@@ -7,6 +7,11 @@
 /** @type {{csrf: string|null, principal: string|null, username: string, roles: string[], scopes: string[]}} */
 const session = { csrf: null, principal: null, username: "", roles: [], scopes: [] };
 let currentView = "";
+/** Served as the user portal (under /portal on the public device address)? */
+const PORTAL = location.pathname === "/portal" || location.pathname.startsWith("/portal/");
+const BASE = PORTAL ? "/portal" : "";
+/** @type {string|null} The portal address users sign in at (console only). */
+let portalUrl = null;
 /** @type {number|undefined} */
 let pollTimer;
 
@@ -57,7 +62,7 @@ async function api(method, path, opts = {}) {
     headers["Content-Type"] = opts.contentType || "application/json";
     body = JSON.stringify(opts.body);
   }
-  const resp = await fetch("/api/v1" + path, { method, headers, body, credentials: "same-origin", cache: "no-store" });
+  const resp = await fetch(BASE + "/api/v1" + path, { method, headers, body, credentials: "same-origin", cache: "no-store" });
   const text = await resp.text();
   /** @type {any} */
   let data = null;
@@ -269,14 +274,16 @@ function showLogin(why) {
   /** @type {HTMLElement} */ (document.getElementById("badges")).replaceChildren();
   session.csrf = null; session.scopes = [];
   const v = root();
-  const user = /** @type {HTMLInputElement} */ (el("input", { autocomplete: "username", required: "", value: "admin" }));
+  const user = /** @type {HTMLInputElement} */ (el("input", { autocomplete: "username", required: "", value: PORTAL ? "" : "admin" }));
   const pass = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "current-password", required: "" }));
   const submit = button("Sign in", "", "submit");
   const form = el("form", { class: "card narrow", "aria-labelledby": "lh" }, [
     el("h1", { id: "lh" }, ["Sign in"]),
     why ? el("p", { class: "muted" }, [why]) : null,
     field("Username", user),
-    field("Password", pass, "First sign-in? The installer printed a one-time admin password (also readable with `aegisctl initial-password` on the server)."),
+    field("Password", pass, PORTAL
+      ? "First sign-in? Use the one-time password your administrator gave you; you will choose your own."
+      : "First sign-in? The installer printed a one-time admin password (also readable with `aegisctl initial-password` on the server)."),
     el("div", { class: "row" }, [submit]),
   ]);
   form.addEventListener("submit", async (ev) => {
@@ -292,7 +299,12 @@ function showLogin(why) {
       submit.disabled = false;
     }
   });
-  v.append(form, bootstrapCard());
+  v.append(form);
+  if (PORTAL) {
+    v.append(el("p", { class: "muted small narrow" }, ["This is the AegisNet user portal: add your devices, remove old ones and download the app. Administrators sign in on the console."]));
+  } else {
+    v.append(bootstrapCard());
+  }
   (session.username ? pass : user).focus();
 }
 
@@ -529,7 +541,7 @@ async function downloadsCard() {
     return card("Client apps", [
       el("p", { class: "muted" }, ["Portable apps — no installation needed. Run, paste an invitation, connect."]),
       el("ul", { class: "downloads" }, data.items.map((/** @type {any} */ f) =>
-        el("li", {}, [el("a", { href: "/downloads/" + encodeURIComponent(f.name), download: f.name }, [f.label || f.name]), el("span", { class: "muted small" }, [" " + fmtBytes(f.size) + (f.sha256 ? " · SHA-256 " + f.sha256.slice(0, 16) + "…" : "")])]))),
+        el("li", {}, [el("a", { href: BASE + "/downloads/" + encodeURIComponent(f.name), download: f.name }, [f.label || f.name]), el("span", { class: "muted small" }, [" " + fmtBytes(f.size) + (f.sha256 ? " · SHA-256 " + f.sha256.slice(0, 16) + "…" : "")])]))),
     ]);
   } catch {
     return el("span");
@@ -558,6 +570,23 @@ async function renderUsers() {
     await listUsers(list);
   });
   const list = el("div");
+  try {
+    const { data: info } = await api("GET", "/system/info");
+    const pr = info.portal || {};
+    portalUrl = pr.enabled && pr.url ? pr.url : null;
+    const link = pr.url ? el("code", {}, [pr.url]) : el("span", { class: "muted" }, ["(available once devices have an address: see Connectivity)"]);
+    const copyUrl = button("Copy address", "ghost small");
+    copyUrl.hidden = !pr.url;
+    copyUrl.addEventListener("click", () => copy(pr.url));
+    const toggle = button(pr.enabled ? "Turn the portal off" : "Turn the portal on", pr.enabled ? "ghost small" : "small");
+    toggle.hidden = !can("system:configure");
+    busy(toggle, async () => { await api("PUT", "/system/portal", { body: { enabled: !pr.enabled } }); await renderUsers(); });
+    v.append(card("User portal", [
+      el("p", { class: "muted" }, ["Users sign in here to add and remove their own devices and download the app, without access to this console. It is served on the same public address as devices (through Cloudflare Tunnel when set up). Administrators can't sign in there."]),
+      el("p", {}, [pill(pr.enabled ? "on" : "off"), " ", link]),
+      el("div", { class: "row" }, [copyUrl, toggle]),
+    ]));
+  } catch { /* not an appliance */ }
   v.append(card("Add a user", [
     el("p", { class: "muted" }, ["New users get a one-time password and must choose their own at first sign-in. Users can invite and revoke only their own devices."]),
     el("div", { class: "cols" }, [field("Username", username), field("Role", role)]),
@@ -575,7 +604,7 @@ function tempPassword(user, pw) {
   const box = el("div", { class: "secret" }, [
     el("p", {}, ["One-time password for ", el("strong", {}, [user]), ". Give it to them privately; it is shown only now."]),
     el("code", { class: "big" }, [pw]),
-    el("p", { class: "muted small" }, ["Console address: " + location.origin]),
+    el("p", { class: "muted small" }, [portalUrl ? "They sign in at " + portalUrl : "Console address: " + location.origin]),
     el("div", { class: "row" }, [copyBtn, done]),
   ]);
   done.addEventListener("click", () => box.remove());
@@ -715,8 +744,12 @@ function cloudflareCard(cf) {
     const keepDns = /** @type {HTMLInputElement} */ (el("input", { type: "checkbox" }));
     const restart = button("Restart connector", "ghost");
     busy(restart, async () => { await api("POST", "/integrations/cloudflare/restart", { body: {} }); notice("Connector restarted."); await renderConnectivity(); });
-    const retry = button(cf.state === "active" ? "Test again" : "Retry setup", "ghost");
-    retry.hidden = cf.state === "active" && !cf.warning;
+    const outdated = cf.state === "active" && cf.portal_routes === false;
+    const retry = button(outdated ? "Update routes for the user portal" : cf.state === "active" ? "Test again" : "Retry setup", "ghost");
+    retry.hidden = cf.state === "active" && !cf.warning && !outdated;
+    if (outdated) {
+      body.append(el("p", { class: "muted" }, ["This tunnel was set up before the user portal existed. Paste the token and press Update routes so users can reach the portal through it."]));
+    }
     busy(retry, async () => {
       if (!token.value) throw new Error("Paste the API token to retry.");
       await api("POST", "/integrations/cloudflare/apply", { body: { token: token.value, plan_id: cf.plan_id } });

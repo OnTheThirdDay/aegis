@@ -92,6 +92,19 @@ pub enum EdgeRequest {
 pub type EdgeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = (u16, Vec<u8>)> + Send>>;
 pub type EdgeHook = Arc<dyn Fn(EdgeRequest, Vec<u8>) -> EdgeFuture + Send + Sync>;
 
+/// A byte stream handed over by the edge.
+pub trait EdgeIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> EdgeIo for T {}
+
+/// Serves a whole HTTP connection whose first request targets `/portal`
+/// (the user portal), installed by the composition root. The request bytes
+/// already read are replayed at the start of the stream.
+pub type PortalHook = Arc<
+    dyn Fn(Box<dyn EdgeIo>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Identity material loaded from secrets.
 #[derive(Clone)]
 pub(crate) struct LoadedIdentity {
@@ -125,12 +138,18 @@ pub struct NodeContext {
     resolver_cache: Mutex<Option<(String, Arc<Resolver>)>>,
     shutdown: watch::Sender<bool>,
     pub(crate) edge_hook: std::sync::OnceLock<EdgeHook>,
+    pub(crate) portal_hook: std::sync::OnceLock<PortalHook>,
 }
 
 impl NodeContext {
     /// Install the enrollment/renewal handler for the public edge (once).
     pub fn set_edge_hook(&self, hook: EdgeHook) {
         let _ = self.edge_hook.set(hook);
+    }
+
+    /// Install the user-portal handler for `/portal` on the public edge.
+    pub fn set_portal_hook(&self, hook: PortalHook) {
+        let _ = self.portal_hook.set(hook);
     }
 
     /// Validate replacements before publishing TLS state. Existing sessions
@@ -607,6 +626,7 @@ pub async fn start_with_diagnostics(
         resolver_cache: Mutex::new(None),
         shutdown,
         edge_hook: std::sync::OnceLock::new(),
+        portal_hook: std::sync::OnceLock::new(),
     });
     {
         let sessions = Arc::clone(&sessions);

@@ -19,6 +19,7 @@ mod cursor;
 mod handlers;
 mod http_util;
 pub mod ipc;
+pub mod portal;
 mod ui;
 
 pub use auth::{hash_password, Permission, Principal, ROLE_OWNER};
@@ -73,6 +74,8 @@ pub struct ManagementContext {
     /// Directory of client app builds offered to signed-in users.
     pub downloads_dir: Mutex<Option<PathBuf>>,
     pub(crate) download_digests: Mutex<std::collections::HashMap<String, (u64, String)>>,
+    /// Concurrent user-portal connections.
+    pub(crate) portal_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Hooks the composition root (aegisd) provides in appliance mode. The
@@ -156,6 +159,7 @@ impl ManagementContext {
             appliance: Mutex::new(None),
             downloads_dir: Mutex::new(None),
             download_digests: Mutex::new(std::collections::HashMap::new()),
+            portal_slots: Arc::new(tokio::sync::Semaphore::new(portal::MAX_CONNECTIONS)),
             coord,
             metrics,
             gauges,

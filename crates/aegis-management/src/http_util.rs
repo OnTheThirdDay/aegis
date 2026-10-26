@@ -296,7 +296,7 @@ fn valid_host_header(h: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
 }
 
-fn finish(mut resp: Response, no_store: bool) -> Response {
+pub(crate) fn finish(mut resp: Response, no_store: bool) -> Response {
     let h = resp.headers_mut();
     let set = |h: &mut HeaderMap, k: &'static str, v: &'static str| {
         h.insert(k, HeaderValue::from_static(v));

@@ -17,7 +17,12 @@ struct LoginBody {
     password: String,
 }
 
-pub async fn login(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+pub async fn login(
+    State(ctx): State<Ctx>,
+    portal: Option<axum::Extension<crate::portal::PortalRequest>>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult {
     let v = read_json(&headers, body, &["application/json"]).await?;
     let b: LoginBody =
         serde_json::from_value(v).map_err(|_| ApiError::bad_request("invalid_body"))?;
@@ -29,7 +34,9 @@ pub async fn login(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> Ap
         return Err(ApiError::bad_request("invalid_body"));
     }
     let c = ctx.clone();
-    let (token, p) = super::blocking(move || c.login(&b.username, &b.password)).await?;
+    let through_portal = portal.is_some();
+    let (token, p) =
+        super::blocking(move || c.login(&b.username, &b.password, through_portal)).await?;
     session_response(&ctx, &token, &p).await
 }
 

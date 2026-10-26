@@ -217,13 +217,35 @@ impl Cloudflare {
     }
     /// Only the device paths reach the origin: the AGP WebSocket and the
     /// edge enrollment/renewal endpoints. Never the management console.
+    /// Device paths and the user portal; nothing else of the gateway is
+    /// published (the console never is).
+    const ROUTES: &'static str = "^/(agp|enroll|renew|portal(/.*)?)$";
+    /// Routes written before the user portal existed: recognised as this
+    /// deployment's own and updated in place rather than treated as drift.
+    const LEGACY_ROUTES: &'static str = "^/(agp|enroll|renew)$";
+
     fn ingress_config(p: &Plan) -> Value {
+        Self::ingress_with(p, Self::ROUTES)
+    }
+
+    fn ingress_with(p: &Plan, path: &str) -> Value {
         let service = p
             .desired
             .origin_service
             .as_deref()
             .unwrap_or("http://gateway:18080");
-        json!({"ingress":[{"hostname":p.desired.hostname,"path":"^/(agp|enroll|renew)$","service":service},{"service":"http_status:404"}]})
+        json!({"ingress":[{"hostname":p.desired.hostname,"path":path,"service":service},{"service":"http_status:404"}]})
+    }
+
+    /// The stored routing is exactly what an earlier AegisNet wrote.
+    fn legacy_ingress(actual: &Value, p: &Plan) -> bool {
+        match (
+            Self::routing(actual),
+            Self::routing(&Self::ingress_with(p, Self::LEGACY_ROUTES)),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
     }
     /// The routing that matters in a stored tunnel configuration: each
     /// rule's (hostname, path, service). Cloudflare returns the stored
@@ -423,9 +445,12 @@ impl InfrastructureProvider for Cloudflare {
             if Self::same_ingress(&current["config"], p) {
                 return Ok(());
             }
-            // Refuse drift into an unrelated origin; only our empty new tunnel or
-            // the same previously owned routing can be configured automatically.
-            if !Self::unconfigured(&current["config"]) {
+            // Refuse drift into an unrelated origin; only our empty new tunnel,
+            // the same previously owned routing, or our own older routing can
+            // be configured automatically.
+            if !Self::unconfigured(&current["config"])
+                && !Self::legacy_ingress(&current["config"], p)
+            {
                 return Err(Error("tunnel_ingress_drift_requires_review"));
             }
             self.request(Method::PUT, &path, Some(json!({"config":desired})))
@@ -497,7 +522,17 @@ impl InfrastructureProvider for Cloudflare {
                 )
                 .await?;
             if !Self::same_ingress(&config["config"], p) {
-                return Err(Error("cloudflare_ingress_drift"));
+                if !Self::legacy_ingress(&config["config"], p) {
+                    return Err(Error("cloudflare_ingress_drift"));
+                }
+                // Our own routes from before the user portal: bring them up
+                // to date (an active tunnel re-verified with its token).
+                self.request(
+                    Method::PUT,
+                    &format!("{}/configurations", Self::tunnel_path(p)?),
+                    Some(json!({"config": Self::ingress_config(p)})),
+                )
+                .await?;
             }
             let records = self.records(p).await?;
             if records.len() != 1 || !Self::record_owned(p, &records[0]) {
@@ -785,6 +820,40 @@ mod tests {
         assert!(Cloudflare::unconfigured(
             &json!({"ingress": [], "warp-routing": {"enabled": false}})
         ));
+    }
+
+    #[tokio::test]
+    async fn own_pre_portal_routes_are_updated_not_reported_as_drift() {
+        let (cf, state) = mock().await;
+        let mut p = plan();
+        cf.validate(&p).await.expect("discovery");
+        p.inventory = cf.tunnel(&p).await.expect("tunnel");
+        p.inventory = cf.dns(&p).await.expect("dns");
+        // A tunnel set up before the user portal existed.
+        state.lock().expect("mock").config =
+            Cloudflare::ingress_with(&p, Cloudflare::LEGACY_ROUTES);
+        cf.verify(&p)
+            .await
+            .expect("active tunnel re-verified: routes updated");
+        let stored = state.lock().expect("mock").config.clone();
+        assert!(Cloudflare::same_ingress(&stored, &p), "{stored}");
+        assert!(stored.to_string().contains("portal"));
+        // Setup also accepts and updates them.
+        state.lock().expect("mock").config =
+            Cloudflare::ingress_with(&p, Cloudflare::LEGACY_ROUTES);
+        cf.ingress(&p)
+            .await
+            .expect("ingress updates our own older routes");
+        // Anything else is still drift.
+        state.lock().expect("mock").config = Cloudflare::ingress_with(&p, "^/(agp|admin)$");
+        assert_eq!(
+            cf.verify(&p).await.expect_err("drift").0,
+            "cloudflare_ingress_drift"
+        );
+        assert_eq!(
+            cf.ingress(&p).await.expect_err("drift").0,
+            "tunnel_ingress_drift_requires_review"
+        );
     }
 
     #[tokio::test]

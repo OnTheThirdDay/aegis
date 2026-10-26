@@ -36,7 +36,7 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
      - loopback console: the existing allowlist still applies, as protection against DNS rebinding.
    - HSTS is set. Cookies are `Secure; HttpOnly; SameSite=Strict`; mutations still require the CSRF header.
    - `--local-console` (`AEGIS_CONSOLE_LOOPBACK=1`) keeps the console on loopback only.
-   - **The console is never published through Cloudflare:** tunnel ingress routes only `^/(agp|enroll|renew)$`.
+   - **The console is never published through Cloudflare:** tunnel ingress routes only the device paths and, since ADR-0010, the restricted user portal: `^/(agp|enroll|renew|portal(/.*)?)$`.
 4. **Edge enrollment.** Devices enroll and renew through the public data-plane listener (`POST /enroll`, `POST /renew`), so the console need not be reachable from the internet.
    - Both endpoints share one implementation and one rate limiter with the API endpoint.
    - Bodies are bounded at 32 KiB; chunked bodies are accepted for proxies.
