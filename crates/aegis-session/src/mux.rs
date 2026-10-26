@@ -521,19 +521,22 @@ impl Session {
     }
 
     /// Open a logical stream (client role). Succeeds only once the gateway
-    /// reports a connected destination.
+    /// reports a connected destination. `timeout` bounds the whole open:
+    /// waiting for a free slot, quota retries and the destination connect.
     pub async fn open(
         &self,
         destination: Destination,
         timeout: Duration,
     ) -> Result<MuxStream, OpenError> {
+        let start = tokio::time::Instant::now();
+        let deadline = start + timeout;
         // The peer may count a stream we already released (its side closes a
         // moment later) and refuse an open as over quota: treat that like our
         // own full session and retry within the same slot wait.
-        let slot_deadline = tokio::time::Instant::now() + timeout.min(SLOT_WAIT);
+        let slot_deadline = start + timeout.min(SLOT_WAIT);
         loop {
             match self
-                .open_once(destination.clone(), timeout, slot_deadline)
+                .open_once(destination.clone(), deadline, slot_deadline)
                 .await
             {
                 Err(OpenError::Rejected(OpenFailure::Quota))
@@ -549,23 +552,13 @@ impl Session {
     async fn open_once(
         &self,
         destination: Destination,
-        timeout: Duration,
+        deadline: tokio::time::Instant,
         slot_deadline: tokio::time::Instant,
     ) -> Result<MuxStream, OpenError> {
         let shared = &self.shared;
         if !shared.is_client {
             return Err(OpenError::Rejected(OpenFailure::Unsupported));
         }
-        let timeout_ms = u32::try_from(timeout.as_millis())
-            .unwrap_or(u32::MAX)
-            .clamp(1, aegis_agp::MAX_OPEN_TIMEOUT_MS);
-        let payload = OpenRequest {
-            network: aegis_agp::Network::Tcp,
-            destination,
-            timeout_ms,
-        }
-        .encode()
-        .map_err(|_| OpenError::Rejected(OpenFailure::Unsupported))?;
         let (tx, rx) = oneshot::channel();
         // A full session (browsers open connections in bursts) waits briefly
         // for a stream to finish rather than refusing at once: an immediate
@@ -573,6 +566,22 @@ impl Session {
         // session full.
         let mut tx = Some(tx);
         let id = loop {
+            // What is left of the open's time goes to the destination
+            // connect (the gateway is told, so both sides give up together).
+            let timeout_ms = u32::try_from(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u32::MAX)
+            .clamp(1, aegis_agp::MAX_OPEN_TIMEOUT_MS);
+            let payload = OpenRequest {
+                network: aegis_agp::Network::Tcp,
+                destination: destination.clone(),
+                timeout_ms,
+            }
+            .encode()
+            .map_err(|_| OpenError::Rejected(OpenFailure::Unsupported))?;
             // The lock is held only inside this block, never across the wait.
             let opened = {
                 let mut st = shared.lock();
@@ -599,7 +608,7 @@ impl Session {
         };
         let started = std::time::Instant::now();
 
-        let outcome = tokio::time::timeout(timeout, rx).await;
+        let outcome = tokio::time::timeout_at(deadline, rx).await;
         let elapsed = started.elapsed().as_secs_f64();
         let result = match outcome {
             Ok(Ok(OpenAck::Success)) => Ok(MuxStream::new(Arc::clone(shared), id)),

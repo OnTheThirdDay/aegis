@@ -443,6 +443,59 @@ async fn full_session_open_waits_for_a_free_slot() {
 }
 
 #[tokio::test]
+async fn open_timeout_covers_the_slot_wait_and_the_connect() {
+    let small = SessionConfig {
+        max_streams: 2,
+        ..cfg("gw-1")
+    };
+    let (client, _server, mut incoming) =
+        pair_with(cfg("client-1"), small, Budget::root(64 * 1024 * 1024)).await;
+    // Echo the first two (each ends when the device closes it); leave later
+    // opens unanswered, like a slow destination.
+    tokio::spawn(async move {
+        let mut accepted = 0;
+        let mut pending = Vec::new();
+        while let Some(open) = incoming.next().await {
+            if accepted < 2 {
+                accepted += 1;
+                let stream = open.accept().expect("accept");
+                tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(stream);
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                    let _ = w.shutdown().await;
+                });
+            } else {
+                pending.push(open);
+            }
+        }
+    });
+    let first = client
+        .open(dest(), Duration::from_secs(5))
+        .await
+        .expect("first");
+    let _second = client
+        .open(dest(), Duration::from_secs(5))
+        .await
+        .expect("second");
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(first);
+    });
+    let started = std::time::Instant::now();
+    let third = client.open(dest(), Duration::from_millis(600)).await;
+    assert!(
+        matches!(third, Err(OpenError::Timeout)),
+        "{:?}",
+        third.err()
+    );
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(850),
+        "one deadline for the whole open: {took:?}"
+    );
+}
+
+#[tokio::test]
 async fn session_rejected_when_budget_exhausted() {
     let budget = Budget::root(64 * 1024); // smaller than 2 stream windows
     let (a, b) = tokio::io::duplex(64 * 1024);

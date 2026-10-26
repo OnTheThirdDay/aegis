@@ -32,7 +32,8 @@ The self-service part of the console is served on the gateway's public edge at `
 **Serving**
 
 - **Connection handling.** The edge reads the first request line. A `/portal` path hands the whole connection to the portal: outside the tunnel-handshake deadline, holding no handshake slot.
-- **Limits.** At most 64 concurrent portal connections; idle keep-alives close after 20 s.
+- **One request per connection.** The edge routes a connection by its first request, so a portal connection closes after its response. Otherwise a proxy that pools connections (cloudflared) could send a device's `/renew` or `/agp` on it and get the portal's 404.
+- **Limits.** At most 64 concurrent portal connections; a request head must arrive within 20 s.
 - **Switch.** On by default; owners can switch it off on the Users page (`PUT /api/v1/system/portal`, audited).
 
 **Cloudflare routes**

@@ -16,6 +16,9 @@ use tokio::sync::mpsc;
 /// How often a connected client checks whether its certificate is due for
 /// renewal (renewal itself starts 10 days before expiry).
 const RENEWAL_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// A changed server address that couldn't be verified from this network is
+/// tried again after this long (each try can take ~15 s before falling back).
+const ENDPOINT_RETRY: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -131,6 +134,7 @@ impl Engine {
             node: None,
             repaint,
             proxy_saved: None,
+            endpoint_failed: None,
         };
         runtime.spawn(worker.run(rx));
         Ok(Engine {
@@ -168,6 +172,9 @@ struct Worker {
     node: Option<aegis_node::NodeRuntime>,
     repaint: Box<dyn Fn() + Send + Sync>,
     proxy_saved: Option<sysproxy::Saved>,
+    /// A changed server address that failed its check here, and when: it
+    /// isn't tried again on every reconnect (see ENDPOINT_RETRY).
+    endpoint_failed: Option<(String, Instant)>,
 }
 
 impl Worker {
@@ -430,6 +437,13 @@ impl Worker {
                 return None;
             }
         };
+        if self
+            .endpoint_failed
+            .as_ref()
+            .is_some_and(|(url, at)| *url == endpoint.url && at.elapsed() < ENDPOINT_RETRY)
+        {
+            return None;
+        }
         self.diag.note(
             Severity::Info,
             "client.endpoint.changed",
@@ -448,6 +462,7 @@ impl Worker {
                     s.server = Some(host.clone());
                     s.info = Some(format!("The server's address changed; now using {host}."));
                 });
+                self.endpoint_failed = None;
                 return Some(node);
             }
         }
@@ -456,6 +471,7 @@ impl Worker {
             "client.endpoint.rejected",
             &[("url", &endpoint.url)],
         );
+        self.endpoint_failed = Some((endpoint.url.clone(), Instant::now()));
         node.shutdown(Duration::from_secs(1)).await;
         None
     }

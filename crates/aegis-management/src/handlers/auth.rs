@@ -82,7 +82,12 @@ struct PasswordBody {
 }
 
 /// Change the caller's own password (also completes a forced change).
-pub async fn change_password(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+pub async fn change_password(
+    State(ctx): State<Ctx>,
+    portal: Option<axum::Extension<crate::portal::PortalRequest>>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult {
     let p = ctx.authenticate(&headers, &Method::POST)?;
     if p.kind != crate::auth::CredentialKind::Cookie {
         return Err(ApiError::forbidden().detail("sign in interactively to change a password"));
@@ -95,10 +100,11 @@ pub async fn change_password(State(ctx): State<Ctx>, headers: HeaderMap, body: B
     }
     let c = ctx.clone();
     let id = p.id.clone();
-    let mfa = p.mfa;
-    let (token, next) =
-        super::blocking(move || c.change_password(&id, &b.current_password, &b.new_password, mfa))
-            .await?;
+    let (mfa, portal) = (p.mfa, portal.is_some());
+    let (token, next) = super::blocking(move || {
+        c.change_password(&id, &b.current_password, &b.new_password, mfa, portal)
+    })
+    .await?;
     session_response(&ctx, &token, &next).await
 }
 
@@ -300,6 +306,7 @@ struct DisableBody {
 /// `POST /api/v1/auth/2fa/disable`: needs the password and a current code.
 pub async fn two_factor_disable(
     State(ctx): State<Ctx>,
+    portal: Option<axum::Extension<crate::portal::PortalRequest>>,
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult {
@@ -308,9 +315,9 @@ pub async fn two_factor_disable(
     let b: DisableBody =
         serde_json::from_value(v).map_err(|_| ApiError::bad_request("invalid_body"))?;
     let c = ctx.clone();
-    let id = p.id.clone();
+    let (id, portal) = (p.id.clone(), portal.is_some());
     super::blocking(move || {
-        c.confirm_password(&id, &b.password)?;
+        c.confirm_password(&id, &b.password, portal)?;
         c.check_second_factor(&id, &b.code)?;
         c.coord.store().tx(|tx| db::disable_two_factor(tx, &id))?;
         crate::totp::remove(&c, &id, false);

@@ -432,8 +432,14 @@ impl ManagementContext {
         scopes
     }
 
-    fn rate_limited(&self, username: &str) -> bool {
-        Self::limited_in(&self.auth.limiter, username)
+    /// The sign-in limiter for a request: the portal's own, so traffic on
+    /// the public address can never lock administrators out of the console.
+    fn limiter(&self, portal: bool) -> &Mutex<Limiter> {
+        if portal {
+            &self.auth.portal_limiter
+        } else {
+            &self.auth.limiter
+        }
     }
 
     fn limited_in(limiter: &Mutex<Limiter>, username: &str) -> bool {
@@ -451,10 +457,6 @@ impl ManagementContext {
             return true;
         }
         matches!(l.failures.get(username), Some((n, t)) if *n >= MAX_FAILURES && now.duration_since(*t) < LOCKOUT)
-    }
-
-    fn record_failure(&self, username: &str) {
-        Self::failure_in(&self.auth.limiter, username);
     }
 
     fn failure_in(limiter: &Mutex<Limiter>, username: &str) {
@@ -480,11 +482,7 @@ impl ManagementContext {
         portal: bool,
         code: Option<&str>,
     ) -> Result<(String, Principal), ApiError> {
-        let limiter = if portal {
-            &self.auth.portal_limiter
-        } else {
-            &self.auth.limiter
-        };
+        let limiter = self.limiter(portal);
         if Self::limited_in(limiter, username) {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
         }
@@ -637,35 +635,43 @@ impl ManagementContext {
             .retain(|_, s| s.principal_id != principal_id);
     }
 
-    /// Self-service password change. Verifies the current password, ends
-    /// all other sessions and returns a fresh, fully scoped session.
     /// Re-check the signed-in principal's password before a sensitive
-    /// action (rate limited like sign-in). Blocking.
-    pub fn confirm_password(&self, principal_id: &str, password: &str) -> Result<(), ApiError> {
+    /// action (rate limited like sign-in, on the `portal`'s limiter when it
+    /// came through the portal). Blocking.
+    pub fn confirm_password(
+        &self,
+        principal_id: &str,
+        password: &str,
+        portal: bool,
+    ) -> Result<(), ApiError> {
         let p = self
             .coord
             .store()
             .read(|c| db::get_principal(c, principal_id))
             .map_err(ApiError::from)?;
-        if self.rate_limited(&p.username) {
+        let limiter = self.limiter(portal);
+        if Self::limited_in(limiter, &p.username) {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
         }
         if p.status != "active"
             || password.len() > 1024
             || !verify_password(password, &p.password_hash)
         {
-            self.record_failure(&p.username);
+            Self::failure_in(limiter, &p.username);
             return Err(ApiError::forbidden().detail("password is incorrect"));
         }
         Ok(())
     }
 
+    /// Self-service password change. Verifies the current password, ends
+    /// all other sessions and returns a fresh, fully scoped session.
     pub fn change_password(
         &self,
         principal_id: &str,
         current: &str,
         new: &str,
         mfa: bool,
+        portal: bool,
     ) -> Result<(String, Principal), ApiError> {
         check_password_policy(new)?;
         if current == new {
@@ -676,11 +682,12 @@ impl ManagementContext {
         let p = store
             .read(|c| db::get_principal(c, principal_id))
             .map_err(ApiError::from)?;
-        if self.rate_limited(&p.username) {
+        let limiter = self.limiter(portal);
+        if Self::limited_in(limiter, &p.username) {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
         }
         if p.status != "active" || !verify_password(current, &p.password_hash) {
-            self.record_failure(&p.username);
+            Self::failure_in(limiter, &p.username);
             return Err(ApiError::forbidden().detail("current password is incorrect"));
         }
         let hash = hash_password(new)?;
@@ -1146,6 +1153,33 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(hashes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn portal_password_failures_never_lock_the_console() {
+        let store = Arc::new(db::Store::open_in_memory().expect("store"));
+        let ctx = context(Arc::clone(&store));
+        insert_owner(&store);
+        for _ in 0..40 {
+            let _ = ctx.confirm_password("test-owner", "wrong", true);
+        }
+        assert_eq!(
+            ctx.confirm_password("test-owner", "wrong", true)
+                .expect_err("portal limited")
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // The console's limiter is untouched: a wrong password is just wrong.
+        let err = ctx
+            .login("owner", "wrong", false, None)
+            .expect_err("wrong password");
+        assert_ne!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_ne!(
+            ctx.confirm_password("test-owner", "wrong", false)
+                .expect_err("wrong")
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]
