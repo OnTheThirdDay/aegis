@@ -4,20 +4,25 @@
 
 ```
 work branch ──PR──► staging ──release PR──► main
-                       │                       │
-                       ▼                       ▼
-        ghcr.io/onthethirdday/aegis:staging    tag vX.Y.Z + GitHub Release
-                                               + ghcr.io/onthethirdday/aegis:X.Y.Z / :latest
+     ┊                 ┊                       │
+     ┊ (manual)        ┊ (manual)              ▼ (automatic, new version only)
+     ▼                 ▼                       tag vX.Y.Z + GitHub Release
+  :test-<branch>    :staging                   + ghcr.io/onthethirdday/aegis:X.Y.Z / :latest
 ```
+
+Test images are built only when you ask for one: a full build takes about 30 minutes and uses Actions minutes, so merging doesn't build anything by itself.
 
 **Making a change:**
 
-1. Create a branch, for example `feature/x` or `fix/y`, commit and push. CI runs, and a pull request into `staging` opens automatically.
-2. Merge it into `staging`. CI runs again and the staging image is published.
-3. Test the staging image on a lab gateway:
+1. Create a branch, for example `feature/x` or `fix/y`, commit and push. CI runs (one check job), and a pull request into `staging` opens automatically.
+2. Merge it into `staging`. CI checks it again. Several changes can collect on `staging` before you test.
+3. **To test on a server:** run **Actions → Release → Run workflow**, choose the `staging` branch, and wait for the run to finish. It publishes `ghcr.io/onthethirdday/aegis:staging`. Install it on a test gateway with the installer from that image:
    ```sh
-   sudo sh install.sh --image ghcr.io/onthethirdday/aegis:staging
+   docker run --rm --pull always --entrypoint cat \
+     ghcr.io/onthethirdday/aegis:staging /usr/share/aegisnet/install.sh > install.sh
+   sudo sh install.sh --name aegis-test
    ```
+   The same run on a work branch builds `:test-<branch>` (for example `:test-feature-x`) instead, to try a change before merging it.
 4. Once `staging` passes CI, a **Release to main** pull request opens, or is updated if one is already open.
 5. Merge it with **Create a merge commit**.
 
@@ -28,8 +33,7 @@ work branch ──PR──► staging ──release PR──► main
 3. `release.yml` sees an untagged version on `main` and does the rest:
    - creates tag `vX.Y.Z`;
    - builds the gateway for amd64 and arm64, plus the client apps for Windows, macOS (arm64 and x86_64) and Linux;
-   - pushes the multi-arch image;
-   - attests build provenance;
+   - pushes the multi-arch image (with build provenance and an SBOM);
    - publishes the GitHub Release.
 
    Versions are never edited by hand on `main`. Merging to `main` without a version bump updates `main` but publishes nothing.
@@ -43,7 +47,7 @@ work branch ──PR──► staging ──release PR──► main
 | ci.yml `branch-policy` | pull requests into `main` | fails if the pull request doesn't come from `staging` |
 | [pull-requests.yml](../.github/workflows/pull-requests.yml) | branch pushes, and successful `ci` runs on `staging` | opens the pull request into `staging` and the release pull request into `main` |
 | [version.yml](../.github/workflows/version.yml) | manual | version bump: `release/vX.Y.Z` branch plus a pull request into `staging` |
-| [release.yml](../.github/workflows/release.yml) | push to `staging` or `main`, manual | staging image (Linux and Windows clients), or on `main` with a new version: tag, image with all clients including macOS, and GitHub Release |
+| [release.yml](../.github/workflows/release.yml) | push to `main`; manual runs | on `main` with a new version: tag, image with all clients including macOS, and GitHub Release. Manual run on `staging`: the `:staging` test image; on a work branch: `:test-<branch>` (Linux and Windows clients) |
 | release.yml main gate (in `plan`) | push to `main` | fails unless `main`'s exact file tree already exists as a commit on `staging` |
 | release.yml `sync-staging` | push to `main` | fast-forwards `staging` to `main` after a release |
 
@@ -53,7 +57,8 @@ work branch ──PR──► staging ──release PR──► main
 |---|---|---|
 | Push to a work branch that changes code | `check` | 10 minutes (20 with a cold cache) |
 | Push that only changes documentation (`*.md`, `docs/`) | nothing (just opening the pull request) | 1 minute |
-| Merge into `staging` | `check` with dependency gates, staging build and image | 35 minutes |
+| Merge into `staging` | `check` with dependency gates | 12 minutes |
+| Test image (manual run on `staging` or a branch) | Linux builds, Windows client, image | 25 minutes |
 | Release to `main` | Linux builds, macOS clients (one job, 10×), image, GitHub Release | 200 minutes, mostly macOS |
 | Weekly fuzzing | `weekly` | 25 minutes |
 
