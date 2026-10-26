@@ -5,7 +5,9 @@
 //! * The device key is generated here and never leaves this device.
 //! * Local proxies: SOCKS5 and HTTP on 127.0.0.1; optionally set as the
 //!   Windows system proxy while connected (restored afterwards).
-//! * No logs are written; errors are shown in the window only.
+//! * No logs are written; errors are shown in the window only. For support,
+//!   Troubleshooting records connection events on demand: in memory, at
+//!   most an hour, then sent to the server or saved to a file.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
@@ -32,6 +34,7 @@ struct App {
     edited: Settings,
     confirm_forget: bool,
     paste_error: Option<String>,
+    diag_minutes: u64,
 }
 
 fn fmt_bytes(n: u64) -> String {
@@ -113,6 +116,7 @@ impl App {
             settings,
             confirm_forget: false,
             paste_error: None,
+            diag_minutes: 15,
         };
         if let Some(code) = initial_invite {
             app.invite = code;
@@ -298,6 +302,74 @@ impl App {
         }
     }
 
+    fn diagnostics_view(&mut self, ui: &mut egui::Ui, s: &engine::Snapshot, enrolled: bool) {
+        let st = self.engine.diag.status();
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Troubleshooting")
+            .default_open(st.state != "off")
+            .show(ui, |ui| {
+                match st.state {
+                    "recording" => {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 5.0, RED);
+                            ui.label(RichText::new(format!(
+                                "Recording · {} left · {} events",
+                                fmt_duration(Duration::from_secs(st.remaining_seconds.unwrap_or(0))),
+                                st.events
+                            )).strong());
+                        });
+                        ui.label(RichText::new("Reproduce the problem now (open the sites or apps that fail). Recording stops by itself and the report is then sent to the server.").small().weak());
+                        ui.horizontal(|ui| {
+                            if enrolled && ui.button("Stop and send").clicked() {
+                                self.engine.send(Command::DiagStop(true));
+                            }
+                            if ui.button("Stop").clicked() {
+                                self.engine.send(Command::DiagStop(false));
+                            }
+                        });
+                    }
+                    "stopped" => {
+                        ui.label(format!(
+                            "Recording finished · {} events (kept in memory for up to an hour)",
+                            st.events
+                        ));
+                        ui.horizontal(|ui| {
+                            if enrolled && ui.add_enabled(!s.diag_sending, egui::Button::new(if s.diag_sending { "Sending..." } else { "Send to server" })).clicked() {
+                                self.engine.send(Command::DiagSend);
+                            }
+                            if ui.button("Save to file").clicked() {
+                                self.engine.send(Command::DiagSave);
+                            }
+                            if ui.button("Discard").clicked() {
+                                self.engine.send(Command::DiagDiscard);
+                            }
+                        });
+                    }
+                    _ => {
+                        ui.label("Something not working? Record what happens while you reproduce it, so your administrator can see what went wrong.");
+                        ui.horizontal(|ui| {
+                            ui.label("Record for");
+                            egui::ComboBox::from_id_salt("diag_minutes")
+                                .selected_text(format!("{} minutes", self.diag_minutes))
+                                .show_ui(ui, |ui| {
+                                    for m in [5u64, 15, 30, 60] {
+                                        ui.selectable_value(&mut self.diag_minutes, m, format!("{m} minutes"));
+                                    }
+                                });
+                            if ui.button("Start recording").clicked() {
+                                self.engine.send(Command::DiagStart(self.diag_minutes));
+                            }
+                        });
+                        ui.label(RichText::new("Records connection events and error messages only, never the sites you visit or your traffic. Kept in memory (at most 5 MB), not written to disk, and switched off automatically. Ask your administrator to start diagnostics on the server too.").small().weak());
+                    }
+                }
+                if let Some((ok, msg)) = &s.diag_message {
+                    ui.label(RichText::new(msg).color(if *ok { GREEN } else { RED }));
+                }
+            });
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui, enrolled: bool) {
         ui.add_space(8.0);
         egui::CollapsingHeader::new("Settings")
@@ -383,6 +455,7 @@ impl eframe::App for App {
                 } else {
                     self.join_view(ui, &s);
                 }
+                self.diagnostics_view(ui, &s, enrolled);
                 self.settings_view(ui, enrolled);
             });
         });
@@ -390,7 +463,8 @@ impl eframe::App for App {
         if matches!(
             s.status,
             Status::Connected | Status::Connecting | Status::Enrolling
-        ) {
+        ) || self.engine.diag.is_recording()
+        {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
     }

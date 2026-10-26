@@ -482,6 +482,15 @@ async fn blocking<T: Send + 'static>(
 /// Start a node: open the store, recover (or import the file config on
 /// first start), load identities, bind listeners from the active revision.
 pub async fn start(opts: StartOptions) -> Result<NodeRuntime, StartError> {
+    start_with_diagnostics(opts, Arc::new(DiagnosticSink::new())).await
+}
+
+/// [`start`] with a caller-owned diagnostics recorder, so a recording can
+/// span several node lifetimes (the client app reconnecting).
+pub async fn start_with_diagnostics(
+    opts: StartOptions,
+    diagnostics: Arc<DiagnosticSink>,
+) -> Result<NodeRuntime, StartError> {
     let file_cfg = opts.config;
     let os = OsFamily::current();
     let env = Arc::new(CapabilityEnv::new(
@@ -495,7 +504,6 @@ pub async fn start(opts: StartOptions) -> Result<NodeRuntime, StartError> {
     let identity_store = IdentityStore::new(IdentitySnapshot::default());
     let gate = AdmissionGate::new(Arc::clone(&identity_store));
     let agent = Arc::new(AgentCell::default());
-    let diagnostics = Arc::new(DiagnosticSink::new());
     let metrics = Arc::new(LocalMetrics::new(Some(Arc::clone(&diagnostics))));
     let coord = Arc::new(Coordinator::new(
         Arc::clone(&store),

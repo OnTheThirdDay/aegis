@@ -158,7 +158,10 @@ pub fn handle(ctx: &ManagementContext, req: &Value) -> Value {
                 .diagnostics
                 .start(Duration::from_secs(minutes.saturating_mul(60)))
             {
-                Ok(()) => ok(json!({"active": true, "minutes": minutes})),
+                Ok(()) => {
+                    ctx.device_reports.clear();
+                    ok(json!({"active": true, "minutes": minutes}))
+                }
                 Err(e) => err(e),
             }
         }
@@ -167,7 +170,12 @@ pub fn handle(ctx: &ManagementContext, req: &Value) -> Value {
         }
         "diagnostic_stop" => {
             ctx.diagnostics.stop();
-            ok(json!({"active": false}))
+            ok(serde_json::to_value(ctx.diagnostics.status()).unwrap_or(Value::Null))
+        }
+        "diagnostic_discard" => {
+            ctx.diagnostics.discard();
+            ctx.device_reports.clear();
+            ok(json!({"state": "off"}))
         }
         "metrics" => {
             ok(serde_json::to_value(ctx.metrics.snapshot((ctx.gauges)())).unwrap_or(Value::Null))

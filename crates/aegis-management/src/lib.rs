@@ -44,6 +44,8 @@ pub struct ManagementContext {
     pub metrics: Arc<LocalMetrics>,
     pub gauges: GaugeFn,
     pub diagnostics: Arc<DiagnosticSink>,
+    /// Device diagnostic reports received while diagnostics are on.
+    pub device_reports: aegis_telemetry::ReportStore,
     /// Local CA for enrollment (gateway only).
     pub ca: Option<CaBundle>,
     pub secrets_dir: PathBuf,
@@ -143,6 +145,7 @@ impl ManagementContext {
             metrics,
             gauges,
             diagnostics,
+            device_reports: aegis_telemetry::ReportStore::default(),
             ca,
             secrets_dir,
             bind,

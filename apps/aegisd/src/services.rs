@@ -195,6 +195,45 @@ impl ApplianceServices for Appliance {
 }
 
 /// Periodic certificate maintenance (first pass shortly after start).
+/// While an on-demand diagnostics recording runs, note integrations that
+/// are failing (for example a Cloudflare connector that is down), so the
+/// analysis can point at them. Idle otherwise.
+pub async fn diagnostics_loop(app: Arc<Appliance>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tick.tick().await;
+        let diagnostics = &app.node.diagnostics;
+        if !diagnostics.is_recording() {
+            continue;
+        }
+        let status = app.integrations.status();
+        for i in status.as_array().into_iter().flatten() {
+            if i["enabled"] != true {
+                continue;
+            }
+            let id = i["id"].as_str().unwrap_or("integration");
+            let state = i["state"].as_str().unwrap_or("");
+            let connector_down = i["state"] == "active"
+                && i["connector"].is_object()
+                && (i["connector"]["running"] != true || i["connector"]["ready"] == false);
+            if state == "failed" || connector_down {
+                let error = i["error"].as_str().unwrap_or(if connector_down {
+                    "connector not running or not ready"
+                } else {
+                    ""
+                });
+                diagnostics.note(
+                    aegis_telemetry::Severity::Error,
+                    "integration.failed",
+                    &[("integration", id), ("state", state), ("error", error)],
+                );
+            } else {
+                diagnostics.count("integration.ok");
+            }
+        }
+    }
+}
+
 pub async fn maintenance_loop(app: Arc<Appliance>) {
     let mut wait = Duration::from_secs(30);
     loop {

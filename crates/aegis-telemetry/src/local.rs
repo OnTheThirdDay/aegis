@@ -142,6 +142,11 @@ impl LocalMetrics {
         }
     }
 
+    /// The on-demand diagnostics recorder events are mirrored into.
+    pub fn diagnostics(&self) -> Option<&Arc<DiagnosticSink>> {
+        self.diagnostics.as_ref()
+    }
+
     /// Count a dropped telemetry item (`runtime.reason` index).
     pub fn telemetry_dropped(&self, reason: &str) {
         let idx = crate::catalog::RUNTIME_REASON_VALUES

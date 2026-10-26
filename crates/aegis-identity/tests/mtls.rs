@@ -230,3 +230,27 @@ fn issuance_limits() {
     let peer = PeerIdentity::from_der(tls::parse_certs(&cert).expect("c")[0].as_ref()).expect("p");
     assert_eq!(peer.node_id, "assigned-name");
 }
+
+#[test]
+fn device_signatures_verify_only_with_their_certificate() {
+    let ca = pki::generate_ca("ca", pki::DEFAULT_CA_VALIDITY).expect("ca");
+    let (key, csr) = pki::generate_key_and_csr("laptop").expect("csr");
+    let cert = pki::sign_csr(
+        &ca,
+        &csr,
+        "laptop",
+        Role::Client,
+        &[],
+        DEFAULT_NODE_VALIDITY,
+    )
+    .expect("sign");
+    let der = tls::parse_certs(&cert).expect("c")[0].clone();
+    let msg = pki::diagnostic_upload_message(1_700_000_000, b"report");
+    let sig = pki::sign_with_key(&key, &msg).expect("signature");
+    assert!(pki::verify_with_certificate(der.as_ref(), &msg, &sig));
+    let other = pki::diagnostic_upload_message(1_700_000_001, b"report");
+    assert!(!pki::verify_with_certificate(der.as_ref(), &other, &sig));
+    let (key2, _) = pki::generate_key_and_csr("other").expect("csr");
+    let forged = pki::sign_with_key(&key2, &msg).expect("signature");
+    assert!(!pki::verify_with_certificate(der.as_ref(), &msg, &forged));
+}

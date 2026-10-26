@@ -52,7 +52,7 @@ local IPC (owner-only socket; --socket PATH, default /var/lib/aegisnet/aegisd.so
   activation inspect
   activation reconcile OPERATION_ID
   activation supersede --pending OP --expected-runtime REV|null --epoch N --revision REV --digest HEX --reason TEXT
-  diagnostic start [--minutes N] | diagnostic status | diagnostic stop
+  diagnostic start [--minutes N<=60] | diagnostic status | diagnostic stop | diagnostic discard
 
 REST API (--api URL default http://127.0.0.1:9080, --token or $AEGIS_TOKEN):
   api METHOD PATH [--data JSON] [--if-match ETAG] [--idempotency-key KEY]
@@ -837,7 +837,8 @@ fn run(args: &[String]) -> Result<bool, String> {
             }
             Some("status") => ipc_print(&o, json!({"cmd": "diagnostic_status"})),
             Some("stop") => ipc_print(&o, json!({"cmd": "diagnostic_stop"})),
-            _ => Err("diagnostic subcommand must be start, status or stop".into()),
+            Some("discard") => ipc_print(&o, json!({"cmd": "diagnostic_discard"})),
+            _ => Err("diagnostic subcommand must be start, status, stop or discard".into()),
         },
         "api" => cmd_api(&o),
         "activate" => cmd_activate(&o),

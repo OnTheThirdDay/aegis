@@ -34,7 +34,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: rustup show active-toolchain || rustup toolchain install
@@ -49,7 +49,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: cargo build --locked --workspace
@@ -64,7 +64,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -84,7 +84,7 @@ jobs:
         os: [windows-2022, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: cargo check --locked --workspace
@@ -93,7 +93,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: cargo install --locked cargo-deny --version 0.20.2
@@ -106,7 +106,7 @@ jobs:
     # the scheduled run. Unmaintained/yanked warnings are errors.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: cargo install --locked cargo-audit --version 0.22.2
@@ -118,7 +118,7 @@ jobs:
     # PR: 60 s per parser target (07 §11). Requires nightly + cargo-fuzz.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4 # TODO: pin to reviewed SHA
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal
@@ -152,7 +152,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -190,7 +190,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Fast-forward staging to main
