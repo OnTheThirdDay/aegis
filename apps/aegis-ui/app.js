@@ -284,24 +284,38 @@ function showLogin(why) {
     field("Password", pass, PORTAL
       ? "First sign-in? Use the one-time password your administrator gave you; you will choose your own."
       : "First sign-in? The installer printed a one-time admin password (also readable with `aegisctl initial-password` on the server)."),
-    el("div", { class: "row" }, [submit]),
   ]);
+  // Second step, shown when the account uses two-factor authentication.
+  const code = /** @type {HTMLInputElement} */ (el("input", { autocomplete: "one-time-code", inputmode: "numeric", spellcheck: "false" }));
+  const codeField = field("Authentication code", code, "The 6-digit code from your authenticator app, or one of your recovery codes.");
+  codeField.hidden = true;
+  form.append(codeField, el("div", { class: "row" }, [submit]));
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     submit.disabled = true;
     try {
-      const { data } = await api("POST", "/auth/login", { body: { username: user.value.trim(), password: pass.value } });
-      pass.value = "";
+      /** @type {Record<string,string>} */
+      const body = { username: user.value.trim(), password: pass.value };
+      if (!codeField.hidden && code.value.trim()) body.code = code.value.trim();
+      const { data } = await api("POST", "/auth/login", { body });
+      pass.value = ""; code.value = "";
       adopt(data);
     } catch (e) {
-      notice(msg(e), true);
+      // @ts-ignore
+      if (e.code === "two_factor_required") {
+        codeField.hidden = false;
+        notice("Enter the code from your authenticator app.");
+        code.focus();
+      } else {
+        notice(msg(e), true);
+      }
     } finally {
       submit.disabled = false;
     }
   });
   v.append(form);
   if (PORTAL) {
-    v.append(el("p", { class: "muted small narrow" }, ["This is the AegisNet user portal: add your devices, remove old ones and download the app. Administrators sign in on the console."]));
+    v.append(el("p", { class: "muted small narrow" }, ["This is the AegisNet user portal: add your devices, remove old ones and download the app. Administrators sign in with two-factor authentication."]));
   } else {
     v.append(bootstrapCard());
   }
@@ -582,7 +596,7 @@ async function renderUsers() {
     toggle.hidden = !can("system:configure");
     busy(toggle, async () => { await api("PUT", "/system/portal", { body: { enabled: !pr.enabled } }); await renderUsers(); });
     v.append(card("User portal", [
-      el("p", { class: "muted" }, ["Users sign in here to add and remove their own devices and download the app, without access to this console. It is served on the same public address as devices (through Cloudflare Tunnel when set up). Administrators can't sign in there."]),
+      el("p", { class: "muted" }, ["Users sign in here to add and remove their own devices and download the app, without access to this console. It is served on the same public address as devices (through Cloudflare Tunnel when set up). Administrators can sign in there too, with two-factor authentication (Account), and then get this whole console without SSH."]),
       el("p", {}, [pill(pr.enabled ? "on" : "off"), " ", link]),
       el("div", { class: "row" }, [copyUrl, toggle]),
     ]));
@@ -636,12 +650,20 @@ async function listUsers(host) {
         notice("Role updated.");
       } catch (e) { notice(msg(e), true); roleSel.value = u.roles[0]; }
     });
+    const reset2fa = u.two_factor ? button("Reset 2FA", "ghost small") : null;
+    if (reset2fa) {
+      busy(reset2fa, async () => {
+        if (!confirm("Turn off two-factor authentication for " + u.username + "? Use this when they lost their authenticator; they can set it up again. Their sessions end.")) return;
+        await api("POST", "/users/" + u.id + "/reset-2fa");
+        await listUsers(host);
+      });
+    }
     return el("tr", {}, [
       el("td", {}, [el("strong", {}, [u.username]), u.id === session.principal ? el("span", { class: "muted" }, [" (you)"]) : null]),
       el("td", {}, [roleSel]),
-      el("td", {}, [pill(u.password_change_required ? "must change password" : u.status)]),
+      el("td", {}, [pill(u.password_change_required ? "must change password" : u.status), u.two_factor ? " " : "", u.two_factor ? pill("2FA") : null]),
       el("td", {}, [when(u.created_at)]),
-      el("td", { class: "actions" }, [reset, toggle]),
+      el("td", { class: "actions" }, [reset, reset2fa, toggle]),
     ]);
   });
   host.replaceChildren(card("Users", [el("table", {}, [
@@ -1064,7 +1086,7 @@ async function renderDiagnostics() {
     /** @type {Record<string,string>} */
     const headers = { "Content-Type": "application/octet-stream", Accept: "application/json" };
     if (session.csrf) headers["X-CSRF-Token"] = session.csrf;
-    const resp = await fetch("/api/v1/diagnostics/devices", { method: "POST", headers, body: await f.arrayBuffer(), credentials: "same-origin" });
+    const resp = await fetch(BASE + "/api/v1/diagnostics/devices", { method: "POST", headers, body: await f.arrayBuffer(), credentials: "same-origin" });
     if (!resp.ok) {
       const e = await resp.json().catch(() => ({}));
       throw new Error(e.detail || friendly(e.aegis_error_code || String(resp.status)));
@@ -1093,7 +1115,7 @@ async function renderDiagnostics() {
     });
     const exp = button("Download as OpenTelemetry logs (OTLP/JSON)", "ghost small");
     busy(exp, async () => {
-      const resp = await fetch("/api/v1/diagnostics/otlp", { credentials: "same-origin" });
+      const resp = await fetch(BASE + "/api/v1/diagnostics/otlp", { credentials: "same-origin" });
       if (!resp.ok) throw new Error("Nothing to download yet.");
       download("aegisnet-diagnostics.otlp.json", await resp.text(), "application/json");
     });
@@ -1125,10 +1147,11 @@ async function renderAccount() {
   const f = passwordForm(false);
   f.form.classList.remove("narrow");
   v.append(card("Signed in", [el("p", {}, [el("strong", {}, [session.username]), " · " + session.roles.join(", ")])]), f.form);
+  try { v.append(await twoFactorCard()); } catch { /* older gateway */ }
   if (can("system:configure")) {
     const dl = button("Download web CA certificate", "ghost");
     busy(dl, async () => {
-      const resp = await fetch("/api/v1/system/web-ca.pem", { credentials: "same-origin" });
+      const resp = await fetch(BASE + "/api/v1/system/web-ca.pem", { credentials: "same-origin" });
       if (!resp.ok) throw new Error("Download failed.");
       download("aegisnet-web-ca.pem", await resp.text(), "application/x-pem-file");
     });
@@ -1139,6 +1162,88 @@ async function renderAccount() {
     const ca = await deviceCaCard().catch(() => null);
     if (ca) v.append(ca);
   }
+}
+
+/** Draw a QR code from rows of "1"/"0" modules (no inline images under the CSP). */
+function qrSvg(/** @type {string[]} */ rows) {
+  const ns = "http://www.w3.org/2000/svg";
+  const n = rows.length, q = 4, size = n + 2 * q;
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 " + size + " " + size);
+  svg.setAttribute("width", "200"); svg.setAttribute("height", "200");
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "QR code for your authenticator app");
+  const bg = document.createElementNS(ns, "rect");
+  bg.setAttribute("width", String(size)); bg.setAttribute("height", String(size)); bg.setAttribute("fill", "#fff");
+  svg.append(bg);
+  rows.forEach((row, y) => {
+    for (let x = 0; x < row.length; x++) {
+      if (row[x] !== "1") continue;
+      const r = document.createElementNS(ns, "rect");
+      r.setAttribute("x", String(x + q)); r.setAttribute("y", String(y + q));
+      r.setAttribute("width", "1"); r.setAttribute("height", "1"); r.setAttribute("fill", "#000");
+      svg.append(r);
+    }
+  });
+  return svg;
+}
+
+/** Two-factor authentication for the signed-in account. */
+async function twoFactorCard() {
+  const { data } = await api("GET", "/auth/2fa");
+  const admin = session.scopes.some((s) => s !== "devices:self" && s !== "self:password");
+  const why = admin
+    ? "Required to sign in to this console through the public address (the user portal), so you can manage the gateway without SSH. On the local console it adds a second check."
+    : "Adds a second check when you sign in: a code from an authenticator app on your phone.";
+  if (data.enabled) {
+    const pw = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "current-password" }));
+    const code = /** @type {HTMLInputElement} */ (el("input", { autocomplete: "one-time-code", inputmode: "numeric" }));
+    const off = button("Turn off two-factor authentication", "danger");
+    busy(off, async () => {
+      await api("POST", "/auth/2fa/disable", { body: { password: pw.value, code: code.value.trim() } });
+      notice("Two-factor authentication is off.");
+      await renderAccount();
+    });
+    return card("Two-factor authentication", [
+      el("p", {}, [pill("on"), " ", el("span", { class: "muted" }, [data.recovery_codes_left + " recovery codes left"])]),
+      el("p", { class: "muted" }, [why]),
+      el("details", {}, [el("summary", {}, ["Turn off"]), el("div", { class: "cols" }, [field("Password", pw), field("Current code", code)]), el("div", { class: "row" }, [off])]),
+    ]);
+  }
+  const start = button("Set up two-factor authentication");
+  const flow = el("div");
+  busy(start, async () => {
+    const { data: s } = await api("POST", "/auth/2fa/setup");
+    const code = /** @type {HTMLInputElement} */ (el("input", { autocomplete: "one-time-code", inputmode: "numeric" }));
+    const confirmBtn = button("Turn on");
+    busy(confirmBtn, async () => {
+      const { data: r } = await api("POST", "/auth/2fa/enable", { body: { code: code.value.trim() } });
+      const copyCodes = button("Copy recovery codes", "ghost small");
+      copyCodes.addEventListener("click", () => copy(r.recovery_codes.join("\n")));
+      const done = button("I saved them");
+      done.addEventListener("click", () => renderAccount());
+      flow.replaceChildren(el("div", { class: "secret" }, [
+        el("p", {}, [el("strong", {}, ["Two-factor authentication is on."]), " Save these recovery codes somewhere safe. Each one works once if you lose your phone; they are shown only now."]),
+        el("ul", { class: "plain mono" }, r.recovery_codes.map((/** @type {string} */ c) => el("li", {}, [c]))),
+        el("div", { class: "row" }, [copyCodes, done]),
+      ]));
+    });
+    flow.replaceChildren(
+      el("ol", { class: "steps" }, [
+        el("li", {}, ["Open an authenticator app on your phone (for example Google Authenticator, Microsoft Authenticator, 1Password or Bitwarden) and scan this code."]),
+        el("li", {}, ["Enter the 6-digit code it shows, then press Turn on."]),
+      ]),
+      qrSvg(s.qr),
+      el("p", { class: "muted small" }, ["Can't scan? Enter this key in the app: ", el("code", {}, [s.secret])]),
+      field("Code from the app", code),
+      el("div", { class: "row" }, [confirmBtn]),
+    );
+  });
+  return card("Two-factor authentication", [
+    el("p", {}, [pill("off")]),
+    el("p", { class: "muted" }, [why]),
+    el("div", { class: "row" }, [start]),
+    flow,
+  ]);
 }
 
 /** Device certificate authority: root key custody and issuer renewal (owner). */
@@ -1171,7 +1276,7 @@ async function deviceCaCard() {
       /** @type {Record<string,string>} */
       const headers = { "Content-Type": "application/json", Accept: "application/x-pem-file" };
       if (session.csrf) headers["X-CSRF-Token"] = session.csrf;
-      const resp = await fetch("/api/v1/system/device-ca/export-root-key", { method: "POST", headers, credentials: "same-origin", body: JSON.stringify({ password: pw.value }) });
+      const resp = await fetch(BASE + "/api/v1/system/device-ca/export-root-key", { method: "POST", headers, credentials: "same-origin", body: JSON.stringify({ password: pw.value }) });
       if (!resp.ok) {
         const e = await resp.json().catch(() => ({}));
         throw new Error(e.detail || friendly(e.aegis_error_code || String(resp.status)));

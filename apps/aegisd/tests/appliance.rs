@@ -312,7 +312,8 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         let (s, v) = portal
             .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": "a much better passphrase"})))
             .await;
-        assert_eq!(s, 403, "administrators are refused on the portal: {v}");
+        assert_eq!(s, 403, "administrators without 2FA are refused on the portal: {v}");
+        assert_eq!(v["aegis_error_code"], "two_factor_setup_required");
         let (s, v) = portal
             .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "alice", "password": alice_pw})))
             .await;
@@ -369,6 +370,88 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
             .call(reqwest::Method::PUT, "/system/portal", Some(json!({"enabled": true})))
             .await;
         assert_eq!(s, 200);
+
+        // Administrators with 2FA get the whole console on the portal.
+        let (s, v) = c.call(reqwest::Method::POST, "/auth/2fa/setup", None).await;
+        assert_eq!(s, 200, "{v}");
+        let secret = aegis_management::totp::base32_decode(v["secret"].as_str().expect("secret")).expect("base32");
+        assert!(v["uri"].as_str().is_some_and(|u| u.starts_with("otpauth://totp/AegisNet:admin?")));
+        assert!(v["qr"].as_array().is_some_and(|rows| rows.len() >= 21));
+        let now = aegis_management::totp::step_of(aegis_storage::now_unix());
+        let code = |step: i64| format!("{:06}", aegis_management::totp::code_at(&secret, step as u64));
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/auth/2fa/enable", Some(json!({"code": "000000"})))
+            .await;
+        assert!(s == 400 || code(now) == "000000", "a wrong code doesn't enable 2FA: {v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/auth/2fa/enable", Some(json!({"code": code(now)})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let recovery: Vec<String> = v["recovery_codes"]
+            .as_array()
+            .expect("recovery codes")
+            .iter()
+            .filter_map(|c| c.as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(recovery.len(), 10);
+        let mut admin = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        admin.base = format!("https://127.0.0.1:{edge_port}/portal");
+        let login = |code: Option<String>| {
+            let mut body = json!({"username": "admin", "password": "a much better passphrase"});
+            if let Some(c) = code {
+                body["code"] = json!(c);
+            }
+            body
+        };
+        let (s, v) = admin.call(reqwest::Method::POST, "/auth/login", Some(login(None))).await;
+        assert_eq!(s, 401, "{v}");
+        assert_eq!(v["aegis_error_code"], "two_factor_required");
+        let (s, v) = admin
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some("123456".into()))))
+            .await;
+        assert!(s == 401 || code(now + 1) == "123456", "wrong code refused: {v}");
+        // The next step's code (the enabling code's step is already spent).
+        let (s, v) = admin
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(code(now + 1)))))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["mfa_session"], true);
+        let (s, v) = admin.call(reqwest::Method::GET, "/users", None).await;
+        assert_eq!(s, 200, "the whole console with 2FA: {v}");
+        let (s, _) = admin.call(reqwest::Method::GET, "/diagnostics", None).await;
+        assert_eq!(s, 200);
+        let (s, _) = admin
+            .call(reqwest::Method::POST, "/system/device-ca/export-root-key", Some(json!({"password": "a much better passphrase"})))
+            .await;
+        assert_eq!(s, 404, "exporting the root key stays local-only");
+        let mut again = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        again.base = admin.base.clone();
+        let (s, _) = again
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(code(now + 1)))))
+            .await;
+        assert_eq!(s, 401, "a code works once");
+        let (s, v) = again
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(recovery[0].clone()))))
+            .await;
+        assert_eq!(s, 200, "recovery code: {v}");
+        let mut third = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        third.base = admin.base.clone();
+        let (s, _) = third
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(recovery[0].clone()))))
+            .await;
+        assert_eq!(s, 401, "a recovery code works once");
+        // The local console asks for the code too once 2FA is on.
+        let mut local = Console::new(running.console.expect("console"), &web_ca);
+        let (s, v) = local.call(reqwest::Method::POST, "/auth/login", Some(login(None))).await;
+        assert_eq!(s, 401, "{v}");
+        assert_eq!(v["aegis_error_code"], "two_factor_required");
+        let (s, v) = local
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(recovery[1].clone()))))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        // Owners can reset a lost authenticator.
+        let (_, v) = c.call(reqwest::Method::GET, "/users", None).await;
+        assert!(v["items"].as_array().expect("users").iter().any(|u| u["username"] == "admin" && u["two_factor"] == true));
 
         // Address change: the device learns the gateway's new endpoint on
         // connect and adopts it only after the pinned gateway answers there.

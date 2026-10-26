@@ -44,6 +44,12 @@ impl ApiError {
         }
     }
 
+    /// Replace the machine-readable error code (keeps the status).
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
+    }
+
     pub fn detail(mut self, d: impl Into<String>) -> Self {
         let d: String = d.into();
         self.detail = Some(d.chars().take(2048).collect());

@@ -20,6 +20,7 @@ mod handlers;
 mod http_util;
 pub mod ipc;
 pub mod portal;
+pub mod totp;
 mod ui;
 
 pub use auth::{hash_password, Permission, Principal, ROLE_OWNER};

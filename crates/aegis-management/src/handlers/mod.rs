@@ -64,6 +64,11 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
             post(appliance::integration_action),
         )
         .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/auth/2fa", get(auth::two_factor_status))
+        .route("/api/v1/auth/2fa/setup", post(auth::two_factor_setup))
+        .route("/api/v1/auth/2fa/enable", post(auth::two_factor_enable))
+        .route("/api/v1/auth/2fa/disable", post(auth::two_factor_disable))
+        .route("/api/v1/users/{id}/reset-2fa", post(auth::two_factor_reset))
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/bootstrap/claim", post(auth::bootstrap_claim))
         .route("/api/v1/system/health", get(system::health))

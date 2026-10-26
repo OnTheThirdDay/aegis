@@ -131,6 +131,8 @@ struct AdminSession {
     csrf_token: String,
     expires_at: i64,
     kind: CredentialKind,
+    /// Signed in with a second factor (TOTP or recovery code).
+    mfa: bool,
 }
 
 /// Authenticated caller of one request.
@@ -141,6 +143,8 @@ pub struct Principal {
     pub kind: CredentialKind,
     pub expires_at: i64,
     pub csrf_token: Option<String>,
+    /// This session was opened with a second factor.
+    pub mfa: bool,
 }
 
 impl Principal {
@@ -368,7 +372,53 @@ impl ManagementContext {
             csrf_token: (kind == CredentialKind::Cookie).then_some(s.csrf_token),
             kind,
             expires_at: s.expires_at,
+            mfa: s.mfa,
         })
+    }
+
+    /// The cookie session of a request, without CSRF or expiry side effects:
+    /// `(scopes, mfa)`. For the portal's routing decision only; handlers
+    /// still authenticate fully.
+    pub(crate) fn peek_session(&self, headers: &HeaderMap) -> Option<(Vec<String>, bool)> {
+        let token = cookie_token(headers)?;
+        let sessions = self.auth.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let s = sessions.get(&token_key(&token))?;
+        (s.kind == CredentialKind::Cookie && s.expires_at > db::now_unix())
+            .then(|| (s.scopes.clone(), s.mfa))
+    }
+
+    /// Whether `scopes` grant anything beyond managing one's own devices.
+    pub(crate) fn administrative(scopes: &[String]) -> bool {
+        scopes
+            .iter()
+            .any(|s| s != Permission::DevicesSelf.as_str() && s != SCOPE_PASSWORD_ONLY)
+    }
+
+    /// Check a second-factor code (TOTP, or a recovery code) and spend it.
+    pub(crate) fn check_second_factor(
+        &self,
+        principal_id: &str,
+        code: &str,
+    ) -> Result<(), ApiError> {
+        let store = self.coord.store();
+        let ok = if crate::totp::looks_like_recovery_code(code) {
+            let hash = crate::totp::recovery_hash(code);
+            store.tx(|c| db::use_recovery_code(c, principal_id, &hash))?
+        } else {
+            match crate::totp::load(self, principal_id, false)
+                .and_then(|secret| crate::totp::verify(&secret, code, db::now_unix()))
+            {
+                Some(step) => store.tx(|c| db::advance_totp_step(c, principal_id, step))?,
+                None => false,
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(ApiError::unauthenticated()
+                .with_code("invalid_two_factor_code")
+                .detail("the authentication code is wrong or was already used"))
+        }
     }
 
     fn scopes_for(roles: &[String]) -> Vec<String> {
@@ -428,6 +478,7 @@ impl ManagementContext {
         username: &str,
         password: &str,
         portal: bool,
+        code: Option<&str>,
     ) -> Result<(String, Principal), ApiError> {
         let limiter = if portal {
             &self.auth.portal_limiter
@@ -471,13 +522,14 @@ impl ManagementContext {
             return Err(ApiError::unauthenticated().detail("invalid credentials"));
         }
         let p = principal.ok_or_else(ApiError::unauthenticated)?;
-        // Checked after the password, so the portal never reveals which
-        // accounts are administrators.
-        if portal
-            && !Self::scopes_for(&p.roles)
-                .iter()
-                .all(|s| s == "devices:self")
-        {
+        // Checked after the password, so nothing here reveals which accounts
+        // are administrators or use 2FA.
+        let two_factor = self
+            .coord
+            .store()
+            .read(|c| db::two_factor_enabled(c, &p.id))
+            .map_err(ApiError::from)?;
+        if portal && Self::administrative(&Self::scopes_for(&p.roles)) && !two_factor {
             let _ = self.coord.store().tx(|c| {
                 db::append_audit(
                     c,
@@ -488,12 +540,28 @@ impl ManagementContext {
                         target_id: None,
                         decision: "denied",
                         revision_digest: None,
-                        metadata: serde_json::json!({"portal": true, "reason": "administrator"}),
+                        metadata: serde_json::json!({"portal": true, "reason": "administrator_without_2fa"}),
                     },
                 )
             });
-            return Err(ApiError::forbidden()
-                .detail("administrators sign in on the console, not the user portal"));
+            return Err(ApiError::forbidden().with_code("two_factor_setup_required").detail(
+                "administrators need two-factor authentication to sign in here: set it up under Account on the console",
+            ));
+        }
+        if two_factor {
+            match code.map(str::trim).filter(|c| !c.is_empty()) {
+                None => {
+                    return Err(ApiError::unauthenticated()
+                        .with_code("two_factor_required")
+                        .detail("enter the code from your authenticator app"));
+                }
+                Some(code) => {
+                    if let Err(e) = self.check_second_factor(&p.id, code) {
+                        Self::failure_in(limiter, username);
+                        return Err(e);
+                    }
+                }
+            }
         }
         let must_change = self
             .coord
@@ -505,7 +573,7 @@ impl ManagementContext {
         } else {
             Self::scopes_for(&p.roles)
         };
-        let (token, principal) = self.open_session(&p.id, scopes);
+        let (token, principal) = self.open_session(&p.id, scopes, two_factor);
         let _ = self.coord.store().tx(|c| {
             db::append_audit(
                 c,
@@ -523,7 +591,12 @@ impl ManagementContext {
         Ok((token, principal))
     }
 
-    fn open_session(&self, principal_id: &str, scopes: Vec<String>) -> (String, Principal) {
+    fn open_session(
+        &self,
+        principal_id: &str,
+        scopes: Vec<String>,
+        mfa: bool,
+    ) -> (String, Principal) {
         let token = random_token();
         let csrf = random_token();
         let expires_at = db::now_unix() + SESSION_TTL.as_secs() as i64;
@@ -539,6 +612,7 @@ impl ManagementContext {
                     csrf_token: csrf.clone(),
                     expires_at,
                     kind: CredentialKind::Cookie,
+                    mfa,
                 },
             );
         (
@@ -549,6 +623,7 @@ impl ManagementContext {
                 kind: CredentialKind::Cookie,
                 expires_at,
                 csrf_token: Some(csrf),
+                mfa,
             },
         )
     }
@@ -590,6 +665,7 @@ impl ManagementContext {
         principal_id: &str,
         current: &str,
         new: &str,
+        mfa: bool,
     ) -> Result<(String, Principal), ApiError> {
         check_password_policy(new)?;
         if current == new {
@@ -630,7 +706,8 @@ impl ManagementContext {
                 let _ = std::fs::remove_file(dir.join("initial-admin-password"));
             }
         }
-        Ok(self.open_session(&p.id, Self::scopes_for(&p.roles)))
+        // A session opened with a second factor stays one after the change.
+        Ok(self.open_session(&p.id, Self::scopes_for(&p.roles), mfa))
     }
 
     /// Owner-created account with a one-time temporary password that must
@@ -990,6 +1067,7 @@ impl ManagementContext {
                     csrf_token: random_token(),
                     expires_at,
                     kind: CredentialKind::Bearer,
+                    mfa: false,
                 },
             );
         Ok((token, expires_at))
