@@ -643,13 +643,22 @@ async function renderConnectivity() {
       conn.public_host
         ? el("span", {}, ["Devices connect to ", el("strong", { class: "mono" }, [conn.public_host + (conn.public_port && conn.public_port !== 443 ? ":" + conn.public_port : "")]),
           " (" + ({ direct: "direct connection, private certificate", cloudflare: "through Cloudflare Tunnel", acme: "direct, Let's Encrypt certificate" }[/** @type {"direct"} */ (conn.mode)] || conn.mode) + ")."])
-        : el("span", { class: "warn-text" }, ["Not set yet — choose one of the options below before inviting devices."]),
+        : el("span", { class: "warn-text" }, [info.tunnel_only
+          ? "Not set yet. This gateway was installed with --tunnel-only, so devices can only use Cloudflare Tunnel: set it up below before inviting devices."
+          : "Not set yet — choose one of the options below before inviting devices."]),
     ]),
     el("p", { class: "muted" }, ["Device traffic is always protected by mutual TLS between the device and this gateway, whichever path it takes."]),
   ]));
-  v.append(directCard(conn, managed));
-  v.append(cloudflareCard(cf));
-  v.append(acmeCard(acme, conn));
+  if (info.tunnel_only) {
+    // No public device port: direct connections and HTTP-validated
+    // certificates can't work, so only the tunnel is offered.
+    v.append(cloudflareCard(cf));
+    v.append(card("Direct connections are off", [el("p", { class: "muted" }, ["This gateway was installed with --tunnel-only: nothing on the server is reachable from the internet, and devices connect through Cloudflare Tunnel. To accept direct connections, reinstall with --direct."])]));
+  } else {
+    v.append(directCard(conn, managed));
+    v.append(cloudflareCard(cf));
+    v.append(acmeCard(acme, conn));
+  }
   if (["applying", "removing", "issuing", "planning", "verifying"].includes(cf.state) || ["issuing", "removing"].includes(acme.state)) {
     pollTimer = window.setTimeout(() => { if (currentView === "connectivity") renderConnectivity().catch(() => {}); }, 2500);
   }
@@ -686,6 +695,7 @@ function cloudflareCard(cf) {
     el("p", { class: "muted" }, ["Uses your Cloudflare account and domain. AegisNet creates the tunnel, the DNS record and runs the connector itself — no dashboard steps. Your router needs no open ports. Cloudflare sees encrypted device traffic only; device authentication stays end-to-end."]),
     head,
     cf.error ? el("p", { class: "err-text" }, ["Last error: " + cf.error]) : null,
+    cf.warning ? el("p", { class: "warn-text" }, [cf.warning]) : null,
     cf.step && cf.state !== "active" ? el("p", { class: "muted" }, ["Step: " + cf.step]) : null,
     cf.connector ? el("p", { class: "muted" }, ["Connector: " + (cf.connector.ready ? "connected to Cloudflare" : cf.connector.running ? "starting…" : "stopped") + (cf.connector.version ? " (cloudflared " + cf.connector.version + ")" : "")]) : null,
     body,
@@ -705,8 +715,8 @@ function cloudflareCard(cf) {
     const keepDns = /** @type {HTMLInputElement} */ (el("input", { type: "checkbox" }));
     const restart = button("Restart connector", "ghost");
     busy(restart, async () => { await api("POST", "/integrations/cloudflare/restart", { body: {} }); notice("Connector restarted."); await renderConnectivity(); });
-    const retry = button("Retry setup", "ghost");
-    retry.hidden = cf.state === "active";
+    const retry = button(cf.state === "active" ? "Test again" : "Retry setup", "ghost");
+    retry.hidden = cf.state === "active" && !cf.warning;
     busy(retry, async () => {
       if (!token.value) throw new Error("Paste the API token to retry.");
       await api("POST", "/integrations/cloudflare/apply", { body: { token: token.value, plan_id: cf.plan_id } });

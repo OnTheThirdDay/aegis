@@ -1149,6 +1149,7 @@ async fn gateway_limits_cover_pending_agp_and_live_sessions() {
             url: format!("ws://{}/agp", gw.bound_addr("ingress-ws").expect("ws")),
             outer_ca_pem: None,
             outer_server_name: None,
+            connect_addresses: Vec::new(),
             connect_timeout: Duration::from_secs(2),
             handshake_timeout: Duration::from_secs(2),
             max_message_bytes: 128 * 1024,

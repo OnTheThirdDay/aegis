@@ -48,11 +48,13 @@ pub async fn info(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
         &json!({
             "version": env!("CARGO_PKG_VERSION"),
             "appliance": appliance.is_some(),
+            "tunnel_only": ctx.tunnel_only(),
             "console_certificate_sha256": ctx.console_fingerprint(),
             "connection": conn,
             "checklist": {
                 "owner_password_changed": owners_pending == 0,
-                "server_address_set": conn.public_host.is_some(),
+                "server_address_set": conn.public_host.is_some()
+                    && (!ctx.tunnel_only() || conn.mode.as_deref() == Some("cloudflare")),
                 "devices_enrolled": devices,
             },
             "runtime": appliance.map(|a| a.status()).unwrap_or(Value::Null),
@@ -76,6 +78,11 @@ pub async fn put_connection(State(ctx): State<Ctx>, headers: HeaderMap, body: Bo
     let v = read_json(&headers, body, &["application/json"]).await?;
     let b: ConnectionBody =
         serde_json::from_value(v).map_err(|_| ApiError::bad_request("invalid_body"))?;
+    if ctx.tunnel_only() {
+        return Err(ApiError::conflict("tunnel_only").detail(
+            "this gateway was installed with --tunnel-only, so its device port is not reachable from the network; use Cloudflare Tunnel (or reinstall with --direct)",
+        ));
+    }
     let host = b.public_host.trim().to_ascii_lowercase();
     if !valid_public_host(&host) || b.public_port == 0 {
         return Err(ApiError::bad_request("invalid_public_address")

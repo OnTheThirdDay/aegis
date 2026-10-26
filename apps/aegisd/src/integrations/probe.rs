@@ -7,6 +7,11 @@
 //!    policy — proving the authenticated AGP session reaches the gateway;
 //! 2. fetches the operator's HTTP and HTTPS verification URLs through SOCKS
 //!    with remote DNS (the HTTPS certificate is verified normally).
+//!
+//! The public hostname is looked up through public resolvers and the probe
+//! connects to those addresses (TLS and Host still use the name): this
+//! server's own resolver may still cache "no such name" from before the
+//! record existed, which says nothing about devices.
 
 use crate::appliance;
 use crate::services::Appliance;
@@ -139,7 +144,79 @@ pub fn ensure_identity(app: &Appliance) -> Result<(), String> {
     Ok(())
 }
 
-fn probe_config(app: &Appliance, url: &str) -> Result<aegis_config::NodeConfig, String> {
+/// Why the data path could not be verified.
+#[derive(Debug)]
+pub enum ProbeFailure {
+    /// Nothing answered when this server connected to the public endpoint
+    /// (TCP refused or timed out): its own route to the edge is blocked,
+    /// which says nothing about devices elsewhere.
+    Unreachable(String),
+    /// Anything else: missing DNS, an HTTP error from the edge, TLS or
+    /// session failures, verification sites unreachable.
+    Failed(String),
+}
+
+impl ProbeFailure {
+    pub fn detail(&self) -> &str {
+        match self {
+            ProbeFailure::Unreachable(d) | ProbeFailure::Failed(d) => d,
+        }
+    }
+}
+
+const PUBLIC_RESOLVERS: [&str; 4] = ["1.1.1.1:53", "8.8.8.8:53", "1.0.0.1:53", "8.8.4.4:53"];
+
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("wss://")?;
+    let auth = rest.split('/').next()?;
+    let host = match auth.rsplit_once(':') {
+        Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => auth,
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// Addresses of `host` per public DNS, waiting up to two minutes while a new
+/// record propagates. Falls back to this server's resolver only when public
+/// DNS is unreachable from here (UDP 53 blocked).
+async fn resolve_public(host: &str) -> Result<Vec<String>, ProbeFailure> {
+    let servers: Vec<std::net::SocketAddr> = PUBLIC_RESOLVERS
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let public = aegis_dns::Resolver::explicit(&servers, Duration::from_secs(4), true)
+        .map_err(|_| ProbeFailure::Failed("dns_resolver_unavailable".into()))?;
+    let system = aegis_dns::Resolver::system(Duration::from_secs(4), true);
+    let mut last = String::new();
+    for _ in 0..24 {
+        match public.resolve(host).await {
+            Ok(ips) if !ips.is_empty() => {
+                return Ok(ips.iter().map(ToString::to_string).collect());
+            }
+            Ok(_) => last = format!("public DNS returns no address for {host}"),
+            Err(aegis_dns::DnsError::Timeout) => {
+                // Public resolvers unreachable from here: use this server's.
+                if let Ok(ips) = system.resolve(host).await {
+                    if !ips.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                }
+                last = format!("{host} does not resolve (public DNS unreachable from this server, and its own resolver has no answer)");
+            }
+            Err(e) => last = format!("public DNS: {host}: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    Err(ProbeFailure::Failed(format!(
+        "{last}; check that the DNS record exists in Cloudflare"
+    )))
+}
+
+fn probe_config(
+    app: &Appliance,
+    url: &str,
+    connect_addresses: &[String],
+) -> Result<aegis_config::NodeConfig, String> {
     let dir = app.dir.join("secrets/probe");
     let cfg = json!({
         "schema_version": "0.2",
@@ -156,7 +233,7 @@ fn probe_config(app: &Appliance, url: &str) -> Result<aegis_config::NodeConfig, 
             "legacy_identity_until": 0
         },
         "inbounds": [{"id": "probe-socks", "kind": "socks5", "bind": "127.0.0.1:0"}],
-        "outbounds": [{"id": "gateway", "kind": "agp_tunnel", "url": url, "server_name": appliance::INNER_SERVER_NAME}],
+        "outbounds": [{"id": "gateway", "kind": "agp_tunnel", "url": url, "server_name": appliance::INNER_SERVER_NAME, "connect_addresses": connect_addresses}],
         "routing": {"default_action": "proxy", "default_outbound": "gateway"},
         "dns": {"mode": "remote_required", "ipv6_policy": "follow-routing-policy"}
     });
@@ -279,27 +356,73 @@ async fn check(proxy: SocketAddr, http_url: &str, https_url: &str) -> Result<(),
     Ok(())
 }
 
+/// Why the probe's connection attempts failed, from its diagnostics notes.
+/// Unreachable only when every attempt failed before anything answered.
+fn connect_failure(
+    sink: &aegis_telemetry::DiagnosticSink,
+    host: &str,
+    fallback: String,
+) -> ProbeFailure {
+    let records = sink.recording().map(|r| r.records).unwrap_or_default();
+    let failures: Vec<_> = records
+        .iter()
+        .filter(|r| r.code == "client.connect.failed")
+        .collect();
+    let Some(last) = failures.last() else {
+        return ProbeFailure::Failed(fallback);
+    };
+    let stage = last.attr("stage").unwrap_or("connect");
+    let kind = last.attr("kind").unwrap_or("");
+    let error = last.attr("error").unwrap_or("");
+    let detail = match (stage, kind) {
+        ("websocket", "http") => format!(
+            "Cloudflare answered {host} with an error instead of reaching the gateway: {error}"
+        ),
+        ("websocket", "tls") => format!("TLS to {host} failed: {error}"),
+        ("websocket", _) => format!("this server could not connect to {host}: {error}"),
+        ("tls", _) => format!("the gateway's inner TLS check failed: {error}"),
+        _ => format!("the gateway refused the test session: {error}"),
+    };
+    let unreachable = failures.iter().all(|r| {
+        r.attr("stage") == Some("websocket")
+            && matches!(r.attr("kind"), Some("connect" | "timeout"))
+    });
+    if unreachable {
+        ProbeFailure::Unreachable(detail)
+    } else {
+        ProbeFailure::Failed(detail)
+    }
+}
+
 /// Run the probe against `wss://<hostname>/agp`, retrying while public DNS
-/// and the edge converge (up to ~2 minutes).
+/// and the edge converge (up to ~2 minutes each).
 pub async fn run(
     app: &Appliance,
     url: &str,
     http_url: &str,
     https_url: &str,
-) -> Result<(), String> {
-    let a = app;
-    ensure_identity(a)?;
+) -> Result<(), ProbeFailure> {
+    let failed = ProbeFailure::Failed;
+    ensure_identity(app).map_err(failed)?;
+    let host = url_host(url).ok_or_else(|| ProbeFailure::Failed("invalid_probe_url".into()))?;
+    let addresses = resolve_public(host).await?;
     let _ = std::fs::remove_file(app.dir.join("probe-state.db"));
-    let node = aegis_node::start(aegis_node::StartOptions {
-        config: probe_config(app, url)?,
-        store_path: app.dir.join("probe-state.db"),
-        failpoints: None,
-    })
+    // The probe's own recorder: why each attempt failed (never exported).
+    let sink = Arc::new(aegis_telemetry::DiagnosticSink::new());
+    let _ = sink.start(Duration::from_secs(15 * 60));
+    let node = aegis_node::start_with_diagnostics(
+        aegis_node::StartOptions {
+            config: probe_config(app, url, &addresses).map_err(failed)?,
+            store_path: app.dir.join("probe-state.db"),
+            failpoints: None,
+        },
+        Arc::clone(&sink),
+    )
     .await
-    .map_err(|_| "probe_client_start_failed".to_owned())?;
+    .map_err(|_| ProbeFailure::Failed("probe_client_start_failed".into()))?;
     let proxy = node
         .bound_addr("probe-socks")
-        .ok_or("probe_socks_unavailable")?;
+        .ok_or_else(|| ProbeFailure::Failed("probe_socks_unavailable".into()))?;
     let mut last = "probe_not_started".to_owned();
     let mut ok = false;
     for _ in 0..24 {
@@ -319,10 +442,76 @@ pub async fn run(
         tokio::time::timeout(Duration::from_secs(60), check(proxy, http_url, https_url))
             .await
             .unwrap_or_else(|_| Err("probe_timeout".into()))
+            .map_err(ProbeFailure::Failed)
     } else {
-        Err(last)
+        Err(connect_failure(&sink, host, last))
     };
     node.shutdown(Duration::from_secs(1)).await;
     let _ = std::fs::remove_file(app.dir.join("probe-state.db"));
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_telemetry::{DiagnosticSink, Severity};
+
+    fn sink(notes: &[(&str, &str, &str)]) -> DiagnosticSink {
+        let s = DiagnosticSink::new();
+        s.start(Duration::from_secs(60)).expect("start");
+        for (stage, kind, error) in notes {
+            s.note(
+                Severity::Warn,
+                "client.connect.failed",
+                &[("stage", stage), ("kind", kind), ("error", error)],
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn host_of_probe_url() {
+        assert_eq!(
+            url_host("wss://aegis.example.com/agp"),
+            Some("aegis.example.com")
+        );
+        assert_eq!(
+            url_host("wss://aegis.example.com:8443/agp"),
+            Some("aegis.example.com")
+        );
+        assert_eq!(url_host("https://x/agp"), None);
+    }
+
+    #[test]
+    fn only_unanswered_connections_count_as_unreachable() {
+        let host = "aegis.example.com";
+        let s = sink(&[
+            ("websocket", "timeout", "timed out"),
+            ("websocket", "connect", "refused"),
+        ]);
+        let f = connect_failure(&s, host, String::new());
+        assert!(matches!(f, ProbeFailure::Unreachable(_)), "{f:?}");
+        assert!(
+            f.detail()
+                .contains("could not connect to aegis.example.com"),
+            "{f:?}"
+        );
+        // An HTTP error from the edge is a real problem, not this host's route.
+        let s = sink(&[
+            ("websocket", "connect", "refused"),
+            ("websocket", "http", "HTTP error: 530"),
+        ]);
+        let f = connect_failure(&s, host, String::new());
+        assert!(matches!(f, ProbeFailure::Failed(_)), "{f:?}");
+        assert!(f.detail().contains("530"), "{f:?}");
+        let s = sink(&[("tls", "inner", "invalid peer certificate")]);
+        assert!(matches!(
+            connect_failure(&s, host, String::new()),
+            ProbeFailure::Failed(_)
+        ));
+        // Nothing recorded: the generic reason, as a hard failure.
+        let s = sink(&[]);
+        let f = connect_failure(&s, host, "probe_timeout".into());
+        assert!(matches!(&f, ProbeFailure::Failed(d) if d == "probe_timeout"));
+    }
 }

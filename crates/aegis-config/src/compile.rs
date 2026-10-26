@@ -585,6 +585,17 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
                         ));
                     }
                 }
+                if ob.connect_addresses.len() > 8
+                    || ob
+                        .connect_addresses
+                        .iter()
+                        .any(|a| crate::connect_address(a, 443).is_none())
+                {
+                    ctx.err(format!(
+                        "outbound {}: connect_addresses must be at most 8 IP addresses (ip, ip:port or [v6]:port)",
+                        ob.id
+                    ));
+                }
                 if let Err(e) = reg.require_capability(ModuleIds::WEBSOCKET, Capability::ByteStream)
                 {
                     ctx.err(format!("outbound {}: {e}", ob.id));

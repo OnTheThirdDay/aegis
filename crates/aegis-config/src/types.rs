@@ -308,6 +308,12 @@ pub struct OutboundConfig {
     /// trust anchor (public roots are not consulted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_server_name: Option<String>,
+    /// agp_tunnel: connect to these IP addresses (`ip`, `ip:port` or
+    /// `[v6]:port`; the URL's port when omitted) instead of resolving the URL
+    /// host, like `curl --resolve`. TLS verification and the WebSocket Host
+    /// still use the URL host. At most 8.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connect_addresses: Vec<String>,
     /// agp_tunnel: acknowledge a plaintext `ws://` outer hop to a non-loopback
     /// host (inner mTLS still protects data). Never implied.
     #[serde(default)]

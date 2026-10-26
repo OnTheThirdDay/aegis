@@ -99,6 +99,8 @@ pub async fn launch(
         bound,
         cfg.management.allowed_hosts.clone(),
     );
+    // Set by the installer for --tunnel-only (devices via Cloudflare only).
+    m.set_tunnel_only(std::env::var("AEGIS_TUNNEL_ONLY").is_ok_and(|v| v == "1"));
     let reload_ctx = Arc::clone(&ctx);
     *m.certificate_reload
         .lock()

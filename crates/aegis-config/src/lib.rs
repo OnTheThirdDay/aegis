@@ -57,6 +57,19 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Parse one `connect_addresses` entry (`ip`, `ip:port` or `[v6]:port`),
+/// using `default_port` when none is given. Unspecified addresses and port 0
+/// are refused.
+pub fn connect_address(entry: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+    let addr = entry.parse::<std::net::SocketAddr>().ok().or_else(|| {
+        entry
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, default_port))
+    })?;
+    (!addr.ip().is_unspecified() && addr.port() != 0).then_some(addr)
+}
+
 pub fn parse_toml(text: &str) -> Result<NodeConfig, ConfigError> {
     if text.len() > MAX_CONFIG_BYTES {
         return Err(ConfigError::TooLarge);
