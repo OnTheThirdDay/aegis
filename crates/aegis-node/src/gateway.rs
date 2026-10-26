@@ -11,6 +11,7 @@ use aegis_core::Admitted;
 use aegis_identity::tls::{self, PeerIdentity};
 use aegis_policy::DecisionInput;
 use aegis_session::{server_handshake, IncomingOpen};
+use aegis_telemetry::Severity;
 use aegis_transport_ws::WsServerConfig;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +22,9 @@ trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
 
 const EDGE_MAX_HEAD: usize = 8 * 1024;
-const EDGE_MAX_BODY: usize = 32 * 1024;
+/// Room for a device's compressed diagnostic report (sent on `/renew`); the
+/// pending-handshake cap and the handshake deadline bound what this costs.
+const EDGE_MAX_BODY: usize = 2 * 1024 * 1024;
 
 /// Read the HTTP request head. `POST /enroll` and `POST /renew` are answered
 /// here and the connection closed (`None`); anything else is replayed into
@@ -205,6 +208,7 @@ pub async fn serve(ctx: Arc<NodeContext>, inbound: InboundConfig, listener: TcpL
             drop(tcp);
             continue;
         };
+        ctx.diagnostics.count("gateway.accepted");
         let ctx = Arc::clone(&ctx);
         let ws_cfg = ws_cfg.clone();
         let inbound = Arc::clone(&inbound);
@@ -266,7 +270,14 @@ async fn handle_connection(
     let tls_timeout = Duration::from_millis(u64::from(ctx.startup.core.tls_handshake_timeout_ms));
     let (tls_stream, peer) = match tls::accept(server_tls, ws, tls_timeout).await {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
+            if ctx.diagnostics.is_recording() {
+                ctx.diagnostics.note(
+                    Severity::Warn,
+                    "gateway.tls.rejected",
+                    &[("error", &e.to_string())],
+                );
+            }
             ctx.obs().record(Event::AuthFailure {
                 reason: ReasonGroup::Tls,
             });
@@ -302,6 +313,16 @@ async fn handle_connection(
     {
         Ok(v) => v,
         Err(e) => {
+            if ctx.diagnostics.is_recording() {
+                ctx.diagnostics.note(
+                    Severity::Warn,
+                    "gateway.session.rejected",
+                    &[
+                        ("reason", e.reason_group().as_str()),
+                        ("error", &e.to_string()),
+                    ],
+                );
+            }
             ctx.obs().record(Event::AuthFailure {
                 reason: e.reason_group(),
             });

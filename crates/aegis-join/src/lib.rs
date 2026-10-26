@@ -378,6 +378,36 @@ pub async fn renew_if_due(dir: &DeviceDir, force: bool) -> Result<bool, JoinErro
     Ok(true)
 }
 
+/// Send a gzipped diagnostic report (OTLP/JSON) to the gateway this device
+/// joined. It travels on the device-authenticated `/renew` edge endpoint,
+/// signed with the device key; the gateway only accepts it while an
+/// administrator has diagnostics turned on.
+pub async fn upload_diagnostics(dir: &DeviceDir, report_gz: &[u8]) -> Result<(), JoinError> {
+    let device = dir.load()?;
+    let key = dir.read("key.pem")?;
+    let cert = dir.read("cert.pem")?;
+    let outer = if device.outer_server_name.is_some() {
+        Some(dir.read("outer-ca.pem")?)
+    } else {
+        None
+    };
+    let signed_at = now();
+    let signature = pki::sign_with_key(&key, &pki::diagnostic_upload_message(signed_at, report_gz))
+        .map_err(|_| JoinError::Storage("could not sign the report".into()))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let body = json!({
+        "certificate_pem": cert,
+        "diagnostic_report_gz": b64.encode(report_gz),
+        "signed_at": signed_at,
+        "signature": b64.encode(signature),
+    });
+    let (status, bytes) = http::post_json(&device.renew_url(), &device.edge(outer), &body).await?;
+    if status != 200 {
+        return Err(rejected(status, &bytes));
+    }
+    Ok(())
+}
+
 /// Local proxy listeners of the client profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ports {

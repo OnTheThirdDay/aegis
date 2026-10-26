@@ -18,6 +18,8 @@ curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/inst
 sudo sh install.sh              # Docker; add --native for a Linux systemd service
 ```
 
+**Step-by-step guide** (servers that already run nginx/v2ray/Cloudflare, public servers, setup, upgrades): [docs/INSTALL.md](docs/INSTALL.md).
+
 Releases are built and published by GitHub Actions; see [docs/RELEASING.md](docs/RELEASING.md) for the branch flow (work branch → `staging` → `main`), version bumps and verification.
 
 The installer:
@@ -86,7 +88,7 @@ Design and limits: [ADR-0007](docs/adr/0007-appliance-console-and-portable-clien
   - no OTel SDK, no exporter, no resource detectors and no console logs: the daemon writes **zero bytes** to stdout/stderr in normal operation;
   - bounded in-memory counters are available only to authenticated callers;
   - opt-in export of four allowlisted coarse metrics requires acknowledging a payload preview;
-  - local diagnostics run for at most 15 minutes and are never exported.
+  - on-demand diagnostics record only when an administrator or a device's user starts them. They stop by themselves within an hour and stay in memory only, capped at 5 MiB with the oldest events deleted first. The console correlates gateway and device reports and explains what went wrong ([docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)).
 
 ## Layout
 

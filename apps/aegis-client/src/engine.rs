@@ -4,7 +4,9 @@
 
 use crate::settings::Settings;
 use crate::sysproxy;
-use aegis_join::{DeviceDir, Ports};
+use aegis_join::{DeviceDir, JoinError, Ports};
+use aegis_telemetry::report::{Report, Role};
+use aegis_telemetry::{DiagnosticSink, Severity};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -35,6 +37,9 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub info: Option<String>,
     pub system_proxy_active: bool,
+    /// Outcome of the last diagnostics send/save: (success, message).
+    pub diag_message: Option<(bool, String)>,
+    pub diag_sending: bool,
 }
 
 impl Default for Snapshot {
@@ -52,6 +57,8 @@ impl Default for Snapshot {
             error: None,
             info: None,
             system_proxy_active: false,
+            diag_message: None,
+            diag_sending: false,
         }
     }
 }
@@ -62,12 +69,22 @@ pub enum Command {
     Disconnect,
     Forget,
     SaveSettings(Settings),
+    /// Start an on-demand diagnostics recording for this many minutes.
+    DiagStart(u64),
+    /// Stop recording; with `true`, send the report to the server.
+    DiagStop(bool),
+    DiagSend,
+    DiagSave,
+    DiagDiscard,
     Shutdown(std::sync::mpsc::Sender<()>),
 }
 
 pub struct Engine {
     tx: mpsc::UnboundedSender<Command>,
     pub state: Arc<Mutex<Snapshot>>,
+    /// On-demand diagnostics: off unless the user starts it, memory only,
+    /// stops by itself. Survives reconnects.
+    pub diag: Arc<DiagnosticSink>,
     _runtime: tokio::runtime::Runtime,
 }
 
@@ -100,7 +117,11 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         let state = Arc::new(Mutex::new(Snapshot::default()));
         let (tx, rx) = mpsc::unbounded_channel();
+        let diag = Arc::new(DiagnosticSink::new());
         let worker = Worker {
+            data_dir: dir.clone(),
+            diag: Arc::clone(&diag),
+            diag_was_recording: false,
             device: DeviceDir::new(dir),
             settings,
             state: Arc::clone(&state),
@@ -112,6 +133,7 @@ impl Engine {
         Ok(Engine {
             tx,
             state,
+            diag,
             _runtime: runtime,
         })
     }
@@ -133,6 +155,10 @@ impl Engine {
 }
 
 struct Worker {
+    data_dir: PathBuf,
+    diag: Arc<DiagnosticSink>,
+    /// Send the report automatically when a recording ends by itself.
+    diag_was_recording: bool,
     device: DeviceDir,
     settings: Settings,
     state: Arc<Mutex<Snapshot>>,
@@ -212,6 +238,21 @@ impl Worker {
                                 self.connect().await;
                             }
                         }
+                        Command::DiagStart(minutes) => self.diag_start(minutes),
+                        Command::DiagStop(send) => {
+                            self.diag.stop();
+                            self.diag_was_recording = false;
+                            if send {
+                                self.diag_send().await;
+                            }
+                        }
+                        Command::DiagSend => self.diag_send().await,
+                        Command::DiagSave => self.diag_save(),
+                        Command::DiagDiscard => {
+                            self.diag.discard();
+                            self.diag_was_recording = false;
+                            self.update(|s| s.diag_message = None);
+                        }
                         Command::Shutdown(done) => {
                             self.disconnect().await;
                             let _ = done.send(());
@@ -222,6 +263,13 @@ impl Worker {
                 _ = tick.tick() => {
                     checks = checks.wrapping_add(1);
                     self.refresh(checks.is_multiple_of(15)).await;
+                    let recording = self.diag.is_recording();
+                    if self.diag_was_recording && !recording {
+                        // The recording ran out: hand it to the server.
+                        self.diag_was_recording = false;
+                        self.diag_send().await;
+                    }
+                    self.diag_was_recording = recording;
                 }
             }
         }
@@ -268,6 +316,11 @@ impl Worker {
             Ok(true) => self.update(|s| s.info = Some("Device certificate renewed.".into())),
             Ok(false) => {}
             Err(e) => {
+                self.diag.note(
+                    Severity::Warn,
+                    "client.renew.failed",
+                    &[("error", &e.to_string())],
+                );
                 let expired = self
                     .device
                     .certificate_expires_at()
@@ -301,15 +354,24 @@ impl Worker {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(self.device.root.join(format!("state.db{suffix}")));
         }
-        let started = aegis_node::start(aegis_node::StartOptions {
-            config: cfg,
-            store_path: self.device.store(),
-            failpoints: None,
-        })
+        self.diag.note(Severity::Info, "client.connect", &[]);
+        let started = aegis_node::start_with_diagnostics(
+            aegis_node::StartOptions {
+                config: cfg,
+                store_path: self.device.store(),
+                failpoints: None,
+            },
+            Arc::clone(&self.diag),
+        )
         .await;
         let node = match started {
             Ok(n) => n,
             Err(e) => {
+                self.diag.note(
+                    Severity::Error,
+                    "client.start.failed",
+                    &[("error", &e.to_string())],
+                );
                 let msg = match e {
                     aegis_node::StartError::Bind(_) => format!(
                         "A local port is already in use (SOCKS {} / HTTP {}). Close the other program or change the ports in Settings.",
@@ -351,6 +413,9 @@ impl Worker {
     }
 
     async fn disconnect(&mut self) {
+        if self.node.is_some() {
+            self.diag.note(Severity::Info, "client.disconnect", &[]);
+        }
         if let Some(saved) = self.proxy_saved.take() {
             let _ = sysproxy::restore(&saved);
             self.settings.proxy_saved = None;
@@ -383,7 +448,13 @@ impl Worker {
         let mut verified = None;
         if probe || !live {
             if let Some(socks) = node.bound_addr("socks") {
-                verified = Some(verify(socks).await);
+                let result = verify(socks).await;
+                match &result {
+                    Ok(()) => self.diag.count("client.check.ok"),
+                    // A note also counts towards the per-kind total.
+                    Err(_) => self.diag.note(Severity::Warn, "client.check.failed", &[]),
+                }
+                verified = Some(result);
             }
         }
         self.update(|s| {
@@ -405,6 +476,114 @@ impl Worker {
                 None => {}
             }
         });
+    }
+}
+
+impl Worker {
+    fn diag_start(&mut self, minutes: u64) {
+        match self
+            .diag
+            .start(Duration::from_secs(minutes.saturating_mul(60)))
+        {
+            Ok(()) => {
+                self.diag_was_recording = true;
+                let ports = format!(
+                    "socks {} http {}",
+                    self.settings.socks_port, self.settings.http_port
+                );
+                self.diag.note(
+                    Severity::Info,
+                    "client.info",
+                    &[
+                        ("version", env!("CARGO_PKG_VERSION")),
+                        ("os", std::env::consts::OS),
+                        ("arch", std::env::consts::ARCH),
+                        ("connected", if self.node.is_some() { "yes" } else { "no" }),
+                        ("ports", &ports),
+                        (
+                            "system_proxy",
+                            if self.settings.system_proxy {
+                                "on"
+                            } else {
+                                "off"
+                            },
+                        ),
+                    ],
+                );
+                self.update(|s| s.diag_message = None);
+            }
+            Err(e) => self.update(|s| s.diag_message = Some((false, e.to_string()))),
+        }
+    }
+
+    fn report(&self) -> Option<Report> {
+        let recording = self.diag.recording()?;
+        Some(Report {
+            role: Role::Client,
+            name: self
+                .device
+                .load()
+                .map(|d| d.name)
+                .unwrap_or_else(|_| "unenrolled device".into()),
+            version: env!("CARGO_PKG_VERSION").into(),
+            recording,
+        })
+    }
+
+    async fn diag_send(&mut self) {
+        let Some(mut report) = self.report() else {
+            return;
+        };
+        if self.device.load().is_err() {
+            self.update(|s| {
+                s.diag_message = Some((
+                    false,
+                    "This device hasn't joined a server; use Save to file instead.".into(),
+                ))
+            });
+            return;
+        }
+        self.update(|s| {
+            s.diag_sending = true;
+            s.diag_message = None;
+        });
+        // Leave headroom under the gateway's limit for base64 and JSON.
+        let gz = report.to_gzip(900 * 1024);
+        let result = aegis_join::upload_diagnostics(&self.device, &gz).await;
+        let message = match result {
+            Ok(()) => (
+                true,
+                "Report sent. Your administrator can now see it under Diagnostics.".to_owned(),
+            ),
+            Err(JoinError::Rejected { status: 409, .. }) => (
+                false,
+                "Diagnostics are off on the server. Ask your administrator to start them in the console (Diagnostics), then press Send again.".to_owned(),
+            ),
+            Err(JoinError::Network(_)) => (
+                false,
+                "Could not reach the server to send the report. Press Save to file and give the file to your administrator.".to_owned(),
+            ),
+            Err(e) => (false, format!("Could not send the report: {e}")),
+        };
+        self.update(|s| {
+            s.diag_sending = false;
+            s.diag_message = Some(message);
+        });
+    }
+
+    fn diag_save(&mut self) {
+        let Some(report) = self.report() else {
+            return;
+        };
+        let path = self
+            .data_dir
+            .join(format!("aegisnet-diagnostics-{}.otlp.json", now()));
+        let body = serde_json::to_vec_pretty(&report.to_otlp()).unwrap_or_default();
+        let message = match std::fs::write(&path, body) {
+            Ok(()) => (true, format!("Saved to {}", path.display())),
+            Err(e) => (false, format!("Could not save the report: {e}")),
+        };
+        self.update(|s| s.diag_message = Some(message));
     }
 }
 

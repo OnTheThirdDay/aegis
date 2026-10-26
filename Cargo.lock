@@ -43,6 +43,7 @@ dependencies = [
  "aegis-config",
  "aegis-join",
  "aegis-node",
+ "aegis-telemetry",
  "arboard",
  "eframe",
  "serde",
@@ -307,6 +308,7 @@ name = "aegis-telemetry"
 version = "0.1.0"
 dependencies = [
  "aegis-contracts",
+ "flate2",
  "hex",
  "proptest",
  "reqwest",
@@ -377,6 +379,7 @@ dependencies = [
  "aegis-node",
  "aegis-provision",
  "aegis-storage",
+ "aegis-telemetry",
  "bytes",
  "hex",
  "http",

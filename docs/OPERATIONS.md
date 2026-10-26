@@ -1,38 +1,6 @@
 # Operations quickstart
 
-> **Most installations should use the appliance:** `sh install.sh`, then the web console. See the README's Quick start and [ADR-0007](adr/0007-appliance-console-and-portable-client.md).
->
-> Appliance operations:
->
-> - **Recover the one-time password:** `docker exec aegis aegisctl initial-password`.
-> - **Check the console certificate:** `docker exec aegis aegisctl console-fingerprint`.
-> - **Upgrade:** download the newest `install.sh` from the latest release and run it with the same options. Data in the `aegis-data` volume is kept. See [RELEASING.md](RELEASING.md).
-> - **Remove:** `sh install.sh --uninstall`, plus `--purge` to delete all data.
-> - **Ports** (container → default host port):
->   - 8443 → 8443: HTTPS console;
->   - 8444 → 443: device edge (`/agp`, `/enroll`, `/renew`);
->   - 8080 → 80: ACME HTTP-01, only while a certificate is being issued.
->
->
-> ### Install next to existing services
->
-> On a server that already runs nginx, v2ray or Cloudflare, keep AegisNet off their ports and reach its console privately:
->
-> ```sh
-> sudo sh install.sh --port 8444 --http-port 0 --local-console --address <public-ip-or-name>
-> ssh -L 8443:127.0.0.1:8443 <user>@<server>     # then open https://localhost:8443
-> ```
->
-> - `--port 8444` and `--http-port 0` leave 80 and 443 to nginx.
-> - `--local-console` binds the console to the server's loopback, so it's never reachable from the internet.
-> - On cloud VMs, `--address` should be the *public* IP or DNS name.
->
-> **Making devices reachable:**
->
-> - **With Cloudflare** (recommended): use Cloudflare Tunnel in the console. No inbound port is needed, and existing tunnels and DNS records are untouched.
-> - **Without Cloudflare:** open TCP 8444 in the provider's firewall and enter the public address under Connectivity.
->
-> **Firewall caveat:** `ufw` rules do not filter ports published by Docker. Restrict the console with `--local-console` or the cloud provider's firewall instead.
+> **Most installations should use the appliance.** Installing, first-time setup (including servers that already run nginx, v2ray or Cloudflare), upgrading and removal are covered step by step in [INSTALL.md](INSTALL.md).
 >
 > The rest of this document covers hand-configured (non-appliance) nodes.
 
@@ -144,10 +112,14 @@ Telemetry is off by default. To opt in to the four coarse metrics:
 
 Only `https://` collectors are accepted.
 
-Local diagnostics:
+On-demand diagnostics:
 
 ```sh
-aegisctl diagnostic start --minutes 10
+aegisctl diagnostic start --minutes 15     # or console → Diagnostics
 ```
 
-This is limited to 15 minutes, held in memory only, and never exported.
+- **Limits:** a recording lasts at most 60 minutes and stops by itself. It is held in memory only, capped at 5 MiB with the oldest records deleted first, and dropped 60 minutes after it ends.
+- **Devices:** devices can send their own signed report while it is on.
+- **Analysis and export:** the console explains the findings and exports everything as OTLP/JSON logs.
+
+See [DIAGNOSTICS.md](DIAGNOSTICS.md).

@@ -51,6 +51,7 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 rand = "0.8"
 subtle = "2.6"
 zeroize = "1.8"
@@ -83,4 +84,4 @@ proptest = "1.5"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-strip = "debuginfo"
+strip = "symbols"

@@ -16,7 +16,7 @@ use aegis_inbound_http::HttpConnectConfig;
 use aegis_inbound_socks::{Reply, SocksConfig};
 use aegis_policy::DecisionInput;
 use aegis_session::{client_handshake, MuxStream, OpenError, Session, SessionConfig};
-use aegis_telemetry::LocalMetrics;
+use aegis_telemetry::{LocalMetrics, Severity};
 use aegis_transport_ws::WsClientConfig;
 use std::path::Path;
 use std::sync::Arc;
@@ -125,11 +125,28 @@ impl Tunnel {
         &self.outbound == outbound
     }
 
+    /// Note why an attempt failed for on-demand diagnostics (a no-op unless
+    /// a recording is running).
+    fn note_failure(&self, stage: &str, reason: ReasonGroup, error: &dyn std::fmt::Display) {
+        if let Some(d) = self.obs.diagnostics().filter(|d| d.is_recording()) {
+            d.note(
+                Severity::Warn,
+                "client.connect.failed",
+                &[
+                    ("stage", stage),
+                    ("reason", reason.as_str()),
+                    ("error", &error.to_string()),
+                ],
+            );
+        }
+    }
+
     async fn connect_once(&self) -> Result<Session, ReasonGroup> {
         let started = Instant::now();
-        let ws = aegis_transport_ws::connect(&self.ws)
-            .await
-            .map_err(|_| ReasonGroup::Transport)?;
+        let ws = aegis_transport_ws::connect(&self.ws).await.map_err(|e| {
+            self.note_failure("websocket", ReasonGroup::Transport, &e);
+            ReasonGroup::Transport
+        })?;
         let (tls_stream, gateway) = tls::connect(
             Arc::clone(&self.tls),
             &self.server_name,
@@ -137,7 +154,10 @@ impl Tunnel {
             self.tls_timeout,
         )
         .await
-        .map_err(|_| ReasonGroup::Tls)?;
+        .map_err(|e| {
+            self.note_failure("tls", ReasonGroup::Tls, &e);
+            ReasonGroup::Tls
+        })?;
         let obs: Arc<dyn Observability> = self.obs.clone();
         let mut session_cfg = self.session_cfg.clone();
         session_cfg.expected_peer_node_id = Some(gateway.node_id);
@@ -148,7 +168,10 @@ impl Tunnel {
             obs,
         )
         .await
-        .map_err(|e| e.reason_group())?;
+        .map_err(|e| {
+            self.note_failure("session", e.reason_group(), &e);
+            e.reason_group()
+        })?;
         self.obs.record(Event::HandshakeDuration {
             seconds: started.elapsed().as_secs_f64(),
             result: OperationResult::Ok,

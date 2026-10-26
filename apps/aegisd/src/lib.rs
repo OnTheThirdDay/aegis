@@ -158,6 +158,7 @@ pub async fn launch(
             Some(app.clone() as Arc<dyn aegis_management::ApplianceServices>);
         app.integrations.resume();
         tokio::spawn(services::maintenance_loop(Arc::clone(&app)));
+        tokio::spawn(services::diagnostics_loop(Arc::clone(&app)));
         running.appliance = Some(app);
     }
     running.console = Some(bound);
