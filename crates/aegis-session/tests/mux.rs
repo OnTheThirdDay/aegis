@@ -386,21 +386,60 @@ async fn tc_p04_quota_bounded_under_open_flood() {
         }
     });
     let mut ok = Vec::new();
+    for _ in 0..8 {
+        ok.push(
+            client
+                .open(dest(), Duration::from_secs(5))
+                .await
+                .expect("within limit"),
+        );
+    }
+    // A full session waits for a free slot no longer than the open's own
+    // timeout, then refuses; nothing beyond the limit is ever admitted.
     let mut quota = 0;
-    for _ in 0..2000 {
-        match client.open(dest(), Duration::from_secs(5)).await {
+    for _ in 0..300 {
+        match client.open(dest(), Duration::from_millis(5)).await {
             Ok(s) => ok.push(s),
             Err(OpenError::Quota) | Err(OpenError::Rejected(OpenFailure::Quota)) => quota += 1,
             Err(e) => panic!("unexpected {e:?}"),
         }
     }
     assert_eq!(ok.len(), 8);
-    assert_eq!(quota, 1992);
-    assert!(
-        budget.used() < 8 * 1024 * 1024,
-        "bounded memory: {}",
-        budget.used()
-    );
+    assert_eq!(quota, 300);
+    // Both sessions' receive windows plus small per-stream reservations.
+    let bound = 2 * u64::from(cfg("x").session_window) + 2 * 1024 * 1024;
+    assert!(budget.used() < bound, "bounded memory: {}", budget.used());
+}
+
+#[tokio::test]
+async fn full_session_open_waits_for_a_free_slot() {
+    let small = SessionConfig {
+        max_streams: 4,
+        ..cfg("gw-1")
+    };
+    let (client, _server, incoming) =
+        pair_with(cfg("client-1"), small, Budget::root(64 * 1024 * 1024)).await;
+    // Like a gateway: each stream ends when the device closes it.
+    spawn_echo(incoming);
+    let mut open = Vec::new();
+    for _ in 0..4 {
+        open.push(
+            client
+                .open(dest(), Duration::from_secs(5))
+                .await
+                .expect("within limit"),
+        );
+    }
+    // Free one slot shortly; the next open waits for it instead of failing.
+    let first = open.remove(0);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(first);
+    });
+    let started = std::time::Instant::now();
+    let fifth = client.open(dest(), Duration::from_secs(5)).await;
+    assert!(fifth.is_ok(), "waited for a slot: {:?}", fifth.err());
+    assert!(started.elapsed() >= Duration::from_millis(150));
 }
 
 #[tokio::test]
@@ -798,8 +837,10 @@ async fn ping_flood_terminates_session() {
 async fn fragmented_data_stays_within_reserved_receive_storage() {
     // A non-power-of-two window catches containers that round capacity up.
     let window = 65_537;
+    // Starts at its full window, so the whole window can arrive at once.
     let config = SessionConfig {
         stream_window: window,
+        initial_stream_window: window,
         ..cfg("gw-1")
     };
     let (mut raw, session, mut incoming) = raw_against_server(config).await;
@@ -811,9 +852,8 @@ async fn fragmented_data_stays_within_reserved_receive_storage() {
         .accept()
         .expect("accept");
     let _ = raw.recv_significant().await.expect("ack");
-    let allocated = session.stats().recv_allocated;
-    assert_eq!(allocated, u64::from(window));
-    assert!(allocated <= session.stats().recv_reserved);
+    // Receive storage is allocated as data arrives, never up front.
+    assert_eq!(session.stats().recv_allocated, 0);
 
     let mut batch = BytesMut::new();
     for _ in 0..1024 {
@@ -835,11 +875,13 @@ async fn fragmented_data_stays_within_reserved_receive_storage() {
     })
     .await
     .expect("all frames consumed");
+    let allocated = session.stats().recv_allocated;
     assert_eq!(
-        session.stats().recv_allocated,
         allocated,
-        "frame count never grows allocation"
+        u64::from(window),
+        "exactly the window, not rounded up"
     );
+    assert!(allocated <= session.stats().recv_reserved);
 
     // Consume enough to grant more credit, then refill across the ring boundary.
     let mut first = vec![0; 32_769];
@@ -860,7 +902,8 @@ async fn fragmented_data_stays_within_reserved_receive_storage() {
         .expect("read wrapped buffer");
     assert!(rest[..32_768].iter().all(|&b| b == b'a'));
     assert!(rest[32_768..].iter().all(|&b| b == b'b'));
-    assert_eq!(session.stats().recv_allocated, allocated);
+    // Drained: the storage is released again.
+    assert_eq!(session.stats().recv_allocated, 0);
     assert_eq!(session.stats().recv_buffered, 0);
 }
 
@@ -1064,4 +1107,109 @@ async fn final_write_flush_and_shutdown_have_a_deadline() {
         drop(session);
         released(&budget, &gate).await;
     }
+}
+
+#[tokio::test]
+async fn open_retries_while_the_peer_still_counts_a_released_stream() {
+    let small = SessionConfig {
+        max_streams: 2,
+        ..cfg("gw-1")
+    };
+    let (client, _server, mut incoming) =
+        pair_with(cfg("client-1"), small, Budget::root(64 * 1024 * 1024)).await;
+    // The gateway side keeps its handles until told to let go, like a relay
+    // that is still closing its connection to the destination.
+    let held = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let h2 = Arc::clone(&held);
+    tokio::spawn(async move {
+        while let Some(open) = incoming.next().await {
+            h2.lock().await.push(open.accept().expect("accept"));
+        }
+    });
+    let a = client
+        .open(dest(), Duration::from_secs(5))
+        .await
+        .expect("first");
+    let _b = client
+        .open(dest(), Duration::from_secs(5))
+        .await
+        .expect("second");
+    drop(a); // released here; the gateway still holds its side
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let release = Arc::clone(&held);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        release.lock().await.remove(0);
+    });
+    let started = std::time::Instant::now();
+    let third = client.open(dest(), Duration::from_secs(5)).await;
+    assert!(
+        third.is_ok(),
+        "retried until the gateway freed the slot: {:?}",
+        third.err()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}
+
+#[tokio::test]
+async fn hundreds_of_idle_streams_fit_and_busy_ones_grow() {
+    let (client, server, incoming) = pair_with(
+        cfg("client-1"),
+        cfg("gw-1"),
+        Budget::root(256 * 1024 * 1024),
+    )
+    .await;
+    spawn_echo(incoming);
+    // A browser's worth of mostly idle connections on one default session.
+    let mut idle = Vec::new();
+    for i in 0..400 {
+        let s = client
+            .open(dest(), Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("stream {i}: {e:?}"));
+        idle.push(s);
+    }
+    let stats = client.stats();
+    assert_eq!(
+        stats.recv_allocated, 0,
+        "idle streams hold no receive storage"
+    );
+    assert!(stats.stream_windows <= 400 * 16 * 1024);
+    // One busy stream alongside them: its window grows past the initial
+    // 16 KiB, and the transfer is byte-exact.
+    let s = client
+        .open(dest(), Duration::from_secs(5))
+        .await
+        .expect("busy");
+    let (mut r, mut w) = tokio::io::split(s);
+    let data: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+    let expected = data.clone();
+    let writer = tokio::spawn(async move {
+        w.write_all(&data).await.expect("write");
+        w.shutdown().await.expect("shutdown");
+    });
+    // Read in chunks, watching the busy stream's window while it flows.
+    let mut got = Vec::with_capacity(expected.len());
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut peak = 0;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let n = r.read(&mut buf).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            peak = peak.max(client.stats().stream_windows);
+        }
+    })
+    .await
+    .expect("transfer finishes");
+    writer.await.expect("join");
+    assert_eq!(got, expected);
+    assert!(
+        peak > 401 * 16 * 1024,
+        "a busy stream's window grows: peak {peak}"
+    );
+    let _ = server;
+    drop(idle);
 }

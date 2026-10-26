@@ -179,7 +179,13 @@ pub fn tls_listener(listener: TcpListener, tls: Arc<ConsoleTls>) -> std::io::Res
     let slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
     tokio::spawn(async move {
         loop {
-            let (tcp, peer) = match listener.accept().await {
+            // Stop (closing the listening socket) once the server side is
+            // gone, i.e. the console shut down.
+            let accepted = tokio::select! {
+                _ = tx.closed() => break,
+                r = listener.accept() => r,
+            };
+            let (tcp, peer) = match accepted {
                 Ok(c) => c,
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;

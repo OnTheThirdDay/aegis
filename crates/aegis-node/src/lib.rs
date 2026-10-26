@@ -467,6 +467,11 @@ impl NodeRuntime {
         for t in &self.tasks {
             t.abort();
         }
+        // Wait until the aborted tasks are gone, so their listeners are
+        // closed (and the ports free) when shutdown returns.
+        for t in self.tasks {
+            let _ = t.await;
+        }
         ctx.coord.agent().transition(AgentState::Stopped);
     }
 }
@@ -667,4 +672,34 @@ pub fn validate_offline(cfg: &NodeConfig) -> Result<aegis_config::CompiledConfig
 
 pub(crate) fn now_unix() -> i64 {
     aegis_storage::now_unix()
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    /// Browsers open connections in bursts; the default limits must leave
+    /// ample room on one session, within the per-peer budget (session window
+    /// plus each stream's initial transmit reservation).
+    #[test]
+    fn default_session_carries_a_browser() {
+        let core = aegis_config::CoreConfig::default();
+        let cfg = aegis_session::SessionConfig {
+            max_streams: core.max_streams_per_session,
+            stream_window: core.stream_buffer_budget_bytes,
+            session_window: core.session_window_bytes,
+            stream_tx_buffer: core.stream_buffer_budget_bytes,
+            ..aegis_session::SessionConfig::default()
+        };
+        let streams = cfg.effective_max_streams(core.session_window_bytes);
+        assert!(
+            streams >= 400,
+            "only {streams} concurrent connections per session"
+        );
+        let needed = u64::from(core.session_window_bytes)
+            + u64::from(streams) * u64::from(cfg.initial_stream_window);
+        assert!(
+            needed <= core.peer_buffer_budget_bytes,
+            "peer budget too small: {needed}"
+        );
+        assert!(core.peer_buffer_budget_bytes <= core.process_buffer_budget_bytes);
+    }
 }

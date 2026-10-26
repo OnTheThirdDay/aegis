@@ -140,7 +140,16 @@ impl AsyncWrite for MuxStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let space = e.tx_cap.saturating_sub(e.tx.len());
+        // Reserve transmit memory as it is needed, up to the cap; the
+        // initial reservation always leaves room, so writes progress.
+        let want = (e.tx.len() + buf.len()).min(e.tx_cap) as u64;
+        let held = e.tx_reservation.bytes();
+        if want > held {
+            let _ = e.tx_reservation.try_grow(want - held);
+        }
+        let space = (e.tx_reservation.bytes() as usize)
+            .min(e.tx_cap)
+            .saturating_sub(e.tx.len());
         if space == 0 {
             e.write_waker = Some(cx.waker().clone());
             return Poll::Pending;
