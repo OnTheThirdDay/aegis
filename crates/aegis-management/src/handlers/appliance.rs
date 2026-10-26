@@ -198,6 +198,59 @@ pub async fn integration_action(
     }
 }
 
+/// Device CA custody: take the root key offline, renew the issuer with it,
+/// or put it back (owner only). Exporting the key needs the password again.
+pub async fn device_ca(
+    State(ctx): State<Ctx>,
+    headers: HeaderMap,
+    Path(action): Path<String>,
+    body: Body,
+) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::POST)?;
+    p.require(Permission::SystemConfigure)?;
+    if !matches!(
+        action.as_str(),
+        "export-root-key" | "remove-root-key" | "restore-root-key" | "renew-issuer"
+    ) {
+        return Err(ApiError::not_found());
+    }
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let appliance = ctx
+        .appliance()
+        .ok_or_else(|| ApiError::conflict("appliance_mode_required"))?;
+    let (c, actor) = (ctx.clone(), p.id.clone());
+    let export = action == "export-root-key";
+    let out = blocking(move || {
+        if export {
+            let password = v.get("password").and_then(Value::as_str).unwrap_or("");
+            c.confirm_password(&actor, password)?;
+        }
+        appliance
+            .device_ca(&action, &actor, v)
+            .map_err(|(status, detail)| {
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+                ApiError::new(status, "device_ca_failed").detail(detail)
+            })
+    })
+    .await?;
+    if export {
+        let pem = out["key_pem"].as_str().unwrap_or("").to_owned();
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "application/x-pem-file"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"aegisnet-device-root-key.pem\"",
+                ),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            pem,
+        )
+            .into_response());
+    }
+    Ok(json(StatusCode::OK, &out, &[]))
+}
+
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 fn download_name_ok(name: &str) -> bool {

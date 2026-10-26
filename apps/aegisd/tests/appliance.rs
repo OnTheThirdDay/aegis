@@ -104,10 +104,18 @@ async fn socks_connect(proxy: SocketAddr, host: &str, port: u16) -> u8 {
 }
 
 async fn start_client(dir: &Path) -> aegis_node::NodeRuntime {
+    start_client_via(dir, None).await
+}
+
+async fn start_client_via(
+    dir: &Path,
+    trial: Option<&aegis_join::Endpoint>,
+) -> aegis_node::NodeRuntime {
     let device = aegis_join::DeviceDir::new(dir);
     let _ = std::fs::remove_file(device.store());
-    let cfg = aegis_join::client_config(&device, aegis_join::Ports { socks: 0, http: 0 })
-        .expect("client config");
+    let cfg =
+        aegis_join::client_config_for(&device, aegis_join::Ports { socks: 0, http: 0 }, trial)
+            .expect("client config");
     aegis_node::start(aegis_node::StartOptions {
         config: cfg,
         store_path: device.store(),
@@ -286,6 +294,91 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         let (_, v) = c.call(reqwest::Method::POST, "/diagnostics/discard", None).await;
         assert_eq!(v["gateway"]["state"], "off");
         assert_eq!(v["devices"].as_array().map(Vec::len), Some(0));
+
+        // Address change: the device learns the gateway's new endpoint on
+        // connect and adopts it only after the pinned gateway answers there.
+        assert_eq!(aegis_join::fetch_endpoint(&device_dir).await.expect("query"), None, "unchanged");
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/connection", Some(json!({"public_host": "localhost", "public_port": edge_port})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let moved = aegis_join::fetch_endpoint(&device_dir)
+            .await
+            .expect("query")
+            .expect("endpoint changed");
+        assert!(moved.url.starts_with("wss://localhost:"), "{moved:?}");
+        // A bogus endpoint (nothing listening) fails the end-to-end check.
+        let mut bogus = moved.clone();
+        bogus.url = format!("wss://127.0.0.1:{}/agp", free_port());
+        let trial = start_client_via(&dev_dir, Some(&bogus)).await;
+        assert!(!aegis_join::verify_tunnel(trial.bound_addr("socks").expect("socks")).await);
+        trial.shutdown(Duration::from_secs(1)).await;
+        // The real one passes and is adopted.
+        let trial = start_client_via(&dev_dir, Some(&moved)).await;
+        assert!(aegis_join::verify_tunnel(trial.bound_addr("socks").expect("socks")).await);
+        trial.shutdown(Duration::from_secs(1)).await;
+        let device = aegis_join::adopt_endpoint(&device_dir, &moved).expect("adopt");
+        assert_eq!(device.url, moved.url);
+        assert_eq!(aegis_join::fetch_endpoint(&device_dir).await.expect("query"), None, "now current");
+        let mut foreign = moved.clone();
+        foreign.device_ca_sha256 = "0".repeat(64);
+        assert!(aegis_join::adopt_endpoint(&device_dir, &foreign).is_err(), "other gateway refused");
+        client.shutdown(Duration::from_secs(1)).await;
+        let client = start_client(&dev_dir).await;
+        let socks = client.bound_addr("socks").expect("socks");
+        assert_eq!(socks_connect(socks, "localhost", 9).await, 2, "connects via the new address");
+
+        // Offline device root: export (password re-checked), remove with
+        // proof of possession, renew the issuer with the offline key (not
+        // stored), and devices keep enrolling/renewing/connecting.
+        let export = |password: &str| {
+            c.http
+                .post(format!("{}/api/v1/system/device-ca/export-root-key", c.base))
+                .header("cookie", format!("aegis_session={}", c.cookie.clone().expect("cookie")))
+                .header("x-csrf-token", c.csrf.clone().expect("csrf"))
+                .json(&json!({ "password": password }))
+                .send()
+        };
+        assert_eq!(export("wrong password!").await.expect("export").status().as_u16(), 403);
+        let resp = export("a much better passphrase").await.expect("export");
+        assert_eq!(resp.status().as_u16(), 200);
+        let root_key = resp.text().await.expect("pem");
+        assert!(root_key.contains("PRIVATE KEY"));
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/remove-root-key", Some(json!({"key_pem": "not a key"})))
+            .await;
+        assert_eq!(s, 400, "removal needs the real key: {v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/remove-root-key", Some(json!({"key_pem": root_key})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["runtime"]["certificates"]["root_key_on_host"], false, "{v}");
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/system/device-ca/renew-issuer", Some(json!({})))
+            .await;
+        assert_eq!(s, 400, "offline root: renewal needs the key file");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/renew-issuer", Some(json!({"key_pem": root_key})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert!(v["issuer_expires_at"].is_string(), "{v}");
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["runtime"]["certificates"]["root_key_on_host"], false, "key not stored by renewal");
+        assert!(aegis_join::renew_if_due(&device_dir, true).await.expect("renew from the new issuer"));
+        client.shutdown(Duration::from_secs(1)).await;
+        let client = start_client(&dev_dir).await;
+        let socks = client.bound_addr("socks").expect("socks");
+        assert_eq!(socks_connect(socks, "localhost", 9).await, 2, "new issuer and gateway identity admitted");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/restore-root-key", Some(json!({"key_pem": root_key})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (_, v) = c.call(reqwest::Method::GET, "/audit?limit=20", None).await;
+        let actions: Vec<&str> = v["items"].as_array().expect("audit").iter().filter_map(|a| a["action"].as_str()).collect();
+        for a in ["pki.root_key_exported", "pki.root_key_removed", "pki.issuer_renewed", "pki.root_key_restored"] {
+            assert!(actions.contains(&a), "audited {a}: {actions:?}");
+        }
 
         // Revoke: new sessions/streams are refused.
         let (_, v) = c.call(reqwest::Method::GET, "/devices", None).await;

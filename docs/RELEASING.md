@@ -76,7 +76,7 @@ sudo sh install.sh            # Docker. Add --native for a systemd service (Linu
   - `--image REF` runs any image, for example `:staging`.
   - `--native` downloads `aegisnet-gateway-linux-<arch>.tar.gz` and checks it against `SHA256SUMS` before installing.
 - **Verifying downloads:** `gh attestation verify <file> -R OnTheThirdDay/aegis`, or for the image `gh attestation verify oci://ghcr.io/onthethirdday/aegis:X.Y.Z -R OnTheThirdDay/aegis`.
-- **Upgrading:** run the newer `install.sh` with the same options. Data is kept.
+- **Upgrading:** run the newer `install.sh` (with `--name`/`--native` if used). Data and settings are kept; settings are read back from the running instance.
 - **Offline or development installs** without GitHub:
   ```sh
   sh deploy/build-bundle.sh DIR

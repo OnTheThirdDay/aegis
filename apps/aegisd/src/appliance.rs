@@ -332,18 +332,42 @@ pub fn load_issuer(secrets: &SecretStore) -> Result<CaBundle, String> {
     })
 }
 
+/// The device root's private key, when it is kept on this host.
+pub const ROOT_KEY: &str = "device-root-key.pem";
+
+/// Whether `key_pem` is the private key of this gateway's device root.
+pub fn is_root_key(secrets: &SecretStore, key_pem: &str) -> bool {
+    let Ok(root) = secrets.read("device-root.pem") else {
+        return false;
+    };
+    aegis_identity::tls::parse_certs(&root)
+        .ok()
+        .and_then(|c| c.first().cloned())
+        .is_some_and(|der| pki::certificate_matches_key(der.as_ref(), key_pem))
+}
+
 /// Rotate the online issuer from the root kept on this host (lab mode).
 /// Devices trust the root, so existing enrollments stay valid.
 pub fn rotate_issuer(secrets: &SecretStore) -> Result<CaBundle, String> {
+    let key_pem = secrets
+        .read(ROOT_KEY)
+        .map_err(|_| err("E_ROOT_KEY_NOT_ON_HOST"))?
+        .to_string();
+    rotate_issuer_with(secrets, &key_pem)
+}
+
+/// Rotate the online issuer with the root key supplied by the operator (the
+/// key kept offline); the key is used in memory only, never stored.
+pub fn rotate_issuer_with(secrets: &SecretStore, root_key_pem: &str) -> Result<CaBundle, String> {
+    if !is_root_key(secrets, root_key_pem) {
+        return Err(err("E_NOT_ROOT_KEY"));
+    }
     let root = CaBundle {
         cert_pem: secrets
             .read("device-root.pem")
             .map_err(|_| err("E_ROOT_UNAVAILABLE"))?
             .to_string(),
-        key_pem: secrets
-            .read("device-root-key.pem")
-            .map_err(|_| err("E_ROOT_KEY_NOT_ON_HOST"))?
-            .to_string(),
+        key_pem: root_key_pem.to_owned(),
     };
     let issuer = pki::generate_intermediate(&root, "AegisNet device issuer", ISSUER_LIFETIME)
         .map_err(|_| err("E_ISSUER_GENERATION"))?;
@@ -486,7 +510,7 @@ pub fn init(dir: &Path, opts: &InitOptions) -> Result<PathBuf, String> {
     let issuer = pki::generate_intermediate(&root, "AegisNet device issuer", ISSUER_LIFETIME)
         .map_err(|_| err("E_ISSUER_GENERATION"))?;
     put(&secrets, "device-root.pem", &root.cert_pem)?;
-    put(&secrets, "device-root-key.pem", &root.key_pem)?;
+    put(&secrets, ROOT_KEY, &root.key_pem)?;
     let chain = format!("{}{}", issuer.cert_pem, root.cert_pem);
     publish_pair(
         &secrets,

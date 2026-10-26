@@ -91,6 +91,17 @@ pub trait ApplianceServices: Send + Sync {
         actor: &str,
         body: serde_json::Value,
     ) -> IntegrationFuture;
+    /// Device CA custody (blocking): `export-root-key`, `remove-root-key`,
+    /// `restore-root-key`, `renew-issuer`. Callers check the permission and,
+    /// for an export, the password.
+    fn device_ca(
+        &self,
+        _action: &str,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        Err((404, "unsupported".into()))
+    }
 }
 
 impl ManagementContext {

@@ -516,6 +516,27 @@ impl ManagementContext {
 
     /// Self-service password change. Verifies the current password, ends
     /// all other sessions and returns a fresh, fully scoped session.
+    /// Re-check the signed-in principal's password before a sensitive
+    /// action (rate limited like sign-in). Blocking.
+    pub fn confirm_password(&self, principal_id: &str, password: &str) -> Result<(), ApiError> {
+        let p = self
+            .coord
+            .store()
+            .read(|c| db::get_principal(c, principal_id))
+            .map_err(ApiError::from)?;
+        if self.rate_limited(&p.username) {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+        }
+        if p.status != "active"
+            || password.len() > 1024
+            || !verify_password(password, &p.password_hash)
+        {
+            self.record_failure(&p.username);
+            return Err(ApiError::forbidden().detail("password is incorrect"));
+        }
+        Ok(())
+    }
+
     pub fn change_password(
         &self,
         principal_id: &str,

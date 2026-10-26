@@ -50,7 +50,7 @@ Download the installer from the latest release:
 curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
 ```
 
-Pick the line that matches your server. **Write down the command you used**, because upgrades must repeat the same options.
+Pick the line that matches your server. Upgrades read these settings back from the running gateway, so you don't need to repeat them later.
 
 | Situation | Command |
 |---|---|
@@ -139,38 +139,46 @@ Keep that session open and browse to **https://localhost:8443**. The console is 
 
 Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl connect --dir DIR`.
 
+**If the server's address changes later** (a new hostname, or a switch from a direct address to Cloudflare Tunnel), devices pick up the new address the next time they connect, as long as the old address still reaches the server at that moment. Keep the old address working until devices have connected once. A device adopts the new address only after it has verified, through its pinned connection, that the same gateway answers there. Devices that were offline for the whole changeover need a new invitation.
+
 ## 6. Upgrade
 
-Download the newest installer and run it **with the same options you installed with**:
+Download the newest installer and run it:
 
 ```sh
 curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
-sudo sh install.sh <same options as the original install>
+sudo sh install.sh                  # add --name NAME / --native if you installed with them
 ```
+
+The installer reads the current settings from the running gateway (ports, addresses, whether the console is local only), prints them, and keeps them. To change one, pass just that option, for example `--port 8444`; use `--public-console` to undo `--local-console`, and `--fresh` to ignore the old settings and use the defaults.
 
 What the upgrade keeps and changes:
 
 - **Kept:** all data, including the admin password, users, devices, certificates and the Cloudflare tunnel. They live in the Docker volume `aegis-data` (or `/var/lib/aegis` with `--native`). The console certificate stays the same, so the browser does not warn again.
 - **Changed:** only the program. Devices reconnect automatically within seconds.
 
-**Forgot the original options?** Read them from the running gateway *before* upgrading:
+The settings live in the gateway's container (or, with `--native`, its systemd unit). After `--uninstall` they are gone; data is kept, but a reinstall starts from the defaults again unless you pass the options.
 
-```sh
-docker port aegis      # e.g. 8443/tcp -> 127.0.0.1:8443 means --local-console;
-                       #      8444/tcp -> 0.0.0.0:8444 means --port 8444;
-                       #      no 8080/tcp line means --http-port 0
-docker inspect aegis --format '{{range .Config.Env}}{{println .}}{{end}}' | grep AEGIS_PUBLIC
-                       # AEGIS_PUBLIC_ADDRESSES = your --address
-```
-
-With `--native`: `systemctl cat aegis | grep AEGIS_`.
-
-**If an upgrade fails to start** (usually a port mismatch, for example forgetting `--port 8444` next to nginx), the gateway is stopped but no data is lost. Run the installer again with the correct options.
+**If an upgrade fails to start** (usually a port another service took in the meantime), the gateway is stopped but no data is lost. Run the installer again with the port options it needs.
 
 **Other upgrade targets:**
 
-- **A specific version:** `sudo sh install.sh --version vX.Y.Z <options>`.
-- **The pre-release test build:** `sudo sh install.sh --image ghcr.io/onthethirdday/aegis:staging <options>`. Use this only on test servers.
+- **A specific version:** `sudo sh install.sh --version vX.Y.Z`.
+- **The pre-release test build:** `sudo sh install.sh --image ghcr.io/onthethirdday/aegis:staging`. Use this only on test servers. The image is not remembered: the next plain upgrade goes back to the release.
+
+## Optional: keep the device root key offline
+
+Device certificates are signed by a one-year *issuer*, which is signed by the gateway's *root*. Devices trust the root. By default the root key is stored on the server, so the issuer renews by itself.
+
+For stronger protection, take the root key off the server. Then someone who breaks into the server can't create a new root. The cost is renewing the issuer yourself once a year.
+
+In the console, open **Account → Device certificate authority**:
+
+1. **Download the root key.** Your password is asked again. Store the file offline, for example on a USB stick kept somewhere safe, or in a password manager.
+2. **Choose the downloaded file and press Remove the key from this server.** Choosing the file proves you saved the right key before it is deleted.
+3. **Once a year**, when the console warns that the device issuer expires within 60 days, choose the key file there and press **Renew the device issuer**. The key is used once and not stored. Devices keep working throughout.
+
+**Put the key back on this server** returns to automatic renewal. Keep a backup of the key file: if it is lost while offline, the issuer can't be renewed, and every device needs a new invitation after it expires.
 
 ## 7. Remove
 

@@ -9,12 +9,18 @@
 # release binaries, verifies SHA256SUMS and installs a hardened service.
 # Then open the printed console URL and finish setup in the browser.
 #
+# Upgrading: run the newest install.sh again (with --name / --native if the
+# instance was installed with them). Ports, addresses and console exposure
+# are read back from the running instance; options given now override them.
+#
 # Options:
 #   --console-port N   host port of the HTTPS console        (default 8443)
 #   --port N           host port devices connect to           (default 443)
 #   --http-port N      host port for Let's Encrypt HTTP-01    (default 80; 0 = none)
 #   --address A[,B]    public IP/DNS names for certificates   (default: detected)
 #   --local-console    console on this machine only (reach it with ssh -L)
+#   --public-console   undo --local-console on an upgrade
+#   --fresh            ignore the existing instance's settings; use defaults
 #   --name NAME        container / service name               (default aegis)
 #   --version vX.Y.Z   release to install                     (default: this installer's)
 #   --image REF        Docker image to run instead of the release image
@@ -30,11 +36,13 @@ RELEASE="@VERSION@"
 RELEASE_IMAGE="@IMAGE@"
 
 NAME=aegis
-CONSOLE_PORT=8443
-EDGE_PORT=443
-HTTP_PORT=80
+# Empty = not given: taken from the existing instance, else the default.
+CONSOLE_PORT=""
+EDGE_PORT=""
+HTTP_PORT=""
 ADDRESSES=""
-LOCAL_CONSOLE=0
+LOCAL_CONSOLE=""
+FRESH=0
 MODE=docker
 UNINSTALL=0
 PURGE=0
@@ -52,6 +60,8 @@ while [ $# -gt 0 ]; do
     --http-port) HTTP_PORT=${2:?}; shift 2 ;;
     --address) ADDRESSES=${2:?}; shift 2 ;;
     --local-console) LOCAL_CONSOLE=1; shift ;;
+    --public-console) LOCAL_CONSOLE=0; shift ;;
+    --fresh) FRESH=1; shift ;;
     --name) NAME=${2:?}; shift 2 ;;
     --version) VERSION=${2:?}; shift 2 ;;
     --image) IMAGE=${2:?}; shift 2 ;;
@@ -59,12 +69,70 @@ while [ $# -gt 0 ]; do
     --native) MODE=native; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
-    -h|--help) sed -n '2,26p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0" 2>/dev/null || true; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
 
 case "$NAME" in *[!A-Za-z0-9_.-]*|"") die "invalid --name" ;; esac
+
+# ---------------------------------------------------------------- settings of an existing instance
+
+RECALLED=0
+
+recall_docker() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker inspect "$NAME" >/dev/null 2>&1 || return 0
+  # "8443/tcp=127.0.0.1:8453 8444/tcp=:8454 ..." (container port=host ip:port)
+  ports=$(docker inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{$p}}={{range $b}}{{.HostIp}}:{{.HostPort}}{{end}} {{end}}' "$NAME" 2>/dev/null) || return 0
+  http_seen=0
+  for entry in $ports; do
+    key=${entry%%=*}; val=${entry#*=}
+    host_port=${val##*:}; host_ip=${val%:*}
+    case "$key" in
+      8443/tcp)
+        if [ -z "$CONSOLE_PORT" ]; then CONSOLE_PORT=$host_port; fi
+        if [ -z "$LOCAL_CONSOLE" ]; then
+          if [ "$host_ip" = 127.0.0.1 ]; then LOCAL_CONSOLE=1; else LOCAL_CONSOLE=0; fi
+        fi ;;
+      8444/tcp) if [ -z "$EDGE_PORT" ]; then EDGE_PORT=$host_port; fi ;;
+      8080/tcp) http_seen=1; if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$host_port; fi ;;
+    esac
+  done
+  if [ -z "$HTTP_PORT" ] && [ "$http_seen" = 0 ]; then HTTP_PORT=0; fi
+  if [ -z "$ADDRESSES" ]; then
+    ADDRESSES=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+      | sed -n 's/^AEGIS_PUBLIC_ADDRESSES=//p' | head -n 1)
+  fi
+  RECALLED=1
+}
+
+recall_native() {
+  unit=/etc/systemd/system/$NAME.service
+  [ -f "$unit" ] || return 0
+  env_of() { sed -n "s/^Environment=$1=//p" "$unit" | head -n 1; }
+  if [ -z "$CONSOLE_PORT" ]; then CONSOLE_PORT=$(env_of AEGIS_CONSOLE_PORT); fi
+  if [ -z "$EDGE_PORT" ]; then EDGE_PORT=$(env_of AEGIS_EDGE_PORT); fi
+  if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$(env_of AEGIS_HTTP_PORT); fi
+  if [ -z "$ADDRESSES" ]; then ADDRESSES=$(env_of AEGIS_PUBLIC_ADDRESSES); fi
+  if [ -z "$LOCAL_CONSOLE" ]; then LOCAL_CONSOLE=$(env_of AEGIS_CONSOLE_LOOPBACK); fi
+  RECALLED=1
+}
+
+if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then
+  if [ "$MODE" = native ]; then recall_native; else recall_docker; fi
+fi
+[ -n "$CONSOLE_PORT" ] || CONSOLE_PORT=8443
+[ -n "$EDGE_PORT" ] || EDGE_PORT=443
+[ -n "$HTTP_PORT" ] || HTTP_PORT=80
+[ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=0
+if [ "$RECALLED" = 1 ]; then
+  console_where="reachable from the network"; [ "$LOCAL_CONSOLE" = 1 ] && console_where="this machine only"
+  say "Upgrading $NAME with its current settings (options given now override them; --fresh ignores them):"
+  say "  console port $CONSOLE_PORT ($console_where), device port $EDGE_PORT, HTTP validation port $HTTP_PORT (0 = none)"
+  [ -n "$ADDRESSES" ] && say "  addresses $ADDRESSES"
+fi
+
 for p in "$CONSOLE_PORT" "$EDGE_PORT" "$HTTP_PORT"; do
   case "$p" in *[!0-9]*|"") die "ports must be numbers" ;; esac
 done
@@ -218,8 +286,9 @@ docker_install() {
   password=$(docker exec "$NAME" aegisctl initial-password 2>/dev/null || true)
   fingerprint=$(docker exec "$NAME" aegisctl console-fingerprint 2>/dev/null || echo unknown)
   print_summary "$password" "$fingerprint" "$addrs"
-  say "  Manage:  docker logs $NAME | docker restart $NAME | sh install.sh --uninstall"
-  say "  Upgrade: run the newest install.sh again (data is kept)."
+  name_opt=""; [ "$NAME" = aegis ] || name_opt=" --name $NAME"
+  say "  Manage:  docker logs $NAME | docker restart $NAME | sh install.sh$name_opt --uninstall"
+  say "  Upgrade: run the newest install.sh again; data and settings are kept."
   say ""
 }
 
@@ -329,8 +398,9 @@ native_install() {
   password=$(/usr/local/bin/aegisctl initial-password --data-dir "$data" 2>/dev/null || true)
   fingerprint=$(/usr/local/bin/aegisctl console-fingerprint --data-dir "$data" 2>/dev/null || echo unknown)
   print_summary "$password" "$fingerprint" "$addrs"
-  say "  Manage:  systemctl status $NAME | sudo sh install.sh --native --uninstall"
-  say "  Upgrade: run the newest install.sh --native again (data is kept)."
+  name_opt=""; [ "$NAME" = aegis ] || name_opt=" --name $NAME"
+  say "  Manage:  systemctl status $NAME | sudo sh install.sh --native$name_opt --uninstall"
+  say "  Upgrade: run the newest install.sh --native again; data and settings are kept."
   say ""
 }
 

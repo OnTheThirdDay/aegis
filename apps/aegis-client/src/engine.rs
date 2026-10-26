@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,6 +339,11 @@ impl Worker {
             socks: self.settings.socks_port,
             http: self.settings.http_port,
         };
+        self.diag.note(Severity::Info, "client.connect", &[]);
+        if let Some(node) = self.follow_endpoint(ports).await {
+            self.install(node).await;
+            return;
+        }
         let cfg = match aegis_join::client_config(&self.device, ports) {
             Ok(c) => c,
             Err(e) => {
@@ -350,21 +354,7 @@ impl Worker {
                 return;
             }
         };
-        // The client keeps no durable state: start from the profile.
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(self.device.root.join(format!("state.db{suffix}")));
-        }
-        self.diag.note(Severity::Info, "client.connect", &[]);
-        let started = aegis_node::start_with_diagnostics(
-            aegis_node::StartOptions {
-                config: cfg,
-                store_path: self.device.store(),
-                failpoints: None,
-            },
-            Arc::clone(&self.diag),
-        )
-        .await;
-        let node = match started {
+        let node = match self.start_node(cfg).await {
             Ok(n) => n,
             Err(e) => {
                 self.diag.note(
@@ -389,6 +379,78 @@ impl Worker {
                 return;
             }
         };
+        self.install(node).await;
+    }
+
+    async fn start_node(
+        &self,
+        config: aegis_config::NodeConfig,
+    ) -> Result<aegis_node::NodeRuntime, aegis_node::StartError> {
+        // The client keeps no durable state: start from the profile.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(self.device.root.join(format!("state.db{suffix}")));
+        }
+        aegis_node::start_with_diagnostics(
+            aegis_node::StartOptions {
+                config,
+                store_path: self.device.store(),
+                failpoints: None,
+            },
+            Arc::clone(&self.diag),
+        )
+        .await
+    }
+
+    /// Follow a changed server address: ask the gateway for its current
+    /// endpoint and, if it differs, try it. It is kept only when the
+    /// gateway's pinned identity answers there (the end-to-end check), so a
+    /// tampered answer can't redirect the device; otherwise the stored
+    /// address is used as before. Returns the running node on success.
+    async fn follow_endpoint(&mut self, ports: Ports) -> Option<aegis_node::NodeRuntime> {
+        let endpoint = match aegis_join::fetch_endpoint(&self.device).await {
+            Ok(Some(e)) => e,
+            Ok(None) => return None,
+            Err(e) => {
+                self.diag.note(
+                    Severity::Info,
+                    "client.endpoint.unchecked",
+                    &[("error", &e.to_string())],
+                );
+                return None;
+            }
+        };
+        self.diag.note(
+            Severity::Info,
+            "client.endpoint.changed",
+            &[("url", &endpoint.url)],
+        );
+        let cfg = aegis_join::client_config_for(&self.device, ports, Some(&endpoint)).ok()?;
+        let node = self.start_node(cfg).await.ok()?;
+        let verified = match node.bound_addr("socks") {
+            Some(socks) => verify(socks).await.is_ok(),
+            None => false,
+        };
+        if verified {
+            if let Ok(device) = aegis_join::adopt_endpoint(&self.device, &endpoint) {
+                let host = host_of(&device.url);
+                self.update(|s| {
+                    s.server = Some(host.clone());
+                    s.info = Some(format!("The server's address changed; now using {host}."));
+                });
+                return Some(node);
+            }
+        }
+        self.diag.note(
+            Severity::Warn,
+            "client.endpoint.rejected",
+            &[("url", &endpoint.url)],
+        );
+        node.shutdown(Duration::from_secs(1)).await;
+        None
+    }
+
+    /// Take over a started node: proxies, optional system proxy, status.
+    async fn install(&mut self, node: aegis_node::NodeRuntime) {
         let socks = node.bound_addr("socks");
         let http = node.bound_addr("http");
         self.node = Some(node);
@@ -587,28 +649,11 @@ impl Worker {
     }
 }
 
-/// Open a stream to `localhost:9` through the tunnel: the gateway must
-/// refuse it by policy (SOCKS reply 2), which proves the authenticated
-/// session works without contacting any third party.
+/// The end-to-end check, with the message the window shows on failure.
 async fn verify(socks: SocketAddr) -> Result<(), String> {
-    let attempt = async {
-        let mut s = tokio::net::TcpStream::connect(socks).await.ok()?;
-        s.write_all(&[5, 1, 0]).await.ok()?;
-        let mut r = [0u8; 2];
-        s.read_exact(&mut r).await.ok()?;
-        let host = b"localhost";
-        let mut req = vec![5, 1, 0, 3, host.len() as u8];
-        req.extend_from_slice(host);
-        req.extend_from_slice(&9u16.to_be_bytes());
-        s.write_all(&req).await.ok()?;
-        let mut head = [0u8; 2];
-        s.read_exact(&mut head).await.ok()?;
-        Some(head[1])
-    };
-    match tokio::time::timeout(Duration::from_secs(15), attempt).await {
-        Ok(Some(2)) => Ok(()),
-        Ok(Some(_)) | Ok(None) | Err(_) => Err(
-            "Cannot reach the server yet — retrying. Check the network, or ask the administrator whether this device was removed.".into(),
-        ),
+    if aegis_join::verify_tunnel(socks).await {
+        Ok(())
+    } else {
+        Err("Cannot reach the server yet — retrying. Check the network, or ask the administrator whether this device was removed.".into())
     }
 }

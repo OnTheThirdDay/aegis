@@ -51,6 +51,10 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
         .route("/api/v1/system/info", get(appliance::info))
         .route("/api/v1/system/connection", put(appliance::put_connection))
         .route("/api/v1/system/web-ca.pem", get(appliance::web_ca))
+        .route(
+            "/api/v1/system/device-ca/{action}",
+            post(appliance::device_ca),
+        )
         .route("/api/v1/system/downloads", get(appliance::downloads))
         .route("/downloads/{name}", get(appliance::download_file))
         .route("/api/v1/integrations", get(appliance::integrations))

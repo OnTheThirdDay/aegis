@@ -340,16 +340,40 @@ pub async fn edge_enroll(ctx: Arc<ManagementContext>, body: Vec<u8>) -> (u16, Ve
     respond(result, 201)
 }
 
-/// Data-plane edge entry for device-authenticated requests: `POST /renew`
-/// with certificate + same-key CSR, or with a signed diagnostic report
-/// (`diagnostic_report_gz`). Reports share this path so existing tunnel
-/// ingress rules keep matching.
+/// The gateway's current device endpoint, for an enrolled device
+/// (`endpoint_query`). Not secret, so only the certificate is checked and
+/// the enrollment rate limit is not spent: every device asks on connect.
+/// Devices adopt a changed endpoint only after the gateway's pinned inner
+/// identity verifies there, so a tampered answer can't redirect them.
+async fn endpoint_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
+    let certificate_pem = body
+        .get("certificate_pem")
+        .and_then(Value::as_str)
+        .filter(|p| p.len() <= 16 * 1024)
+        .ok_or_else(|| ApiError::bad_request("invalid_body"))?
+        .to_owned();
+    let anchor = device_trust_anchor(ctx)?;
+    let c = ctx.clone();
+    blocking(move || {
+        authenticate_device(&c, &anchor, &certificate_pem)?;
+        Ok(json!({ "endpoint": super::devices::current_endpoint(&c)? }))
+    })
+    .await
+}
+
+/// Data-plane edge entry for device-authenticated requests on `POST /renew`:
+/// certificate + same-key CSR (renewal), a signed diagnostic report
+/// (`diagnostic_report_gz`) or an endpoint query (`endpoint_query`). They
+/// share this path so existing tunnel ingress rules keep matching.
 pub async fn edge_renew(ctx: Arc<ManagementContext>, body: Vec<u8>) -> (u16, Vec<u8>) {
     let (request, result) = match serde_json::from_slice::<Value>(&body) {
         Ok(v) if v.get("diagnostic_report_gz").is_some() => (
             "diagnostic_report",
             super::diagnostics::device_report(&ctx, v).await,
         ),
+        Ok(v) if v.get("endpoint_query").is_some() => {
+            ("endpoint_query", endpoint_query(&ctx, v).await)
+        }
         Ok(v) => ("renew", renew_self(&ctx, v).await),
         Err(_) => ("renew", Err(ApiError::bad_request("invalid_body"))),
     };
