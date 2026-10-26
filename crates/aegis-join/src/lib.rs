@@ -73,6 +73,19 @@ pub struct Invite {
     pub device_ca_sha256: String,
 }
 
+impl Invite {
+    pub fn endpoint(&self) -> Endpoint {
+        Endpoint {
+            url: self.url.clone(),
+            enroll_url: self.enroll_url.clone(),
+            server_name: self.server_name.clone(),
+            outer_server_name: self.outer_server_name.clone(),
+            outer_ca_pem: self.outer_ca_pem.clone(),
+            device_ca_sha256: self.device_ca_sha256.clone(),
+        }
+    }
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -82,6 +95,44 @@ fn now() -> i64 {
 
 fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
+}
+
+/// Where and how a device reaches its gateway: the non-secret part of an
+/// invitation, which the gateway also serves to enrolled devices so they
+/// can follow address changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Endpoint {
+    pub url: String,
+    pub enroll_url: String,
+    pub server_name: String,
+    #[serde(default)]
+    pub outer_server_name: Option<String>,
+    #[serde(default)]
+    pub outer_ca_pem: Option<String>,
+    pub device_ca_sha256: String,
+}
+
+impl Endpoint {
+    fn check(&self) -> Result<(), &'static str> {
+        if self.device_ca_sha256.len() != 64
+            || !self.device_ca_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            || !self.url.starts_with("wss://")
+            || !self.enroll_url.starts_with("https://")
+            || self.url.len() > 2048
+            || self.enroll_url.len() > 2048
+            || aegis_contracts::destination::normalize_domain(&self.server_name).as_ref()
+                != Ok(&self.server_name)
+        {
+            return Err("missing or malformed fields");
+        }
+        if self.outer_server_name.is_some() != self.outer_ca_pem.is_some() {
+            return Err("incomplete edge trust");
+        }
+        if let Some(ca) = &self.outer_ca_pem {
+            aegis_identity::tls::parse_certs(ca).map_err(|_| "bad edge certificate")?;
+        }
+        Ok(())
+    }
 }
 
 /// Parse and validate an invitation code (whitespace tolerant).
@@ -111,25 +162,13 @@ pub fn parse_invite(code: &str) -> Result<Invite, JoinError> {
     if !aegis_identity::valid_node_id(&invite.name)
         || invite.token.is_empty()
         || invite.token.len() > 256
-        || invite.device_ca_sha256.len() != 64
-        || !invite
-            .device_ca_sha256
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit())
-        || !invite.url.starts_with("wss://")
-        || !invite.enroll_url.starts_with("https://")
-        || aegis_contracts::destination::normalize_domain(&invite.server_name).as_ref()
-            != Ok(&invite.server_name)
     {
         return Err(JoinError::InvalidInvite("missing or malformed fields"));
     }
-    if invite.outer_server_name.is_some() != invite.outer_ca_pem.is_some() {
-        return Err(JoinError::InvalidInvite("incomplete edge trust"));
-    }
-    if let Some(ca) = &invite.outer_ca_pem {
-        aegis_identity::tls::parse_certs(ca)
-            .map_err(|_| JoinError::InvalidInvite("bad edge certificate"))?;
-    }
+    invite
+        .endpoint()
+        .check()
+        .map_err(JoinError::InvalidInvite)?;
     if invite.expires_at <= now() {
         return Err(JoinError::InviteExpired);
     }
@@ -408,6 +447,98 @@ pub async fn upload_diagnostics(dir: &DeviceDir, report_gz: &[u8]) -> Result<(),
     Ok(())
 }
 
+/// Ask the gateway for its current endpoint. Returns `Some` only when it
+/// differs from what this device stores; the caller must verify the new
+/// endpoint works (the gateway's pinned identity) before [`adopt_endpoint`].
+/// An endpoint for a different device CA is refused outright.
+pub async fn fetch_endpoint(dir: &DeviceDir) -> Result<Option<Endpoint>, JoinError> {
+    let device = dir.load()?;
+    let cert = dir.read("cert.pem")?;
+    let outer = if device.outer_server_name.is_some() {
+        Some(dir.read("outer-ca.pem")?)
+    } else {
+        None
+    };
+    let body = json!({"certificate_pem": cert, "endpoint_query": true});
+    let (status, bytes) =
+        http::post_json(&device.renew_url(), &device.edge(outer.clone()), &body).await?;
+    if status != 200 {
+        return Err(rejected(status, &bytes));
+    }
+    let response: Value =
+        serde_json::from_slice(&bytes).map_err(|_| JoinError::Untrusted("malformed response"))?;
+    let endpoint: Endpoint = serde_json::from_value(response["endpoint"].clone())
+        .map_err(|_| JoinError::Untrusted("malformed endpoint"))?;
+    endpoint.check().map_err(JoinError::Untrusted)?;
+    if endpoint.device_ca_sha256 != device.device_ca_sha256 {
+        return Err(JoinError::Untrusted(
+            "endpoint belongs to a different gateway",
+        ));
+    }
+    let same = endpoint.url == device.url
+        && endpoint.enroll_url == device.enroll_url
+        && endpoint.server_name == device.server_name
+        && endpoint.outer_server_name == device.outer_server_name
+        && endpoint.outer_ca_pem.as_deref().map(str::trim) == outer.as_deref().map(str::trim);
+    Ok((!same).then_some(endpoint))
+}
+
+/// Store `endpoint` as this device's way to reach the gateway.
+pub fn adopt_endpoint(dir: &DeviceDir, endpoint: &Endpoint) -> Result<Device, JoinError> {
+    endpoint.check().map_err(JoinError::Untrusted)?;
+    let mut device = dir.load()?;
+    if endpoint.device_ca_sha256 != device.device_ca_sha256 {
+        return Err(JoinError::Untrusted(
+            "endpoint belongs to a different gateway",
+        ));
+    }
+    let outer = dir.identity().join("outer-ca.pem");
+    match &endpoint.outer_ca_pem {
+        Some(ca) => write_private(&outer, ca)?,
+        None => {
+            let _ = std::fs::remove_file(&outer);
+        }
+    }
+    let _ = std::fs::remove_file(dir.identity().join(STAGED_OUTER_CA));
+    device.url = endpoint.url.clone();
+    device.enroll_url = endpoint.enroll_url.clone();
+    device.server_name = endpoint.server_name.clone();
+    device.outer_server_name = endpoint.outer_server_name.clone();
+    let text = serde_json::to_string_pretty(&device)
+        .map_err(|_| JoinError::Storage("serialize".into()))?;
+    write_private(&dir.device_file(), &text)?;
+    Ok(device)
+}
+
+/// End-to-end check of a running client: open a stream to `localhost:9`
+/// through its SOCKS5 proxy. The gateway must refuse it *by policy* (SOCKS
+/// reply 2), which only happens after the pinned inner mTLS handshake and
+/// registry admission succeeded, without contacting any third party.
+pub async fn verify_tunnel(socks: std::net::SocketAddr) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let attempt = async {
+        let mut s = tokio::net::TcpStream::connect(socks).await.ok()?;
+        s.write_all(&[5, 1, 0]).await.ok()?;
+        let mut r = [0u8; 2];
+        s.read_exact(&mut r).await.ok()?;
+        let host = b"localhost";
+        let mut req = vec![5, 1, 0, 3, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&9u16.to_be_bytes());
+        s.write_all(&req).await.ok()?;
+        let mut head = [0u8; 2];
+        s.read_exact(&mut head).await.ok()?;
+        Some(head[1])
+    };
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(15), attempt).await,
+        Ok(Some(2))
+    )
+}
+
+/// Edge CA of an endpoint being tried, before it is adopted.
+const STAGED_OUTER_CA: &str = "outer-ca.next.pem";
+
 /// Local proxy listeners of the client profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ports {
@@ -427,16 +558,46 @@ impl Default for Ports {
 /// Build the client node configuration for an enrolled device. Destination
 /// names are always resolved by the gateway (`remote_required`).
 pub fn client_config(dir: &DeviceDir, ports: Ports) -> Result<aegis_config::NodeConfig, JoinError> {
+    client_config_for(dir, ports, None)
+}
+
+/// The client profile, reaching the gateway through `trial` instead of the
+/// stored endpoint (to verify a changed endpoint before adopting it).
+pub fn client_config_for(
+    dir: &DeviceDir,
+    ports: Ports,
+    trial: Option<&Endpoint>,
+) -> Result<aegis_config::NodeConfig, JoinError> {
     let device = dir.load()?;
     let path = |p: PathBuf| p.display().to_string();
+    let (url, server_name, outer) = match trial {
+        Some(e) => {
+            let outer = match (&e.outer_server_name, &e.outer_ca_pem) {
+                (Some(name), Some(ca)) => {
+                    write_private(&dir.identity().join(STAGED_OUTER_CA), ca)?;
+                    Some((name.clone(), format!("secret://identity/{STAGED_OUTER_CA}")))
+                }
+                _ => None,
+            };
+            (e.url.clone(), e.server_name.clone(), outer)
+        }
+        None => (
+            device.url.clone(),
+            device.server_name.clone(),
+            device
+                .outer_server_name
+                .clone()
+                .map(|n| (n, "secret://identity/outer-ca.pem".to_owned())),
+        ),
+    };
     let mut outbound = json!({
         "id": "gateway",
         "kind": "agp_tunnel",
-        "url": device.url,
-        "server_name": device.server_name,
+        "url": url,
+        "server_name": server_name,
     });
-    if let Some(name) = &device.outer_server_name {
-        outbound["outer_ca"] = json!("secret://identity/outer-ca.pem");
+    if let Some((name, ca)) = outer {
+        outbound["outer_ca"] = json!(ca);
         outbound["outer_server_name"] = json!(name);
     }
     let cfg = json!({

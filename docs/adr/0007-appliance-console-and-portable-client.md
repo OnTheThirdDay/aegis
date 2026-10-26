@@ -6,7 +6,7 @@ Status: accepted (owner direction, 2026-10-25). Supersedes parts of SPEC-12 as n
 
 The owner asked for setup without CLI or file editing:
 
-- one command installs the server (Docker or native);
+- one command installs the server (Docker or native; later narrowed to Docker only, with the installer shipped inside the public image so the repository can be private);
 - the server generates a random admin password;
 - the admin opens a browser at the server, signs in, changes the password and configures everything there, including Cloudflare and "plugins";
 - end users get their own pages;
@@ -79,7 +79,10 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
 
 - **Exposed console.** The console listens on the LAN by default; the residual risk is password guessing. Mitigations: Argon2id hashing, per-user lockout and a global rate limit, and the forced password change.
   - The console certificate is self-issued, so the browser warns until the web CA is installed or replaced. The installer prints the SHA-256 fingerprint for out-of-band checking.
-- **Lab-mode root key.** The device root key stays on the appliance host. Hardened, offline-root operation exists only on the CLI/Compose path.
+- **Root key custody.** The device root key starts on the appliance host, so the issuer renews by itself.
+  - The owner can take it offline from the console (Account → Device certificate authority). Export needs the password again; removal needs the key file back as proof.
+  - With the root key offline, the issuer is renewed in the console with the key file. The key is used in memory and not stored. The console warns 60 days before expiry.
+  - All steps are audited (`pki.root_key_exported`, `pki.root_key_removed`, `pki.issuer_renewed`, `pki.root_key_restored`).
 - **Platforms.** The GUI client is built for Windows (cross-compiled with mingw) and Linux. macOS needs a native build. The Windows system-proxy toggle is implemented but has not been exercised on a real desktop.
 - **Cloudflare evidence.**
   - Adapter: mock contract tests only.

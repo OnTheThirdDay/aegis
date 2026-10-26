@@ -392,6 +392,14 @@ async function renderOverview() {
       "connectivity", "Set up connectivity"),
     step((c.devices_enrolled || 0) > 0, "Add your first device", (c.devices_enrolled || 0) + " device(s) enrolled. Create an invitation and paste it into the AegisNet client app.", "devices", "Invite a device"),
   ]);
+  if (info.runtime && info.runtime.certificates && info.runtime.certificates.issuer_renewal_due) {
+    const go = button("Renew the device issuer", "small");
+    go.addEventListener("click", () => view("account"));
+    v.append(card("Device issuer expires soon", [
+      el("p", {}, ["The device root key is offline, so the issuer that signs device certificates can't renew by itself. Renew it with the root key file, or devices will stop being able to join and renew."]),
+      el("div", { class: "row" }, [go]),
+    ], "warn-card"));
+  }
   v.append(card("Getting started", [steps]));
 
   const rt = info.runtime || {};
@@ -414,7 +422,7 @@ async function renderOverview() {
       certRow("Edge certificate", certs.edge_expires_at),
       certRow("Console certificate", certs.console_expires_at),
     ])]) : null,
-    info.appliance ? el("p", { class: "muted" }, ["Certificates renew automatically. " + (certs.root_key_on_host ? "The device root key is stored on this server (lab mode)." : "The device root key is offline (hardened).")]) : null,
+    info.appliance ? el("p", { class: "muted" }, [certs.root_key_on_host ? "Certificates renew automatically. The device root key is stored on this server." : "Certificates renew automatically, except the device issuer: the device root key is offline, so renew the issuer under Account before it expires."]) : null,
     info.console_certificate_sha256 ? el("p", { class: "muted small" }, ["Console certificate SHA-256: ", el("span", { class: "mono" }, [info.console_certificate_sha256])]) : null,
   ]));
   if (can("telemetry:read")) {
@@ -1085,7 +1093,85 @@ async function renderAccount() {
       el("p", { class: "muted" }, ["The console uses a certificate from this server's own web CA, so browsers warn the first time. To remove the warning, install this CA as trusted on your computer — only do this if you trust this server's operators."]),
       el("div", { class: "row" }, [dl]),
     ]));
+    const ca = await deviceCaCard().catch(() => null);
+    if (ca) v.append(ca);
   }
+}
+
+/** Device certificate authority: root key custody and issuer renewal (owner). */
+async function deviceCaCard() {
+  const { data: info } = await api("GET", "/system/info");
+  if (!info.appliance) return null;
+  const certs = (info.runtime || {}).certificates || {};
+  const onHost = !!certs.root_key_on_host;
+  const days = inDays(certs.issuer_expires_at);
+  /** @param {HTMLInputElement} input */
+  const keyOf = async (input) => {
+    const f = input.files && input.files[0];
+    if (!f) throw new Error("Choose the device root key file first.");
+    return (await f.text()).trim() + "\n";
+  };
+  /** @param {string} action @param {any} body */
+  const call = (action, body) => api("POST", "/system/device-ca/" + action, { body });
+  const keyFile = () => /** @type {HTMLInputElement} */ (el("input", { type: "file", accept: ".pem,.key,.txt", "aria-label": "Device root key file" }));
+
+  const facts = el("table", { class: "kv" }, [el("tbody", {}, [
+    el("tr", {}, [el("th", {}, ["Root key"]), el("td", {}, [onHost ? pill("on this server") : pill("offline")])]),
+    el("tr", {}, [el("th", {}, ["Device issuer expires"]), el("td", {}, [when(certs.issuer_expires_at), " ", days == null ? "" : pill(certs.issuer_renewal_due ? "expires in " + days + " days" : "ok · " + days + " days")])]),
+    el("tr", {}, [el("th", {}, ["Root fingerprint"]), el("td", { class: "mono small" }, [certs.root_fingerprint || "—"])]),
+  ])]);
+
+  if (onHost) {
+    const pw = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "current-password" }));
+    const dl = button("Download the root key", "ghost");
+    busy(dl, async () => {
+      /** @type {Record<string,string>} */
+      const headers = { "Content-Type": "application/json", Accept: "application/x-pem-file" };
+      if (session.csrf) headers["X-CSRF-Token"] = session.csrf;
+      const resp = await fetch("/api/v1/system/device-ca/export-root-key", { method: "POST", headers, credentials: "same-origin", body: JSON.stringify({ password: pw.value }) });
+      if (!resp.ok) {
+        const e = await resp.json().catch(() => ({}));
+        throw new Error(e.detail || friendly(e.aegis_error_code || String(resp.status)));
+      }
+      download("aegisnet-device-root-key.pem", await resp.text(), "application/x-pem-file");
+      pw.value = "";
+      notice("Root key downloaded. Store it somewhere safe and offline, then remove it from the server below.");
+    });
+    const file = keyFile();
+    const remove = button("Remove the key from this server", "danger");
+    busy(remove, async () => {
+      await call("remove-root-key", { key_pem: await keyOf(file) });
+      notice("The root key is no longer on this server. Renew the device issuer yourself before it expires.");
+      await renderAccount();
+    });
+    const renew = button("Renew the device issuer now", "ghost small");
+    busy(renew, async () => { await call("renew-issuer", {}); notice("Device issuer renewed."); await renderAccount(); });
+    return card("Device certificate authority (advanced)", [
+      el("p", { class: "muted" }, ["Device certificates come from a one-year issuer signed by this gateway's root. The root key is on this server, so the issuer renews by itself. For stronger protection you can keep the root key offline: then even someone who breaks into this server can't create a new root, but you must renew the issuer here once a year."]),
+      facts,
+      el("h3", {}, ["Take the root key offline"]),
+      el("ol", { class: "steps" }, [
+        el("li", {}, ["Download it (your password is checked again), and store the file offline, for example on a USB stick or in a password manager."]),
+        el("li", {}, ["Choose the downloaded file to prove you have it, then remove the key from this server."]),
+      ]),
+      field("Your password", pw),
+      el("div", { class: "row" }, [dl]),
+      el("div", { class: "row" }, [file, remove]),
+      el("div", { class: "row" }, [renew]),
+    ]);
+  }
+
+  const file = keyFile();
+  const renew = button("Renew the device issuer");
+  busy(renew, async () => { await call("renew-issuer", { key_pem: await keyOf(file) }); notice("Device issuer renewed. The key was not stored."); await renderAccount(); });
+  const restore = button("Put the key back on this server", "ghost");
+  busy(restore, async () => { await call("restore-root-key", { key_pem: await keyOf(file) }); notice("The root key is on this server again; the issuer renews by itself."); await renderAccount(); });
+  return card("Device certificate authority (advanced)", [
+    el("p", { class: "muted" }, ["The root key is offline, so this server can't renew the device issuer by itself. Renew it before it expires (the console warns 60 days ahead): choose the root key file and press Renew. The key is used once in memory and not stored. Devices keep working throughout."]),
+    facts,
+    el("div", { class: "row" }, [file]),
+    el("div", { class: "row" }, [renew, restore]),
+  ], certs.issuer_renewal_due ? "warn-card" : "");
 }
 
 // ---------------------------------------------------------------- wiring

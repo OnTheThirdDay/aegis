@@ -58,7 +58,7 @@ work branch ──PR──► staging ──release PR──► main
   - **Pull requests: Read and write**.
 
   Without it the built-in token is used. Then turn on Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests", and approve CI on bot pull requests by hand. Note the expiry date somewhere.
-- **Image package:** after the first publish, go to Packages → `aegis` → Package settings → change visibility to **Public**. Servers can then pull it without `docker login`. If the package stays private, run `docker login ghcr.io` on each server.
+- **Image package:** after the first publish, go to Packages → `aegis` → Package settings → change visibility to **Public**. Servers can then pull it, and the installer inside it, without `docker login`. This works while the repository itself is private. If the package stays private, run `docker login ghcr.io` on each server.
 - **Local hook:** run `git config core.hooksPath .githooks` once per clone. It blocks direct pushes to `main` and `staging`; `--no-verify` overrides it deliberately.
 - **Branch protection:** rulesets need a paid plan for private repositories. Until then, `main-gate`, `branch-policy` and the hook enforce the flow. With rulesets available:
   - **`main`:** block force pushes and deletion; require a pull request with merge commits only; require the `required`, `branch-policy` and `main-gate` checks.
@@ -66,18 +66,21 @@ work branch ──PR──► staging ──release PR──► main
 
 ## Installing a release (servers)
 
+Servers need only the public image; the repository can stay private. Each image carries `install.sh`, stamped with its own tag:
+
 ```sh
-curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
-sudo sh install.sh            # Docker. Add --native for a systemd service (Linux)
+docker run --rm --pull always --entrypoint cat \
+  ghcr.io/onthethirdday/aegis /usr/share/aegisnet/install.sh > install.sh
+sudo sh install.sh            # add --tunnel-only on a public server
 ```
 
-- **Image pinning:** the release copy of `install.sh` pins that release's image **by digest**.
+- **Which image it installs:** the copy from `:latest` or `:X.Y.Z` installs that release; the copy from `:staging` installs `:staging`.
   - `--version vX.Y.Z` selects another release.
-  - `--image REF` runs any image, for example `:staging`.
-  - `--native` downloads `aegisnet-gateway-linux-<arch>.tar.gz` and checks it against `SHA256SUMS` before installing.
-- **Verifying downloads:** `gh attestation verify <file> -R OnTheThirdDay/aegis`, or for the image `gh attestation verify oci://ghcr.io/onthethirdday/aegis:X.Y.Z -R OnTheThirdDay/aegis`.
-- **Upgrading:** run the newer `install.sh` with the same options. Data is kept.
-- **Offline or development installs** without GitHub:
+  - `--image REF` runs any image.
+- **Provenance:** the image carries buildx provenance and an SBOM (`docker buildx imagetools inspect ghcr.io/onthethirdday/aegis:X.Y.Z --format '{{json .Provenance}}'`). GitHub artifact attestations are not used, because they need a public repository on the free plan.
+- **Upgrading:** fetch `install.sh` again as above and run it (with `--name` if used). Data and settings are kept; settings are read back from the running instance.
+- **The GitHub Release** (visible to repository members) holds the client apps and `SHA256SUMS`. The apps are also in the image, served by the console under Devices → Client apps.
+- **Offline or development installs** without the registry:
   ```sh
   sh deploy/build-bundle.sh DIR
   sudo sh DIR/aegisnet-gateway/install.sh --from DIR/aegisnet-gateway

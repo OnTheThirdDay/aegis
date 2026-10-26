@@ -70,13 +70,65 @@ impl Appliance {
         let issuer = appliance::load_issuer(&self.secrets)
             .ok()
             .and_then(|i| expiry(&i.cert_pem));
+        let on_host = self.root_key_on_host();
+        let root_fingerprint = self
+            .secrets
+            .read("device-root.pem")
+            .ok()
+            .and_then(|p| aegis_identity::tls::parse_certs(&p).ok())
+            .and_then(|c| c.first().map(|d| aegis_storage::sha256_hex(d.as_ref())));
         json!({
             "gateway_identity_expires_at": at("gateway-identity.json").map(aegis_core::rfc3339),
             "edge_expires_at": at("edge-tls.json").map(aegis_core::rfc3339),
             "console_expires_at": at("console-tls.json").map(aegis_core::rfc3339),
             "issuer_expires_at": issuer.map(aegis_core::rfc3339),
-            "root_key_on_host": self.secrets.root().join("device-root-key.pem").exists(),
+            "root_key_on_host": on_host,
+            "root_fingerprint": root_fingerprint,
+            // Offline root: nobody renews the issuer automatically.
+            "issuer_renewal_due": !on_host && issuer.is_some_and(|e| e - now_unix() < ISSUER_RENEW_BEFORE),
         })
+    }
+
+    fn root_key_on_host(&self) -> bool {
+        self.secrets.root().join(appliance::ROOT_KEY).exists()
+    }
+
+    fn audit(&self, actor: &str, action: &'static str, metadata: Value) {
+        let _ = self.store.tx(|c| {
+            aegis_storage::append_audit(
+                c,
+                aegis_storage::AuditInsert {
+                    actor_id: Some(actor),
+                    action,
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata,
+                },
+            )
+        });
+    }
+
+    /// Renew the device issuer now with `root_key_pem`, then re-issue the
+    /// gateway's identity from it and reload.
+    fn renew_issuer_with(&self, root_key_pem: &str) -> Result<Value, (u16, String)> {
+        let issuer = appliance::rotate_issuer_with(&self.secrets, root_key_pem).map_err(|_| {
+            (
+                400,
+                "that file is not this gateway's device root key".to_owned(),
+            )
+        })?;
+        appliance::issue_gateway_identity(&self.secrets, &issuer).map_err(|e| {
+            (
+                500,
+                format!("issuer renewed, but the gateway identity was not: {e}"),
+            )
+        })?;
+        self.node
+            .reload_certificates()
+            .map_err(|e| (500, format!("issuer renewed, but reloading failed: {e}")))?;
+        Ok(json!({ "issuer_expires_at": expiry(&issuer.cert_pem).map(aegis_core::rfc3339) }))
     }
 
     fn reissue_web(&self, names: &[String], ips: &[IpAddr]) -> Result<(), String> {
@@ -191,6 +243,75 @@ impl ApplianceServices for Appliance {
         body: Value,
     ) -> aegis_management::IntegrationFuture {
         self.integrations.dispatch(id, action, actor, body)
+    }
+
+    fn device_ca(&self, action: &str, actor: &str, body: Value) -> Result<Value, (u16, String)> {
+        let supplied = body
+            .get("key_pem")
+            .and_then(Value::as_str)
+            .filter(|k| k.len() <= 16 * 1024)
+            .map(str::to_owned);
+        let not_on_host = || (409, "the device root key is not on this server".to_owned());
+        let wrong_key = || {
+            (
+                400,
+                "that file is not this gateway's device root key".to_owned(),
+            )
+        };
+        match action {
+            "export-root-key" => {
+                let key = self
+                    .secrets
+                    .read(appliance::ROOT_KEY)
+                    .map_err(|_| not_on_host())?;
+                self.audit(actor, "pki.root_key_exported", json!({}));
+                Ok(json!({ "key_pem": key.as_str() }))
+            }
+            "remove-root-key" => {
+                if !self.root_key_on_host() {
+                    return Err(not_on_host());
+                }
+                // Proof the operator holds the key before it leaves the host.
+                let key = supplied.ok_or_else(wrong_key)?;
+                if !appliance::is_root_key(&self.secrets, &key) {
+                    return Err(wrong_key());
+                }
+                std::fs::remove_file(self.secrets.root().join(appliance::ROOT_KEY))
+                    .map_err(|e| (500, format!("could not remove the key: {}", e.kind())))?;
+                self.audit(actor, "pki.root_key_removed", json!({}));
+                Ok(json!({ "root_key_on_host": false }))
+            }
+            "restore-root-key" => {
+                let key = supplied.ok_or_else(wrong_key)?;
+                if !appliance::is_root_key(&self.secrets, &key) {
+                    return Err(wrong_key());
+                }
+                self.secrets
+                    .put(appliance::ROOT_KEY, &key, true)
+                    .map_err(|_| (500, "could not store the key".to_owned()))?;
+                self.audit(actor, "pki.root_key_restored", json!({}));
+                Ok(json!({ "root_key_on_host": true }))
+            }
+            "renew-issuer" => {
+                let key = match supplied {
+                    Some(k) => k,
+                    None => self
+                        .secrets
+                        .read(appliance::ROOT_KEY)
+                        .map(|k| k.to_string())
+                        .map_err(|_| {
+                            (
+                                400,
+                                "choose the device root key file to renew the issuer".to_owned(),
+                            )
+                        })?,
+                };
+                let out = self.renew_issuer_with(&key)?;
+                self.audit(actor, "pki.issuer_renewed", out.clone());
+                Ok(out)
+            }
+            _ => Err((404, format!("unknown action {action}"))),
+        }
     }
 }
 
