@@ -3,6 +3,7 @@
 mod appliance;
 mod auth;
 mod devices;
+pub mod diagnostics;
 pub mod edge;
 mod nodes;
 mod profiles;
@@ -87,6 +88,13 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
         .route("/api/v1/revisions/{id}/restore", post(profiles::restore))
         .route("/api/v1/jobs/{id}", get(profiles::job))
         .route("/api/v1/diagnostics/explain", post(profiles::explain))
+        .route("/api/v1/diagnostics", get(diagnostics::status))
+        .route("/api/v1/diagnostics/start", post(diagnostics::start))
+        .route("/api/v1/diagnostics/stop", post(diagnostics::stop))
+        .route("/api/v1/diagnostics/discard", post(diagnostics::discard))
+        .route("/api/v1/diagnostics/analysis", get(diagnostics::analysis))
+        .route("/api/v1/diagnostics/otlp", get(diagnostics::otlp))
+        .route("/api/v1/diagnostics/devices", post(diagnostics::import))
         .route(
             "/api/v1/telemetry/settings",
             get(telemetry::get_settings).patch(telemetry::patch_settings),

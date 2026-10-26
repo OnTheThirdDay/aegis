@@ -134,6 +134,49 @@ pub fn certificate_matches_key(cert_der: &[u8], key_pem: &str) -> bool {
     rcgen::PublicKeyData::der_bytes(&key) == cert.public_key().subject_public_key.data.as_ref()
 }
 
+/// What a device signs to upload a diagnostic report: a domain label, the
+/// signing time and the payload's SHA-256, so a signature is useless for
+/// anything else.
+pub fn diagnostic_upload_message(signed_at: i64, payload: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    format!(
+        "aegis-diagnostic-report-v1
+{signed_at}
+{}",
+        hex::encode(Sha256::digest(payload))
+    )
+    .into_bytes()
+}
+
+/// Sign `msg` with a device's private key (ECDSA P-256/P-384 or Ed25519).
+pub fn sign_with_key(key_pem: &str, msg: &[u8]) -> Result<Vec<u8>, IdentityError> {
+    use rcgen::SigningKey;
+    Ok(KeyPair::from_pem(key_pem)?.sign(msg)?)
+}
+
+/// Whether `signature` over `msg` was made by the key in `cert_der`. The
+/// caller authenticates the certificate itself.
+pub fn verify_with_certificate(cert_der: &[u8], msg: &[u8], signature: &[u8]) -> bool {
+    use rustls::SignatureScheme as S;
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_der) else {
+        return false;
+    };
+    let public_key = cert.public_key().subject_public_key.data.as_ref();
+    let provider = rustls::crypto::ring::default_provider();
+    provider
+        .signature_verification_algorithms
+        .mapping
+        .iter()
+        .filter(|(scheme, _)| {
+            matches!(
+                scheme,
+                S::ECDSA_NISTP256_SHA256 | S::ECDSA_NISTP384_SHA384 | S::ED25519
+            )
+        })
+        .flat_map(|(_, algs)| algs.iter())
+        .any(|alg| alg.verify_signature(public_key, msg, signature).is_ok())
+}
+
 fn node_params(
     node_id: &str,
     role: Role,

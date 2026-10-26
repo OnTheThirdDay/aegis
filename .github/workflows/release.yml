@@ -36,7 +36,7 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       image: ${{ steps.plan.outputs.image }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -76,7 +76,7 @@ jobs:
           - arch: arm64
             target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Cross toolchain
@@ -101,7 +101,7 @@ jobs:
           sum_var="CLOUDFLARED_SHA256_$ARCH"
           echo "${!sum_var}  out/$ARCH/cloudflared" | sha256sum -c -
           chmod 0755 out/"$ARCH"/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gateway-${{ matrix.arch }}
           path: out/
@@ -132,7 +132,7 @@ jobs:
             bin: aegis-client
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: rustup target add ${{ matrix.target }}
@@ -141,7 +141,7 @@ jobs:
         run: |
           mkdir -p out
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "out/${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: client-${{ matrix.asset }}
           path: out/
@@ -158,15 +158,15 @@ jobs:
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: gateway-*
           path: context/bin
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: client-*
           path: context/clients
@@ -176,9 +176,9 @@ jobs:
           cp deploy/Dockerfile.prebuilt context/Dockerfile
           chmod 0755 context/bin/*/* context/clients/*
           find context -type f | sort
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -198,7 +198,7 @@ jobs:
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
       - id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: context
           platforms: linux/amd64,linux/arm64
@@ -209,7 +209,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
           sbom: true
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ needs.plan.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
@@ -224,15 +224,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: gateway-*
           path: gateway
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: client-*
           path: assets
@@ -249,7 +249,7 @@ jobs:
             pkg=$(mktemp -d)/aegisnet-gateway
             mkdir -p "$pkg/bin" "$pkg/clients"
             cp gateway/$arch/* "$pkg/bin/"
-            cp assets/* "$pkg/clients/"
+            cp assets/aegis-client-* "$pkg/clients/"
             tar -C "$(dirname "$pkg")" -czf "assets/aegisnet-gateway-linux-$arch.tar.gz" aegisnet-gateway
           done
           # The installer pins this release's image by digest.
@@ -259,7 +259,7 @@ jobs:
           grep -q "^RELEASE=\"v$VERSION\"" assets/install.sh
           ( cd assets && sha256sum * > SHA256SUMS )
           cat assets/SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: assets/*
       - name: Tag and publish the release

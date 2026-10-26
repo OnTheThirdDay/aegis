@@ -230,6 +230,63 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         let socks = client.bound_addr("socks").expect("socks");
         assert_eq!(socks_connect(socks, "localhost", 9).await, 2, "renewed identity admitted");
 
+        // On-demand diagnostics: a device report is refused while the
+        // gateway's diagnostics are off, accepted (signed with the device
+        // key, through the edge) once an administrator starts a recording,
+        // attributed by the registry and explained by the analysis.
+        let sink = aegis_telemetry::DiagnosticSink::new();
+        sink.start(Duration::from_secs(60)).expect("start");
+        sink.note(
+            aegis_telemetry::Severity::Warn,
+            "client.connect.failed",
+            &[("stage", "tls"), ("error", "invalid peer certificate: UnknownIssuer")],
+        );
+        let mut report = aegis_telemetry::Report {
+            role: aegis_telemetry::report::Role::Client,
+            name: "claims-another-name".into(),
+            version: "test".into(),
+            recording: sink.recording().expect("recording"),
+        };
+        let gz = report.to_gzip(900 * 1024);
+        let refused = aegis_join::upload_diagnostics(&device_dir, &gz).await;
+        assert!(
+            matches!(refused, Err(aegis_join::JoinError::Rejected { status: 409, .. })),
+            "upload while off must be refused: {refused:?}"
+        );
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/diagnostics/start", Some(json!({"minutes": 61})))
+            .await;
+        assert_eq!(s, 400, "{v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/diagnostics/start", Some(json!({"minutes": 5})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["gateway"]["state"], "recording");
+        aegis_join::upload_diagnostics(&device_dir, &gz)
+            .await
+            .expect("signed upload accepted");
+        let (_, v) = c.call(reqwest::Method::GET, "/diagnostics", None).await;
+        assert_eq!(v["devices"][0]["name"], "laptop", "the registry names the sender");
+        let (s, v) = c
+            .call(reqwest::Method::GET, "/diagnostics/analysis", None)
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let ids: Vec<&str> = v["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .filter_map(|f| f["id"].as_str())
+            .collect();
+        assert!(ids.contains(&"device_tls_failed"), "{v}");
+        let (s, v) = c.call(reqwest::Method::GET, "/diagnostics/otlp", None).await;
+        assert_eq!(s, 200);
+        assert_eq!(v["resourceLogs"].as_array().map(Vec::len), Some(2), "gateway + device");
+        let (_, v) = c.call(reqwest::Method::POST, "/diagnostics/stop", None).await;
+        assert_eq!(v["gateway"]["state"], "stopped");
+        let (_, v) = c.call(reqwest::Method::POST, "/diagnostics/discard", None).await;
+        assert_eq!(v["gateway"]["state"], "off");
+        assert_eq!(v["devices"].as_array().map(Vec::len), Some(0));
+
         // Revoke: new sessions/streams are refused.
         let (_, v) = c.call(reqwest::Method::GET, "/devices", None).await;
         let id = v["items"][0]["id"].as_str().expect("id").to_owned();

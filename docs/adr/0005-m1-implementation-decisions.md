@@ -73,7 +73,7 @@ Route actions are role-checked:
 ## 8. Telemetry
 
 - No OTel SDK is linked. `coarse_export` is a hand-written OTLP/HTTP-JSON encoder for exactly the four catalog metrics, with exhaustive pre-serialization allowlisting. The scope name and SDK name are truthful but not product-identifying (`runtime.coarse`, `coarse-otlp-json`).
-- `local_diagnostic` is an in-memory ring of coded events (no destinations), at most 15 minutes, started only over local IPC. It is never persisted, so any restart disables it.
+- `local_diagnostic` is an in-memory ring of coded events (no destinations), at most 15 minutes, started only over local IPC. It is never persisted, so any restart disables it. *Superseded by [ADR-0008](0008-on-demand-diagnostics.md): up to 60 minutes, console and device toggles, size cap, OTLP/JSON export.*
 
 ## 9. Explicit non-implementations
 

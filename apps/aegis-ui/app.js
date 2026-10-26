@@ -189,6 +189,7 @@ function sections() {
   if (can("users:manage")) s.push(["users", "Users"]);
   if (can("system:configure")) s.push(["connectivity", "Connectivity"]);
   if (can("provision:read")) s.push(["integrations", "Integrations"]);
+  if (can("diagnostics:explain")) s.push(["diagnostics", "Diagnostics"]);
   if (can("profiles:read")) s.push(["configuration", "Advanced configuration"]);
   if (can("audit:read")) s.push(["audit", "Audit log"]);
   s.push(["account", "Account"]);
@@ -221,7 +222,7 @@ async function render() {
   const views = {
     overview: renderOverview, devices: renderDevices, users: renderUsers,
     connectivity: renderConnectivity, integrations: renderIntegrations,
-    configuration: renderConfiguration, audit: renderAudit, account: renderAccount,
+    configuration: renderConfiguration, diagnostics: renderDiagnostics, audit: renderAudit, account: renderAccount,
   };
   const fn = views[currentView] || renderAccount;
   await fn();
@@ -935,6 +936,123 @@ async function pollJob(jobId) {
     await new Promise((res) => setTimeout(res, 500));
   }
   notice("Still running; check again later.", true);
+}
+
+// ---------------------------------------------------------------- diagnostics
+
+/** @param {number} seconds */
+function mins(seconds) {
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  return m ? `${m} min ${s} s` : `${s} s`;
+}
+
+/** @param {number|null|undefined} unix */
+function at(unix) {
+  return unix ? new Date(unix * 1000).toLocaleTimeString() : "—";
+}
+
+async function renderDiagnostics() {
+  const v = root();
+  const { data } = await api("GET", "/diagnostics");
+  const g = data.gateway;
+  const lim = data.limits;
+  const status = g.state === "recording"
+    ? `Recording · ${mins(g.remaining_seconds || 0)} left · ${g.events} events`
+    : g.state === "stopped"
+      ? `Stopped at ${at(g.ends_unix)} · ${g.events} events · kept until ${at(g.discard_unix)}`
+      : "Off";
+
+  const controls = el("div", { class: "row" }, []);
+  if (g.state === "recording") {
+    const stop = button("Stop recording");
+    busy(stop, async () => { await api("POST", "/diagnostics/stop"); await renderDiagnostics(); });
+    controls.append(stop);
+  } else {
+    const minutes = /** @type {HTMLSelectElement} */ (el("select", { class: "inline", "aria-label": "Duration" },
+      [5, 15, 30, 60].filter((m) => m <= lim.max_minutes).map((m) => el("option", { value: String(m) }, [`${m} minutes`]))));
+    minutes.value = "15";
+    const start = button(g.state === "stopped" ? "Start a new recording" : "Start recording");
+    busy(start, async () => {
+      await api("POST", "/diagnostics/start", { body: { minutes: Number(minutes.value) } });
+      notice("Recording. Now start recording on the device too and reproduce the problem.");
+      await renderDiagnostics();
+    });
+    controls.append(el("span", {}, ["Record for"]), minutes, start);
+  }
+  if (g.state !== "off" || data.devices.length) {
+    const discard = button("Discard everything", "ghost");
+    busy(discard, async () => { await api("POST", "/diagnostics/discard"); notice("Diagnostics discarded."); await renderDiagnostics(); });
+    controls.append(discard);
+  }
+
+  v.append(card("Diagnostics", [
+    el("p", { class: "muted" }, [
+      `When something doesn't work, record what the gateway and the device see while you reproduce it, then read the analysis below. Off by default. A recording stops by itself after at most ${lim.max_minutes} minutes, is held in memory only (at most ${Math.round(lim.max_bytes / 1048576)} MB per recording, oldest events deleted first) and is dropped ${lim.retain_minutes} minutes after it ends. It holds connection events and error messages, never visited sites or traffic.`,
+    ]),
+    el("div", { class: "row" }, [el("strong", {}, ["Gateway: "]), pill(g.state === "recording" ? "running" : g.state === "stopped" ? "stopped" : "off"), el("span", { class: "muted" }, [status])]),
+    controls,
+    el("h3", {}, ["How to diagnose a device"]),
+    el("ol", { class: "steps" }, [
+      el("li", {}, ["Start recording here."]),
+      el("li", {}, ["On the device, open the AegisNet app → Troubleshooting → Start recording."]),
+      el("li", {}, ["Reproduce the problem, then press Stop and send in the app (it also sends by itself when its recording ends)."]),
+      el("li", {}, ["Read the analysis below. A device that can't reach this server can Save to file instead; import that file here."]),
+    ]),
+  ]));
+
+  // Device reports.
+  const rows = data.devices.map((/** @type {any} */ d) => el("tr", {}, [
+    el("td", {}, [d.name]), el("td", {}, [at(d.started_unix) + " – " + at(d.ended_unix)]),
+    el("td", {}, [String(d.events) + (d.dropped ? ` (+${d.dropped} older deleted)` : "")]), el("td", { class: "muted" }, [at(d.received_unix)]),
+  ]));
+  const file = /** @type {HTMLInputElement} */ (el("input", { type: "file", accept: ".json,.gz,application/json", "aria-label": "Report file" }));
+  const importBtn = button("Import report file", "ghost small");
+  busy(importBtn, async () => {
+    const f = file.files && file.files[0];
+    if (!f) throw new Error("Choose the report file the device saved first.");
+    /** @type {Record<string,string>} */
+    const headers = { "Content-Type": "application/octet-stream", Accept: "application/json" };
+    if (session.csrf) headers["X-CSRF-Token"] = session.csrf;
+    const resp = await fetch("/api/v1/diagnostics/devices", { method: "POST", headers, body: await f.arrayBuffer(), credentials: "same-origin" });
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.detail || friendly(e.aegis_error_code || String(resp.status)));
+    }
+    notice("Report imported.");
+    await renderDiagnostics();
+  });
+  v.append(card("Device reports", [
+    data.devices.length
+      ? el("table", {}, [el("thead", {}, [el("tr", {}, [el("th", {}, ["Device"]), el("th", {}, ["Recorded"]), el("th", {}, ["Events"]), el("th", {}, ["Received"])])]), el("tbody", {}, rows)])
+      : el("p", { class: "muted" }, [g.state === "off" ? "Devices can send reports while diagnostics are on." : "No device has sent a report yet."]),
+    el("div", { class: "row" }, [file, importBtn]),
+  ]));
+
+  // Analysis.
+  if (g.state !== "off" || data.devices.length) {
+    const { data: a } = await api("GET", "/diagnostics/analysis");
+    const items = a.findings.map((/** @type {any} */ f) => {
+      const cls = f.severity === "error" ? "bad" : f.severity === "warn" ? "warn" : "ok";
+      return el("div", { class: "report " + (cls === "bad" ? "bad" : cls === "ok" ? "ok" : "") }, [
+        el("div", { class: "row spread" }, [el("strong", {}, [f.title]), el("span", { class: "pill " + cls }, [f.severity])]),
+        f.detail ? el("p", {}, [f.detail]) : null,
+        el("p", {}, [el("strong", {}, ["What to do: "]), f.action]),
+        f.evidence.length ? el("p", { class: "muted small mono" }, [f.evidence.join(" · ")]) : null,
+      ]);
+    });
+    const exp = button("Download as OpenTelemetry logs (OTLP/JSON)", "ghost small");
+    busy(exp, async () => {
+      const resp = await fetch("/api/v1/diagnostics/otlp", { credentials: "same-origin" });
+      if (!resp.ok) throw new Error("Nothing to download yet.");
+      download("aegisnet-diagnostics.otlp.json", await resp.text(), "application/json");
+    });
+    v.append(card("Analysis", [...items, el("div", { class: "row" }, [exp])]));
+  }
+
+  // Refresh while recording so arriving device reports and the analysis show up.
+  if (g.state === "recording") {
+    pollTimer = window.setTimeout(() => { if (currentView === "diagnostics") renderDiagnostics().catch(() => {}); }, 5000);
+  }
 }
 
 // ---------------------------------------------------------------- audit

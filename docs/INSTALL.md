@@ -190,4 +190,5 @@ Add `--native` if it was installed with `--native`. Removing AegisNet does not d
 | Browser can't reach the console | With `--local-console`, use the SSH command. Otherwise, check the provider's firewall for TCP 8443 |
 | Cloudflare status `failed` | The error text says why (missing token permission, existing DNS name, connector blocked). Fix it, paste the token and press **Retry setup**; nothing is duplicated |
 | Client says "Cannot reach the server" | Check the device port is open (direct mode), the Cloudflare status (tunnel mode), or whether the device was removed in **Devices** |
-| Logs | `docker logs aegis`. The gateway logs almost nothing by design; status is in the console |
+| Anything else, or the cause isn't clear | Record it: console **Diagnostics** plus **Troubleshooting** in the client app, then read the analysis. See [DIAGNOSTICS.md](DIAGNOSTICS.md) |
+| Logs | `docker logs aegis`. The gateway keeps no logs by design; status is in the console, and diagnostics record on demand (see above) |

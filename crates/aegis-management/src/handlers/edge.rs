@@ -193,48 +193,54 @@ pub(crate) async fn renew_self(ctx: &Ctx, body: Value) -> Result<Value, ApiError
     let c = ctx.clone();
     blocking(move || {
         let _permit = permit;
-        // Authenticate the presented certificate exactly as the data plane
-        // would: chain to the device trust anchor, then registry lookup.
-        let peer = aegis_identity::tls::validate_client_certificate(&b.certificate_pem, &anchor)
-            .map_err(|_| ApiError::unauthenticated().detail("certificate not trusted"))?;
-        let der = parse_certs(&b.certificate_pem).map_err(|_| ApiError::bad_request("invalid_certificate"))?;
+        let device = authenticate_device(&c, &anchor, &b.certificate_pem)?;
+        let (node_id, name, der) = (device.node_id, device.name, device.der);
         let store = c.coord.store();
-        let fp = peer.fingerprint_hex();
-        let row = store.read(|conn| {
-            Ok(conn.query_row(
-                "SELECT n.id, n.name, n.role, n.status, i.not_after FROM trusted_identities i JOIN nodes n ON n.id = i.node_id WHERE i.fingerprint = ?1 AND i.status = 'active'",
-                [&fp],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?)),
-            ).optional()?)
-        })?;
-        let Some((node_id, name, role, status, not_after)) = row else {
-            return Err(ApiError::unauthenticated().detail("device is not enrolled or was revoked"));
-        };
-        if status != "active" && status != "rotating" || not_after <= db::now_unix() || name != peer.node_id {
-            return Err(ApiError::unauthenticated().detail("device is not enrolled or was revoked"));
-        }
-        if role != "client" {
-            return Err(ApiError::forbidden().detail("only client devices renew here"));
-        }
-        let cert = pki::sign_renewal_csr(&ca, &b.csr_pem, der[0].as_ref(), &name, Role::Client, &[], pki::DEFAULT_NODE_VALIDITY)
-            .map_err(|_| ApiError::bad_request("invalid_csr"))?;
+        let cert = pki::sign_renewal_csr(
+            &ca,
+            &b.csr_pem,
+            &der,
+            &name,
+            Role::Client,
+            &[],
+            pki::DEFAULT_NODE_VALIDITY,
+        )
+        .map_err(|_| ApiError::bad_request("invalid_csr"))?;
         let new = parse_certs(&cert).map_err(|_| ApiError::unavailable())?;
         let next = PeerIdentity::from_der(new[0].as_ref()).map_err(|_| ApiError::unavailable())?;
         store.tx(|c| {
-            db::rotate_node_certificate(c, &node_id, &next.fingerprint_hex(), &next.serial_hex, next.not_after)?;
-            db::insert_identity(c, &next.fingerprint_hex(), &node_id, &next.serial_hex, next.not_before, next.not_after)?;
+            db::rotate_node_certificate(
+                c,
+                &node_id,
+                &next.fingerprint_hex(),
+                &next.serial_hex,
+                next.not_after,
+            )?;
+            db::insert_identity(
+                c,
+                &next.fingerprint_hex(),
+                &node_id,
+                &next.serial_hex,
+                next.not_before,
+                next.not_after,
+            )?;
             db::bump_epoch(c)?;
-            db::append_audit(c, AuditInsert {
-                actor_id: None,
-                action: "identity.self_renew",
-                target_type: "node",
-                target_id: Some(&node_id),
-                decision: "allowed",
-                revision_digest: None,
-                metadata: json!({}),
-            })
+            db::append_audit(
+                c,
+                AuditInsert {
+                    actor_id: None,
+                    action: "identity.self_renew",
+                    target_type: "node",
+                    target_id: Some(&node_id),
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata: json!({}),
+                },
+            )
         })?;
-        c.coord.refresh_identities().map_err(|_| ApiError::unavailable())?;
+        c.coord
+            .refresh_identities()
+            .map_err(|_| ApiError::unavailable())?;
         Ok(json!({
             "node_id": node_id,
             "certificate_pem": format!("{cert}{}", ca.cert_pem),
@@ -243,6 +249,69 @@ pub(crate) async fn renew_self(ctx: &Ctx, body: Value) -> Result<Value, ApiError
         }))
     })
     .await
+}
+
+/// A client device authenticated by its certificate.
+pub(crate) struct Device {
+    pub node_id: String,
+    pub name: String,
+    /// Leaf certificate DER.
+    pub der: Vec<u8>,
+}
+
+/// Authenticate a presented device certificate exactly as the data plane
+/// would: chain to the device trust anchor, then registry lookup. Blocking.
+pub(crate) fn authenticate_device(
+    ctx: &ManagementContext,
+    anchor: &str,
+    certificate_pem: &str,
+) -> Result<Device, ApiError> {
+    let peer = aegis_identity::tls::validate_client_certificate(certificate_pem, anchor)
+        .map_err(|_| ApiError::unauthenticated().detail("certificate not trusted"))?;
+    let der =
+        parse_certs(certificate_pem).map_err(|_| ApiError::bad_request("invalid_certificate"))?;
+    let fp = peer.fingerprint_hex();
+    let row = ctx.coord.store().read(|conn| {
+        Ok(conn.query_row(
+            "SELECT n.id, n.name, n.role, n.status, i.not_after FROM trusted_identities i JOIN nodes n ON n.id = i.node_id WHERE i.fingerprint = ?1 AND i.status = 'active'",
+            [&fp],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?)),
+        ).optional()?)
+    })?;
+    let Some((node_id, name, role, status, not_after)) = row else {
+        return Err(ApiError::unauthenticated().detail("device is not enrolled or was revoked"));
+    };
+    if status != "active" && status != "rotating"
+        || not_after <= db::now_unix()
+        || name != peer.node_id
+    {
+        return Err(ApiError::unauthenticated().detail("device is not enrolled or was revoked"));
+    }
+    if role != "client" {
+        return Err(ApiError::forbidden().detail("only client devices renew here"));
+    }
+    Ok(Device {
+        node_id,
+        name,
+        der: der[0].as_ref().to_vec(),
+    })
+}
+
+/// Note a failed edge request in a running diagnostics recording.
+fn note_failure(ctx: &ManagementContext, request: &str, result: &Result<Value, ApiError>) {
+    if let Err(e) = result {
+        if ctx.diagnostics.is_recording() {
+            let error = match &e.detail {
+                Some(d) => format!("{}: {d}", e.code),
+                None => e.code.to_string(),
+            };
+            ctx.diagnostics.note(
+                aegis_telemetry::Severity::Warn,
+                "edge.failed",
+                &[("request", request), ("error", &error)],
+            );
+        }
+    }
 }
 
 fn respond(result: Result<Value, ApiError>, ok: u16) -> (u16, Vec<u8>) {
@@ -267,14 +336,23 @@ pub async fn edge_enroll(ctx: Arc<ManagementContext>, body: Vec<u8>) -> (u16, Ve
         Ok(b) => redeem(&ctx, b, false).await,
         Err(e) => Err(e),
     };
+    note_failure(&ctx, "enroll", &result);
     respond(result, 201)
 }
 
-/// Data-plane edge entry: `POST /renew` with certificate + same-key CSR.
+/// Data-plane edge entry for device-authenticated requests: `POST /renew`
+/// with certificate + same-key CSR, or with a signed diagnostic report
+/// (`diagnostic_report_gz`). Reports share this path so existing tunnel
+/// ingress rules keep matching.
 pub async fn edge_renew(ctx: Arc<ManagementContext>, body: Vec<u8>) -> (u16, Vec<u8>) {
-    let result = match serde_json::from_slice::<Value>(&body) {
-        Ok(v) => renew_self(&ctx, v).await,
-        Err(_) => Err(ApiError::bad_request("invalid_body")),
+    let (request, result) = match serde_json::from_slice::<Value>(&body) {
+        Ok(v) if v.get("diagnostic_report_gz").is_some() => (
+            "diagnostic_report",
+            super::diagnostics::device_report(&ctx, v).await,
+        ),
+        Ok(v) => ("renew", renew_self(&ctx, v).await),
+        Err(_) => ("renew", Err(ApiError::bad_request("invalid_body"))),
     };
+    note_failure(&ctx, request, &result);
     respond(result, 200)
 }

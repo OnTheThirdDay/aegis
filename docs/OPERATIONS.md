@@ -112,10 +112,14 @@ Telemetry is off by default. To opt in to the four coarse metrics:
 
 Only `https://` collectors are accepted.
 
-Local diagnostics:
+On-demand diagnostics:
 
 ```sh
-aegisctl diagnostic start --minutes 10
+aegisctl diagnostic start --minutes 15     # or console → Diagnostics
 ```
 
-This is limited to 15 minutes, held in memory only, and never exported.
+- **Limits:** a recording lasts at most 60 minutes and stops by itself. It is held in memory only, capped at 5 MiB with the oldest records deleted first, and dropped 60 minutes after it ends.
+- **Devices:** devices can send their own signed report while it is on.
+- **Analysis and export:** the console explains the findings and exports everything as OTLP/JSON logs.
+
+See [DIAGNOSTICS.md](DIAGNOSTICS.md).
