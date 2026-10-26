@@ -63,6 +63,9 @@ pub struct ManagementContext {
     /// HTTPS console reachable beyond loopback: Host may be any address the
     /// operator uses, and Origin must then equal `https://<Host>`.
     remote_console: AtomicBool,
+    /// Installed with `--tunnel-only`: the device port is not reachable from
+    /// the network, so devices can only use Cloudflare Tunnel.
+    tunnel_only: AtomicBool,
     pub(crate) console_tls: Mutex<Option<Arc<console::ConsoleTls>>>,
     /// Appliance services (integrations, certificate lifecycle) installed by
     /// the composition root; absent on hand-configured nodes.
@@ -148,6 +151,7 @@ impl ManagementContext {
             certificate_reload: Mutex::new(None),
             data_dir: Mutex::new(None),
             remote_console: AtomicBool::new(false),
+            tunnel_only: AtomicBool::new(false),
             console_tls: Mutex::new(None),
             appliance: Mutex::new(None),
             downloads_dir: Mutex::new(None),
@@ -180,6 +184,14 @@ impl ManagementContext {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn set_tunnel_only(&self, on: bool) {
+        self.tunnel_only.store(on, Ordering::Relaxed);
+    }
+
+    pub fn tunnel_only(&self) -> bool {
+        self.tunnel_only.load(Ordering::Relaxed)
     }
 
     pub(crate) fn remote_console(&self) -> bool {

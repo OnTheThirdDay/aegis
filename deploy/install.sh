@@ -313,6 +313,7 @@ docker_install() {
       --pids-limit 256 --memory 512m --tmpfs /tmp:rw,noexec,nosuid,size=16m \
       -v "$NAME-data:/var/lib/aegisnet" \
       -e AEGIS_PUBLIC_ADDRESSES="$addrs" -e AEGIS_PUBLIC_PORT="$EDGE_PORT" \
+      -e AEGIS_TUNNEL_ONLY="$TUNNEL_ONLY" \
       -p "$console_bind:$CONSOLE_PORT:8443" -p "$edge_bind:$EDGE_PORT:8444" $1 \
       "$IMAGE" >/dev/null 2>"$err"
   }

@@ -222,6 +222,8 @@ Removing AegisNet does not delete its Cloudflare tunnel. To remove the tunnel an
 | `could not pull ghcr.io/…` | No internet from the server, or a wrong `--version` |
 | Browser can't reach the console | Server on the internet: use the SSH command from step 3 and browse to `https://localhost:<port>`. Home server: check the console port the installer printed |
 | Cloudflare status `failed` | The error text says why (missing token permission, existing DNS name, connector blocked). Fix it, paste the token and press **Retry setup**; nothing is duplicated |
+| Cloudflare status `active` with "not verified from this server" | Cloudflare reports the tunnel healthy, but the server couldn't connect to its own public address to test it (its network blocks or filters Cloudflare). Devices elsewhere still work: connect one to confirm. **Test again** re-runs the check |
+| "Accepts devices only through Cloudflare Tunnel" when inviting | The gateway was installed with `--tunnel-only`. Finish **Connectivity → Cloudflare Tunnel** until it's active, then invite |
 | Client says "Cannot reach the server" | Check the device port is open (direct mode), the Cloudflare status (tunnel mode), or whether the device was removed in **Devices** |
 | Anything else, or the cause isn't clear | Record it: console **Diagnostics** plus **Troubleshooting** in the client app, then read the analysis. See [DIAGNOSTICS.md](DIAGNOSTICS.md) |
 | Logs | `docker logs aegis`. The gateway keeps no logs by design; status is in the console, and diagnostics record on demand (see above) |

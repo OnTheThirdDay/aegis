@@ -151,6 +151,64 @@ async fn active_requires_real_probe_evidence_and_reapply_has_no_host_mutation() 
         "stale_provision_plan"
     );
 }
+/// The host itself can't reach its public endpoint; everything else is fine.
+struct Unreachable;
+impl Probe for Unreachable {
+    fn verify<'a>(&'a self, _: &'a Plan) -> StepFuture<'a, Verification> {
+        Box::pin(async { Err(Error(DATA_PATH_UNVERIFIED_FROM_HOST)) })
+    }
+}
+
+#[tokio::test]
+async fn unreachable_from_host_commits_flagged_unverified() {
+    let c = Controller::new(Arc::new(Store::open_in_memory().expect("db")));
+    let p = c.plan(desired(), "owner", None).expect("plan");
+    let host = Host {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    };
+    let active = c
+        .apply(
+            &p.id,
+            "owner",
+            &p.etag(),
+            None,
+            &NoProvider,
+            &host,
+            &Unreachable,
+        )
+        .await
+        .expect("committed despite the host-side test");
+    assert_eq!(active.state, PlanState::Active);
+    assert!(
+        !active.inventory.verified,
+        "never claims a verified data path"
+    );
+    assert_eq!(
+        active.error_code.as_deref(),
+        Some(DATA_PATH_UNVERIFIED_FROM_HOST)
+    );
+    // A later full verification marks nothing unverified any more; a
+    // re-test that still can't reach the endpoint reports it and stays active.
+    let again = c
+        .apply(
+            &p.id,
+            "owner",
+            &active.etag(),
+            Some("verified-runtime-revision"),
+            &NoProvider,
+            &host,
+            &Unreachable,
+        )
+        .await
+        .expect_err("re-test reports the condition");
+    assert_eq!(again.0, DATA_PATH_UNVERIFIED_FROM_HOST);
+    assert_eq!(
+        c.get(&p.id, "owner").expect("plan").state,
+        PlanState::Active
+    );
+}
+
 #[tokio::test]
 async fn failures_survive_reopen_and_do_not_claim_rollback_or_active() {
     let dir = tempfile::tempdir().expect("temp");

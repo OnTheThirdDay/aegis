@@ -133,6 +133,11 @@ fn endpoint(host: &str, port: u16, path: &str, scheme: &str) -> String {
 /// of an invitation. Devices fetch it on connect to follow address changes.
 pub(crate) fn current_endpoint(ctx: &ManagementContext) -> Result<Value, ApiError> {
     let conn = connection(ctx)?;
+    if ctx.tunnel_only() && conn.mode.as_deref() != Some("cloudflare") {
+        return Err(ApiError::conflict("tunnel_not_ready").detail(
+            "this gateway accepts devices only through Cloudflare Tunnel; finish setting it up under Connectivity first, and invitations will point at the tunnel's hostname",
+        ));
+    }
     let host = conn
         .public_host
         .clone()

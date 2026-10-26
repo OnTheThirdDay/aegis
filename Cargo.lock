@@ -373,6 +373,7 @@ dependencies = [
  "aegis-config",
  "aegis-contracts",
  "aegis-core",
+ "aegis-dns",
  "aegis-identity",
  "aegis-join",
  "aegis-management",

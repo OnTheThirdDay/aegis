@@ -69,6 +69,15 @@ impl Tunnel {
                 url: ob.url.clone().unwrap_or_default(),
                 outer_ca_pem,
                 outer_server_name: ob.outer_server_name.clone(),
+                connect_addresses: {
+                    let port = aegis_transport_ws::parse_url(ob.url.as_deref().unwrap_or(""))
+                        .map(|u| u.port)
+                        .unwrap_or(443);
+                    ob.connect_addresses
+                        .iter()
+                        .filter_map(|a| aegis_config::connect_address(a, port))
+                        .collect()
+                },
                 connect_timeout: Duration::from_millis(u64::from(c.connect_timeout_ms)),
                 handshake_timeout: Duration::from_millis(u64::from(c.tls_handshake_timeout_ms)),
                 max_message_bytes: 128 * 1024,
@@ -127,13 +136,22 @@ impl Tunnel {
 
     /// Note why an attempt failed for on-demand diagnostics (a no-op unless
     /// a recording is running).
-    fn note_failure(&self, stage: &str, reason: ReasonGroup, error: &dyn std::fmt::Display) {
+    /// `kind` refines the WebSocket stage: `connect`/`timeout` (nothing
+    /// answered), `tls`, `http` (an HTTP status instead of an upgrade).
+    fn note_failure(
+        &self,
+        stage: &str,
+        kind: &str,
+        reason: ReasonGroup,
+        error: &dyn std::fmt::Display,
+    ) {
         if let Some(d) = self.obs.diagnostics().filter(|d| d.is_recording()) {
             d.note(
                 Severity::Warn,
                 "client.connect.failed",
                 &[
                     ("stage", stage),
+                    ("kind", kind),
                     ("reason", reason.as_str()),
                     ("error", &error.to_string()),
                 ],
@@ -144,7 +162,14 @@ impl Tunnel {
     async fn connect_once(&self) -> Result<Session, ReasonGroup> {
         let started = Instant::now();
         let ws = aegis_transport_ws::connect(&self.ws).await.map_err(|e| {
-            self.note_failure("websocket", ReasonGroup::Transport, &e);
+            let kind = match &e {
+                aegis_transport_ws::WsError::Connect(_) => "connect",
+                aegis_transport_ws::WsError::Timeout => "timeout",
+                aegis_transport_ws::WsError::Tls(_) => "tls",
+                aegis_transport_ws::WsError::Handshake(_) => "http",
+                _ => "config",
+            };
+            self.note_failure("websocket", kind, ReasonGroup::Transport, &e);
             ReasonGroup::Transport
         })?;
         let (tls_stream, gateway) = tls::connect(
@@ -155,7 +180,7 @@ impl Tunnel {
         )
         .await
         .map_err(|e| {
-            self.note_failure("tls", ReasonGroup::Tls, &e);
+            self.note_failure("tls", "inner", ReasonGroup::Tls, &e);
             ReasonGroup::Tls
         })?;
         let obs: Arc<dyn Observability> = self.obs.clone();
@@ -169,7 +194,7 @@ impl Tunnel {
         )
         .await
         .map_err(|e| {
-            self.note_failure("session", e.reason_group(), &e);
+            self.note_failure("session", "agp", e.reason_group(), &e);
             e.reason_group()
         })?;
         self.obs.record(Event::HandshakeDuration {

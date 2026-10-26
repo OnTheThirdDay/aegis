@@ -8,6 +8,7 @@ fn client(url: String) -> WsClientConfig {
         url,
         outer_ca_pem: None,
         outer_server_name: None,
+        connect_addresses: Vec::new(),
         connect_timeout: Duration::from_secs(5),
         handshake_timeout: Duration::from_secs(5),
         max_message_bytes: 128 * 1024,
@@ -50,6 +51,33 @@ async fn ordered_bytes_survive_message_framing() {
     writer.await.expect("join");
     assert_eq!(got, expected);
     server.await.expect("join").expect("server ok");
+}
+
+#[tokio::test]
+async fn connect_addresses_replace_name_resolution() {
+    let (port, server) = echo_server(WsServerConfig::default()).await;
+    // The URL host does not resolve; the pinned address is used instead,
+    // after a dead one, and the URL host still goes into the Host header.
+    let mut cfg = client(format!("ws://gateway.invalid:{port}/agp"));
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead_addr = dead.local_addr().expect("addr");
+    drop(dead);
+    cfg.connect_addresses = vec![
+        dead_addr,
+        format!("127.0.0.1:{port}").parse().expect("addr"),
+    ];
+    let ws = connect(&cfg).await.expect("connect via pinned address");
+    let (mut r, mut w) = tokio::io::split(ws);
+    w.write_all(b"ping").await.expect("write");
+    w.shutdown().await.expect("close");
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).await.expect("read");
+    assert_eq!(got, b"ping");
+    server.await.expect("join").expect("server ok");
+    // Without pinning, the same URL fails to resolve.
+    assert!(connect(&client(format!("ws://gateway.invalid:{port}/agp")))
+        .await
+        .is_err());
 }
 
 #[tokio::test]
