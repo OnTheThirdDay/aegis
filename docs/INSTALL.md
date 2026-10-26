@@ -27,20 +27,13 @@ docker --version || curl -fsSL https://get.docker.com | sudo sh
 
 On macOS, install Docker Desktop and make sure it's running. Enable *Start Docker Desktop when you sign in*, so the gateway comes back after a reboot.
 
-**Check which ports are already taken:**
+**Ports:** you don't need to check them. The installer uses these defaults and, when one is already taken (for example by nginx in a v2ray + nginx setup), picks a free one instead and shows it in its summary. Existing v2ray, nginx and cloudflared services are never modified.
 
-```sh
-sudo ss -ltnp | grep -E ':(80|443|8443)\b'        # Linux
-sudo lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(80|443|8443) '   # macOS
-```
-
-| Port | Used by AegisNet for | Option to change it |
-|---|---|---|
-| 8443 | the HTTPS web console | `--console-port N` |
-| 443 | devices connecting to the gateway | `--port N` |
-| 80 | Let's Encrypt HTTP validation (only during issuance) | `--http-port N` (`0` = don't use) |
-
-**If nginx (or another web server) already uses 80 and 443**, as it does with a typical v2ray + nginx setup, use `--port 8444 --http-port 0` in step 2. AegisNet then leaves both ports alone. Existing v2ray, nginx and cloudflared services are never modified.
+| Port | Used by AegisNet for | If taken | Option to set it |
+|---|---|---|---|
+| 8443 | the HTTPS web console | 8453, 8463, 9443 | `--console-port N` |
+| 443 | devices connecting directly | 8444, 8454, 9444 | `--port N` |
+| 80 | Let's Encrypt HTTP validation (only during issuance) | not used | `--http-port N` (`0` = don't use) |
 
 ## 2. Install
 
@@ -54,21 +47,30 @@ Pick the line that matches your server. Upgrades read these settings back from t
 
 | Situation | Command |
 |---|---|
-| Home or LAN server, ports 80/443 free | `sudo sh install.sh` |
-| Public server (VPS), ports free | `sudo sh install.sh --local-console --address <public-ip>` |
-| Public server already running nginx/v2ray | `sudo sh install.sh --port 8444 --http-port 0 --local-console --address <public-ip>` |
+| Public server (VPS), with or without nginx/v2ray: **recommended** | `sudo sh install.sh --tunnel-only` |
+| Public server, devices connect directly (no Cloudflare) | `sudo sh install.sh --local-console --address <public-ip>` |
+| Home or LAN server | `sudo sh install.sh` |
 | Linux without Docker | add `--native` to any line above (systemd service; not yet tested on a real distribution) |
+
+**`--tunnel-only` exposes nothing to the internet, at any point:**
+
+- The console listens on the server itself only; you reach it over SSH (step 3).
+- The device port is bound to the server itself too.
+- No port 80 is used.
+
+Devices then connect through the Cloudflare Tunnel you create in step 4 (option A), which connects outbound. A port scan of the server finds nothing, and the server's IP stays hidden behind Cloudflare. Option B (direct connection) doesn't work in this mode; reinstall with `--direct` to switch.
 
 **Options:**
 
 - **`--address`**: the public IP or DNS name people use to reach this server. It goes into the server's certificates. On cloud VMs the network card usually only knows a private address, so give the public one here; you can list several separated by commas.
-- **`--local-console`**: the admin console is reachable only from the server itself; see step 3.
+- **`--local-console`**: the admin console is reachable only from the server itself; see step 3. Implied by `--tunnel-only`.
 - **`--name NAME`**: run a second, separate instance (its own container and data).
 - **`--version vX.Y.Z`**: install a specific release instead of the newest.
 
 The installer checks Docker, pulls the release image (pinned to an exact digest), starts it hardened and waits until it is healthy. It then prints:
 
-- **the console address:** with `--local-console`, the SSH command to use instead (see step 3);
+- **the ports it chose** and whether each is reachable from the network or from the server only;
+- **the console address:** with `--local-console` or `--tunnel-only`, the SSH command to use instead (see step 3);
 - **the one-time admin password:** `admin` / `xxxxx-xxxxx-xxxxx-xxxxx`;
 - **the console certificate's SHA-256 fingerprint.**
 
@@ -83,13 +85,13 @@ sudo aegisctl initial-password --data-dir /var/lib/aegis              # --native
 
 **Server installed without `--local-console`** (home/LAN): open `https://<server-address>:8443` in a browser.
 
-**Server installed with `--local-console`** (recommended for public servers): the console only listens on the server itself. Reach it through SSH from your computer:
+**Server installed with `--tunnel-only` or `--local-console`** (public servers): the console only listens on the server itself. Reach it through SSH from your computer, using the console port the installer printed (8443 unless it was taken):
 
 ```sh
-ssh -L 8443:127.0.0.1:8443 <user>@<server>
+ssh -L 8443:127.0.0.1:8443 <user>@<server>          # or 8453:127.0.0.1:8453, …
 ```
 
-Keep that session open and browse to **https://localhost:8443**. The console is never exposed to the internet this way.
+Keep that session open and browse to **https://localhost:8443** (or the port you forwarded). The console is never exposed to the internet this way.
 
 **The first time, the browser warns** that the certificate isn't trusted. That's expected: the server made its own certificate. Compare the fingerprint the installer printed with the certificate's fingerprint in the browser (click the warning, then view the certificate), then continue. To get rid of the warning permanently, download the web CA under **Account → Trust this console** and install it on your computer.
 
@@ -113,7 +115,7 @@ Keep that session open and browse to **https://localhost:8443**. The console is 
 
    **Option B: direct connection** (LAN, or a public server without Cloudflare)
 
-   1. Enter the server's address (IP or DNS name) and the device port (443, or 8444 if you used `--port 8444`), then press **Use this address**.
+   1. Enter the server's address (IP or DNS name) and the device port the installer printed (443 unless it was taken), then press **Use this address**.
    2. For a public server, open that TCP port in the cloud provider's firewall or security group.
 
    Devices trust the server through the invitation, so no public certificate is needed.
@@ -150,7 +152,7 @@ curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/inst
 sudo sh install.sh                  # add --name NAME / --native if you installed with them
 ```
 
-The installer reads the current settings from the running gateway (ports, addresses, whether the console is local only), prints them, and keeps them. To change one, pass just that option, for example `--port 8444`; use `--public-console` to undo `--local-console`, and `--fresh` to ignore the old settings and use the defaults.
+The installer reads the current settings from the running gateway (ports, addresses, whether the console and device port are local only), prints them, and keeps them. To change one, pass just that option, for example `--port 8444`; `--public-console` undoes `--local-console`, `--direct` undoes `--tunnel-only`, and `--fresh` ignores the old settings. With `--native`, port and exposure changes only take effect on a new data directory, because the gateway writes them into its configuration at first start.
 
 What the upgrade keeps and changes:
 

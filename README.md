@@ -15,7 +15,7 @@ AegisNet is a security-first modular proxy engine written in Rust. It implements
 
 ```sh
 curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
-sudo sh install.sh              # Docker; add --native for a Linux systemd service
+sudo sh install.sh              # Docker; add --tunnel-only on a public server, --native for systemd
 ```
 
 **Step-by-step guide** (servers that already run nginx/v2ray/Cloudflare, public servers, setup, upgrades): [docs/INSTALL.md](docs/INSTALL.md).

@@ -135,6 +135,8 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
             public_addresses: vec!["127.0.0.1".into()],
             public_port: Some(edge_port),
             console_loopback: true,
+            // Tunnel-only exposure: the device edge listens on loopback.
+            edge_loopback: true,
             console_port: Some(console_port),
             edge_port: Some(edge_port),
             tunnel_port: Some(0),

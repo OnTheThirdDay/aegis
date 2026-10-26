@@ -9,11 +9,21 @@
 # release binaries, verifies SHA256SUMS and installs a hardened service.
 # Then open the printed console URL and finish setup in the browser.
 #
+# Public servers: --tunnel-only exposes nothing to the internet. The console
+# listens on this machine only (reach it with ssh -L) and devices arrive
+# through the Cloudflare Tunnel you set up in the console.
+#
+# Ports that are not given and already in use (nginx, v2ray, ...) are
+# replaced by free ones automatically; the summary shows which.
+#
 # Upgrading: run the newest install.sh again (with --name / --native if the
-# instance was installed with them). Ports, addresses and console exposure
-# are read back from the running instance; options given now override them.
+# instance was installed with them). Ports, addresses and exposure are read
+# back from the running instance; options given now override them.
 #
 # Options:
+#   --tunnel-only      nothing public: console and device port on this machine
+#                      only, no HTTP-01 port; devices use Cloudflare Tunnel
+#   --direct           undo --tunnel-only on an upgrade
 #   --console-port N   host port of the HTTPS console        (default 8443)
 #   --port N           host port devices connect to           (default 443)
 #   --http-port N      host port for Let's Encrypt HTTP-01    (default 80; 0 = none)
@@ -42,6 +52,7 @@ EDGE_PORT=""
 HTTP_PORT=""
 ADDRESSES=""
 LOCAL_CONSOLE=""
+TUNNEL_ONLY=""
 FRESH=0
 MODE=docker
 UNINSTALL=0
@@ -61,6 +72,8 @@ while [ $# -gt 0 ]; do
     --address) ADDRESSES=${2:?}; shift 2 ;;
     --local-console) LOCAL_CONSOLE=1; shift ;;
     --public-console) LOCAL_CONSOLE=0; shift ;;
+    --tunnel-only) TUNNEL_ONLY=1; shift ;;
+    --direct) TUNNEL_ONLY=0; shift ;;
     --fresh) FRESH=1; shift ;;
     --name) NAME=${2:?}; shift 2 ;;
     --version) VERSION=${2:?}; shift 2 ;;
@@ -69,7 +82,7 @@ while [ $# -gt 0 ]; do
     --native) MODE=native; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
-    -h|--help) sed -n '2,31p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,40p' "$0" 2>/dev/null || true; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
@@ -95,7 +108,11 @@ recall_docker() {
         if [ -z "$LOCAL_CONSOLE" ]; then
           if [ "$host_ip" = 127.0.0.1 ]; then LOCAL_CONSOLE=1; else LOCAL_CONSOLE=0; fi
         fi ;;
-      8444/tcp) if [ -z "$EDGE_PORT" ]; then EDGE_PORT=$host_port; fi ;;
+      8444/tcp)
+        if [ -z "$EDGE_PORT" ]; then EDGE_PORT=$host_port; fi
+        if [ -z "$TUNNEL_ONLY" ]; then
+          if [ "$host_ip" = 127.0.0.1 ]; then TUNNEL_ONLY=1; else TUNNEL_ONLY=0; fi
+        fi ;;
       8080/tcp) http_seen=1; if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$host_port; fi ;;
     esac
   done
@@ -116,21 +133,77 @@ recall_native() {
   if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$(env_of AEGIS_HTTP_PORT); fi
   if [ -z "$ADDRESSES" ]; then ADDRESSES=$(env_of AEGIS_PUBLIC_ADDRESSES); fi
   if [ -z "$LOCAL_CONSOLE" ]; then LOCAL_CONSOLE=$(env_of AEGIS_CONSOLE_LOOPBACK); fi
+  if [ -z "$TUNNEL_ONLY" ]; then TUNNEL_ONLY=$(env_of AEGIS_EDGE_LOOPBACK); fi
   RECALLED=1
+}
+
+instance_exists() {
+  if [ "$MODE" = native ]; then [ -f "/etc/systemd/system/$NAME.service" ]
+  else command -v docker >/dev/null 2>&1 && docker inspect "$NAME" >/dev/null 2>&1; fi
+}
+
+# Whether something on this machine already listens on TCP port $1. Without
+# a tool to ask, assume free (the start then fails with a clear message).
+port_busy() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -an 2>/dev/null | grep -i listen | awk '{print $4}' | grep -qE "[:.]$1\$"
+  else
+    return 1
+  fi
+}
+
+# First free port of the candidates (the first one when none is free).
+pick_port() {
+  for candidate in "$@"; do
+    if ! port_busy "$candidate"; then printf '%s' "$candidate"; return; fi
+  done
+  printf '%s' "$1"
 }
 
 if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then
   if [ "$MODE" = native ]; then recall_native; else recall_docker; fi
 fi
-[ -n "$CONSOLE_PORT" ] || CONSOLE_PORT=8443
-[ -n "$EDGE_PORT" ] || EDGE_PORT=443
-[ -n "$HTTP_PORT" ] || HTTP_PORT=80
+[ -n "$TUNNEL_ONLY" ] || TUNNEL_ONLY=0
+if [ "$TUNNEL_ONLY" = 1 ]; then
+  # Nothing public: the console needs ssh -L, and HTTP-01 can't reach us.
+  [ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=1
+  [ -n "$HTTP_PORT" ] || HTTP_PORT=0
+fi
 [ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=0
-if [ "$RECALLED" = 1 ]; then
+# Defaults, skipping ports another service already uses. Not on an upgrade
+# or reinstall of this instance: its own ports would look taken.
+auto=0
+if [ "$UNINSTALL" = 0 ] && ! instance_exists; then auto=1; fi
+if [ -z "$CONSOLE_PORT" ]; then
+  if [ "$auto" = 1 ]; then CONSOLE_PORT=$(pick_port 8443 8453 8463 9443); else CONSOLE_PORT=8443; fi
+fi
+if [ -z "$EDGE_PORT" ]; then
+  if [ "$auto" = 1 ]; then EDGE_PORT=$(pick_port 443 8444 8454 9444); else EDGE_PORT=443; fi
+fi
+if [ -z "$HTTP_PORT" ]; then
+  HTTP_PORT=80
+  if [ "$auto" = 1 ] && port_busy 80; then
+    HTTP_PORT=0
+    say "Port 80 is in use; Let's Encrypt HTTP validation is off (DNS validation still works)."
+  fi
+fi
+describe_settings() {
   console_where="reachable from the network"; [ "$LOCAL_CONSOLE" = 1 ] && console_where="this machine only"
-  say "Upgrading $NAME with its current settings (options given now override them; --fresh ignores them):"
-  say "  console port $CONSOLE_PORT ($console_where), device port $EDGE_PORT, HTTP validation port $HTTP_PORT (0 = none)"
-  [ -n "$ADDRESSES" ] && say "  addresses $ADDRESSES"
+  devices_where="all addresses"; [ "$TUNNEL_ONLY" = 1 ] && devices_where="this machine only; devices use Cloudflare Tunnel"
+  say "  console port $CONSOLE_PORT ($console_where); device port $EDGE_PORT ($devices_where); HTTP validation port $HTTP_PORT (0 = none)"
+  if [ -n "$ADDRESSES" ]; then say "  addresses $ADDRESSES"; fi
+}
+if [ "$UNINSTALL" = 0 ]; then
+  if [ "$RECALLED" = 1 ]; then
+    say "Upgrading $NAME with its current settings (options given now override them; --fresh ignores them):"
+  else
+    say "Installing $NAME with:"
+  fi
+  describe_settings
 fi
 
 for p in "$CONSOLE_PORT" "$EDGE_PORT" "$HTTP_PORT"; do
@@ -211,8 +284,14 @@ print_summary() { # password fingerprint addresses
   say "  its own. Check its SHA-256 fingerprint matches:"
   say "      $2"
   say ""
-  say "  Devices connect to TCP port $EDGE_PORT. For access from the internet, open that"
-  say "  port in your firewall, or set up Cloudflare Tunnel in the console (no open ports)."
+  if [ "$TUNNEL_ONLY" = 1 ]; then
+    say "  Nothing on this server is reachable from the internet. Devices connect through"
+    say "  Cloudflare Tunnel: set it up in the console under Connectivity."
+  else
+    say "  Devices connect to TCP port $EDGE_PORT. For access from the internet, open that"
+    say "  port in your firewall, or set up Cloudflare Tunnel in the console (no open ports;"
+    say "  install with --tunnel-only to keep this port off the network)."
+  fi
   say ""
 }
 
@@ -258,6 +337,7 @@ docker_install() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   addrs=$(detect_addresses)
   console_bind="0.0.0.0"; [ "$LOCAL_CONSOLE" = 1 ] && console_bind="127.0.0.1"
+  edge_bind="0.0.0.0"; [ "$TUNNEL_ONLY" = 1 ] && edge_bind="127.0.0.1"
   err=$(mktemp)
   run() { # extra publish flags
     # shellcheck disable=SC2086
@@ -266,7 +346,7 @@ docker_install() {
       --pids-limit 256 --memory 512m --tmpfs /tmp:rw,noexec,nosuid,size=16m \
       -v "$NAME-data:/var/lib/aegisnet" \
       -e AEGIS_PUBLIC_ADDRESSES="$addrs" -e AEGIS_PUBLIC_PORT="$EDGE_PORT" \
-      -p "$console_bind:$CONSOLE_PORT:8443" -p "$EDGE_PORT:8444" $1 \
+      -p "$console_bind:$CONSOLE_PORT:8443" -p "$edge_bind:$EDGE_PORT:8444" $1 \
       "$IMAGE" >/dev/null 2>"$err"
   }
   extra=""; [ "$HTTP_PORT" != 0 ] && extra="-p $HTTP_PORT:8080"
@@ -296,6 +376,7 @@ docker_install() {
 
 write_unit() { # unit data addresses
   console_loopback=0; [ "$LOCAL_CONSOLE" = 1 ] && console_loopback=1
+  edge_loopback=0; [ "$TUNNEL_ONLY" = 1 ] && edge_loopback=1
   cat > "$1" <<UNIT
 # AegisNet appliance (native), written by install.sh --native.
 [Unit]
@@ -314,6 +395,7 @@ Environment=AEGIS_PUBLIC_PORT=$EDGE_PORT
 Environment=AEGIS_HTTP_PORT=$HTTP_PORT
 Environment=AEGIS_PUBLIC_ADDRESSES=$3
 Environment=AEGIS_CONSOLE_LOOPBACK=$console_loopback
+Environment=AEGIS_EDGE_LOOPBACK=$edge_loopback
 Environment=AEGIS_DOWNLOADS_DIR=/usr/local/share/aegisnet/clients
 ExecStart=/usr/local/bin/aegisd --data-dir $2
 StateDirectory=$NAME
