@@ -840,12 +840,13 @@ pub struct PrincipalSummary {
     pub status: String,
     pub roles: Vec<String>,
     pub must_change_password: bool,
+    pub two_factor: bool,
     pub created_at: i64,
 }
 
 pub fn list_principals(c: &Connection) -> Result<Vec<PrincipalSummary>> {
     let mut stmt = c.prepare(
-        "SELECT id, username, status, must_change_password, created_at FROM principals ORDER BY created_at, id LIMIT 500",
+        "SELECT id, username, status, must_change_password, created_at, totp_enabled FROM principals ORDER BY created_at, id LIMIT 500",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -855,21 +856,89 @@ pub fn list_principals(c: &Connection) -> Result<Vec<PrincipalSummary>> {
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     rows.into_iter()
-        .map(|(id, username, status, must, created_at)| {
+        .map(|(id, username, status, must, created_at, totp)| {
             Ok(PrincipalSummary {
                 roles: roles_of(c, &id)?,
                 id,
                 username,
                 status,
                 must_change_password: must != 0,
+                two_factor: totp != 0,
                 created_at,
             })
         })
         .collect()
+}
+
+/// Whether the principal signs in with a second factor (TOTP). The shared
+/// secret itself is kept in the secret store, never in this database.
+pub fn two_factor_enabled(c: &Connection, id: &str) -> Result<bool> {
+    let v: i64 = c.query_row(
+        "SELECT totp_enabled FROM principals WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    Ok(v != 0)
+}
+
+/// Turn the second factor on with fresh recovery codes (hashes only).
+pub fn enable_two_factor(c: &Connection, id: &str, recovery_hashes: &[String]) -> Result<()> {
+    let n = c.execute(
+        "UPDATE principals SET totp_enabled = 1, totp_last_step = 0 WHERE id = ?1",
+        [id],
+    )?;
+    if n != 1 {
+        return Err(StoreError::NotFound);
+    }
+    c.execute("DELETE FROM totp_recovery WHERE principal_id = ?1", [id])?;
+    for h in recovery_hashes {
+        c.execute(
+            "INSERT INTO totp_recovery (principal_id, code_hash, used_at) VALUES (?1, ?2, NULL)",
+            params![id, h],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn disable_two_factor(c: &Connection, id: &str) -> Result<()> {
+    c.execute(
+        "UPDATE principals SET totp_enabled = 0, totp_last_step = 0 WHERE id = ?1",
+        [id],
+    )?;
+    c.execute("DELETE FROM totp_recovery WHERE principal_id = ?1", [id])?;
+    Ok(())
+}
+
+/// Record a used code's time step; false if that step (or a later one)
+/// was already used, which makes each code single-use.
+pub fn advance_totp_step(c: &Connection, id: &str, step: i64) -> Result<bool> {
+    let n = c.execute(
+        "UPDATE principals SET totp_last_step = ?2 WHERE id = ?1 AND totp_enabled = 1 AND totp_last_step < ?2",
+        params![id, step],
+    )?;
+    Ok(n == 1)
+}
+
+/// Spend a recovery code (by hash); false if unknown or already used.
+pub fn use_recovery_code(c: &Connection, id: &str, code_hash: &str) -> Result<bool> {
+    let n = c.execute(
+        "UPDATE totp_recovery SET used_at = ?3 WHERE principal_id = ?1 AND code_hash = ?2 AND used_at IS NULL",
+        params![id, code_hash, now_unix()],
+    )?;
+    Ok(n == 1)
+}
+
+pub fn recovery_codes_left(c: &Connection, id: &str) -> Result<i64> {
+    Ok(c.query_row(
+        "SELECT COUNT(*) FROM totp_recovery WHERE principal_id = ?1 AND used_at IS NULL",
+        [id],
+        |r| r.get(0),
+    )?)
 }
 
 pub fn must_change_password(c: &Connection, id: &str) -> Result<bool> {

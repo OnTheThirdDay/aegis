@@ -17,7 +17,14 @@ The self-service part of the console is served on the gateway's public edge at `
   - sign-in, sign-out, the current session and password change;
   - the user's devices: list, invite, revoke;
   - client downloads.
-- **Users only.** Accounts with any role beyond `user` are refused at sign-in. This happens after the password check, so the portal does not reveal which accounts are administrators. Refusals are audited.
+- **Administrators only with 2FA.** An account with any role beyond `user` can sign in only with two-factor authentication. Without it, sign-in is refused after the password check, so the portal does not reveal which accounts are administrators; refusals are audited. A session opened with a second factor gets the **whole console** on the portal (owner decision, 2026-10-26), so SSH is optional. The exception is exporting the device root key, which stays local-only. The allowlist above applies to everyone else.
+- **Two-factor authentication** (TOTP, RFC 6238: HMAC-SHA1, 6 digits, 30 s, ±1 step):
+  - Set up under Account by scanning a QR code, then confirmed with a code. It is optional on the local console, but once on, every sign-in asks for a code.
+  - Each code works once (the last used time step is recorded).
+  - Ten single-use recovery codes are stored as hashes.
+  - The shared secret is kept in the secret directory, never in the database.
+  - Owners can reset a lost authenticator for an account; that ends its sessions.
+  - Code failures count against the same sign-in limits as passwords.
 - **Browser sessions only.** `Authorization` headers (API tokens) are refused. Sessions are the usual `Secure; HttpOnly; SameSite=Strict` cookies with CSRF tokens.
 - **Host and origin.** The `Host` must be the gateway's public device address, and cross-origin requests are refused.
 - **Separate sign-in limits.** Portal sign-in has its own rate limiter (global and per user), so traffic on the portal can never lock an administrator out of the console.

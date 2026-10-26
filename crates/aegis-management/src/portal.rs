@@ -5,8 +5,10 @@
 //!
 //! * Only self-service routes are reachable (an allowlist below); everything
 //!   else answers 404, whatever the session.
-//! * Administrators (any role beyond `user`) are refused at sign-in, after
-//!   the password check, so the portal reveals nothing about who is one.
+//! * Administrators (any role beyond `user`) may sign in only with two-factor
+//!   authentication; such a session gets the whole console here (minus a few
+//!   local-only actions), so SSH is optional. Without 2FA they are refused,
+//!   after the password check, so the portal reveals nothing about who is one.
 //! * Cookie sessions only: `Authorization` headers (API tokens) are refused.
 //! * The Host must be the gateway's public device address; cross-origin
 //!   requests are refused.
@@ -44,6 +46,7 @@ fn allowed(method: &Method, path: &str) -> bool {
             "/" | "/app.js"
                 | "/style.css"
                 | "/api/v1/auth/me"
+                | "/api/v1/auth/2fa"
                 | "/api/v1/devices"
                 | "/api/v1/system/downloads"
         ) || path.starts_with("/downloads/")
@@ -53,11 +56,20 @@ fn allowed(method: &Method, path: &str) -> bool {
             "/api/v1/auth/login"
                 | "/api/v1/auth/logout"
                 | "/api/v1/auth/password"
+                | "/api/v1/auth/2fa/setup"
+                | "/api/v1/auth/2fa/enable"
+                | "/api/v1/auth/2fa/disable"
                 | "/api/v1/devices/invite"
         ) || (path.starts_with("/api/v1/devices/") && path.ends_with("/revoke"))
     } else {
         false
     }
+}
+
+/// Console actions never offered on the public address, even to an
+/// administrator signed in with 2FA: taking the device root key off the server.
+fn local_only(method: &Method, path: &str) -> bool {
+    *method == Method::POST && path == "/api/v1/system/device-ca/export-root-key"
 }
 
 /// Whether the portal is switched on (default: on).
@@ -99,8 +111,18 @@ async fn guard(
     next: Next,
 ) -> Response {
     let not_found = || finish(ApiError::not_found().into_response(), true);
-    if !enabled(&ctx) || !allowed(req.method(), req.uri().path()) {
+    if !enabled(&ctx) {
         return not_found();
+    }
+    if !allowed(req.method(), req.uri().path()) {
+        // Beyond self-service: only an administrator whose session was
+        // opened with a second factor (the handlers still authenticate).
+        let admin_2fa = ctx
+            .peek_session(req.headers())
+            .is_some_and(|(scopes, mfa)| mfa && ManagementContext::administrative(&scopes));
+        if !admin_2fa || local_only(req.method(), req.uri().path()) {
+            return not_found();
+        }
     }
     if req.headers().contains_key(header::AUTHORIZATION) {
         return finish(

@@ -118,6 +118,12 @@ docker exec aegis aegisctl initial-password
 
 The browser's traffic goes to your own computer, through the encrypted SSH connection to the server, and to the console there. It doesn't go through Cloudflare (the tunnel only carries device traffic), and the console port is never reachable from the internet. Use the same SSH command whenever you need the console later. PuTTY can do the same: Connection → SSH → Tunnels, source port `8453`, destination `127.0.0.1:8453`.
 
+**Without SSH, after setup:**
+1. Turn on two-factor authentication under **Account** (scan the QR code with an authenticator app and save the recovery codes).
+2. From then on, sign in at the user portal address (`https://<device address>/portal/`, shown on the Users page) with your password and the app's code.
+
+An administrator signed in this way gets the whole console, except exporting the device root key, which stays SSH-only.
+
 **Server at home or on your local network:** open `https://<server-address>:<console-port>` in a browser on your network, for example `https://192.168.1.20:8443`.
 
 **The first time, the browser warns** that the certificate isn't trusted. That's expected: the server made its own certificate. Compare the fingerprint the installer printed with the certificate's fingerprint in the browser (click the warning, then view the certificate), then continue. To get rid of the warning permanently, download the web CA under **Account → Trust this console** and install it on your computer.

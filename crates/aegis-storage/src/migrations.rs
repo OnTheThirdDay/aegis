@@ -221,6 +221,17 @@ CREATE TABLE integrations (
 );
 "#,
     ),
+    (
+        4,
+        r#"
+ALTER TABLE principals ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE principals ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE totp_recovery (
+ principal_id TEXT NOT NULL, code_hash TEXT NOT NULL, used_at INTEGER,
+ PRIMARY KEY(principal_id, code_hash)
+);
+"#,
+    ),
 ];
 
 fn checksum(sql: &str) -> String {

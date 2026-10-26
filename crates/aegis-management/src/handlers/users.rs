@@ -26,6 +26,7 @@ pub async fn list(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
                 "status": u.status,
                 "roles": u.roles,
                 "password_change_required": u.must_change_password,
+                "two_factor": u.two_factor,
                 "created_at": rfc3339(u.created_at),
             })
         })
