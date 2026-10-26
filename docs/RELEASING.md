@@ -38,13 +38,28 @@ work branch ──PR──► staging ──release PR──► main
 
 | Workflow | Trigger | Does |
 |---|---|---|
-| [ci.yml](../.github/workflows/ci.yml) | every push, nightly, manual | fmt, clippy, tests, arch rules, aarch64 cross-build, Windows/macOS checks, cargo-deny, cargo-audit and fuzz smoke tests, aggregated into `required` |
-| ci.yml `branch-policy` | pull requests | fails if a pull request into `main` doesn't come from `staging` |
-| ci.yml `main-gate` | push to `main` | fails unless `main`'s exact file tree already exists as a commit on `staging` |
-| ci.yml `sync-staging` | push to `main` | fast-forwards `staging` to `main` after a release |
+| [ci.yml](../.github/workflows/ci.yml) `check` | code pushes to any branch except `main` | one cached Linux job: fmt, clippy, architecture rules, tests and a Windows compile check; on `staging` also cargo-deny and cargo-audit |
+| ci.yml `weekly` | Sundays, or manual (choose seconds per fuzz target) | fuzz targets (3 minutes each) and the large property-test budget |
+| ci.yml `branch-policy` | pull requests into `main` | fails if the pull request doesn't come from `staging` |
 | [pull-requests.yml](../.github/workflows/pull-requests.yml) | branch pushes, and successful `ci` runs on `staging` | opens the pull request into `staging` and the release pull request into `main` |
 | [version.yml](../.github/workflows/version.yml) | manual | version bump: `release/vX.Y.Z` branch plus a pull request into `staging` |
-| [release.yml](../.github/workflows/release.yml) | push to `staging` or `main`, manual | staging image, or (on `main` with a new version) tag, image and GitHub Release |
+| [release.yml](../.github/workflows/release.yml) | push to `staging` or `main`, manual | staging image (Linux and Windows clients), or on `main` with a new version: tag, image with all clients including macOS, and GitHub Release |
+| release.yml main gate (in `plan`) | push to `main` | fails unless `main`'s exact file tree already exists as a commit on `staging` |
+| release.yml `sync-staging` | push to `main` | fast-forwards `staging` to `main` after a release |
+
+**Actions minutes.** The repository is private, so CI uses the free plan's 2,000 minutes a month. Windows minutes count double, macOS minutes 10×, and every job rounds up to whole minutes. The workflows are sized for that:
+
+| Event | Runs | About |
+|---|---|---|
+| Push to a work branch that changes code | `check` | 10 minutes (20 with a cold cache) |
+| Push that only changes documentation (`*.md`, `docs/`) | nothing (just opening the pull request) | 1 minute |
+| Merge into `staging` | `check` with dependency gates, staging build and image | 35 minutes |
+| Release to `main` | Linux builds, macOS clients (one job, 10×), image, GitHub Release | 200 minutes, mostly macOS |
+| Weekly fuzzing | `weekly` | 25 minutes |
+
+Every job has a time limit (5 to 60 minutes), so a hang fails quickly instead of running for GitHub's default 6 hours. Usage so far: Settings → Billing and plans → Usage.
+
+macOS is compiled only for releases, so a macOS-only build problem shows up when releasing (the release then fails before anything is published). To check earlier, run `cargo check -p aegis-client` on a Mac.
 
 **Quirks to know:**
 
@@ -60,9 +75,9 @@ work branch ──PR──► staging ──release PR──► main
   Without it the built-in token is used. Then turn on Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests", and approve CI on bot pull requests by hand. Note the expiry date somewhere.
 - **Image package:** after the first publish, go to Packages → `aegis` → Package settings → change visibility to **Public**. Servers can then pull it, and the installer inside it, without `docker login`. This works while the repository itself is private. If the package stays private, run `docker login ghcr.io` on each server.
 - **Local hook:** run `git config core.hooksPath .githooks` once per clone. It blocks direct pushes to `main` and `staging`; `--no-verify` overrides it deliberately.
-- **Branch protection:** rulesets need a paid plan for private repositories. Until then, `main-gate`, `branch-policy` and the hook enforce the flow. With rulesets available:
-  - **`main`:** block force pushes and deletion; require a pull request with merge commits only; require the `required`, `branch-policy` and `main-gate` checks.
-  - **`staging`:** the same, requiring only `required`.
+- **Branch protection:** rulesets need a paid plan for private repositories. Until then, the main gate in release.yml, `branch-policy` and the hook enforce the flow. With rulesets available:
+  - **`main`:** block force pushes and deletion; require a pull request with merge commits only; require the `branch-policy` check.
+  - **`staging`:** the same, requiring the `check` job.
 
 ## Installing a release (servers)
 

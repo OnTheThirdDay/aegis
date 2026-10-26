@@ -45,6 +45,14 @@ docker run --rm --pull always --entrypoint cat \
   ghcr.io/onthethirdday/aegis /usr/share/aegisnet/install.sh > install.sh
 ```
 
+To test with staging:
+
+```sh
+docker run --rm --pull always --entrypoint cat \
+  ghcr.io/onthethirdday/aegis:staging /usr/share/aegisnet/install.sh > install.sh
+sudo sh install.sh --name aegis-test --tunnel-only
+```
+
 Then run **one** of the three commands below, chosen by where the server is and how devices will reach it. Nginx, v2ray or anything else already on the server doesn't change the choice: the installer avoids ports that are taken.
 
 ### Server on the internet, devices use Cloudflare Tunnel (recommended)
@@ -204,6 +212,34 @@ In the console, open **Account → Device certificate authority**:
 3. **Once a year**, when the console warns that the device issuer expires within 60 days, choose the key file there and press **Renew the device issuer**. The key is used once and not stored. Devices keep working throughout.
 
 **Put the key back on this server** returns to automatic renewal. Keep a backup of the key file: if it is lost while offline, the issuer can't be renewed, and every device needs a new invitation after it expires.
+
+## Back up, restore or move a gateway
+
+All of a gateway's state lives in one Docker volume named after the instance: `aegis-data`, or `<name>-data` with `--name`. Inside the container it is `/var/lib/aegisnet`. On Linux the files are under `/var/lib/docker/volumes/<volume>/_data`; on macOS the volume is inside Docker Desktop's virtual machine, so use the commands below.
+
+The volume holds the configuration, the database (users, devices, settings, audit log) and `secrets/`: the device CA and root key, the gateway and console certificates, the web CA and the Cloudflare connector token. **Treat a backup like a password vault**, and don't edit the volume while the gateway runs.
+
+**Back up** (the gateway stops for a few seconds so the database is consistent):
+
+```sh
+docker stop aegis
+docker run --rm -v aegis-data:/data:ro -v "$PWD":/backup debian:bookworm-slim \
+  tar czf /backup/aegis-data.tgz -C /data .
+docker start aegis
+```
+
+**Restore, or move to another server:** install the gateway there first (step 2, same `--name`), then replace its data with the backup:
+
+```sh
+docker stop aegis
+docker run --rm -v aegis-data:/data -v "$PWD":/backup debian:bookworm-slim \
+  sh -c 'find /data -mindepth 1 -delete && tar xzf /backup/aegis-data.tgz -C /data && chown -R 10001:10001 /data'
+docker start aegis
+```
+
+The restored gateway keeps its identity, so devices keep working without new invitations. When moving with Cloudflare Tunnel, stop the old server before starting the new one: both would otherwise run the same tunnel connector. With a direct connection, point the DNS name devices use at the new server.
+
+`--uninstall --purge` deletes the volume and with it the gateway's identity: every device then needs a new invitation.
 
 ## 7. Remove
 

@@ -26,6 +26,7 @@ jobs:
   into-staging:
     if: github.event_name == 'push' && !github.event.deleted
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Open a pull request into staging
         env:
@@ -51,6 +52,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Open or update the release pull request staging -> main
         env:
