@@ -2,9 +2,10 @@
 
 This guide is for anyone setting up a gateway on a new server. Normal use takes the steps in order:
 
-1. **Prepare the server**: install Docker and check which ports are free.
-2. **Install** with one command, adding options if the server already runs nginx, v2ray or Cloudflare.
-3. **Finish setup in the browser**: set the admin password, choose how devices connect, invite devices.
+1. **Prepare the server**: install Docker.
+2. **Install** with one command, chosen by where the server is and how devices will reach it.
+3. **Open the admin console**: directly on a home network, through SSH for a server on the internet.
+4. **Finish setup in the browser**: set the admin password, choose how devices connect, invite devices.
 
 Upgrades and removal are covered at the end.
 
@@ -37,65 +38,83 @@ On macOS, install Docker Desktop and make sure it's running. Enable *Start Docke
 
 ## 2. Install
 
-Download the installer from the latest release:
+Get the installer. It ships inside the gateway's public Docker image, so this needs only Docker, no GitHub account:
 
 ```sh
-curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
+docker run --rm --pull always --entrypoint cat \
+  ghcr.io/onthethirdday/aegis /usr/share/aegisnet/install.sh > install.sh
 ```
 
-Pick the line that matches your server. Upgrades read these settings back from the running gateway, so you don't need to repeat them later.
+Then run **one** of the three commands below, chosen by where the server is and how devices will reach it. Nginx, v2ray or anything else already on the server doesn't change the choice: the installer avoids ports that are taken.
 
-| Situation | Command |
-|---|---|
-| Public server (VPS), with or without nginx/v2ray: **recommended** | `sudo sh install.sh --tunnel-only` |
-| Public server, devices connect directly (no Cloudflare) | `sudo sh install.sh --local-console --address <public-ip>` |
-| Home or LAN server | `sudo sh install.sh` |
-| Linux without Docker | add `--native` to any line above (systemd service; not yet tested on a real distribution) |
+### Server on the internet, devices use Cloudflare Tunnel (recommended)
 
-**`--tunnel-only` exposes nothing to the internet, at any point:**
+```sh
+sudo sh install.sh --tunnel-only
+```
 
-- The console listens on the server itself only; you reach it over SSH (step 3).
-- The device port is bound to the server itself too.
-- No port 80 is used.
+- Nothing on the server becomes reachable from the internet, not even during setup.
+- You open the admin console through SSH (step 3) and create the Cloudflare Tunnel there (step 4, option A).
+- Devices then connect through Cloudflare. The server's IP stays hidden and no firewall port needs opening.
 
-Devices then connect through the Cloudflare Tunnel you create in step 4 (option A), which connects outbound. A port scan of the server finds nothing, and the server's IP stays hidden behind Cloudflare. Option B (direct connection) doesn't work in this mode; reinstall with `--direct` to switch.
+### Server on the internet, devices connect straight to it (no Cloudflare)
 
-**Options:**
+```sh
+sudo sh install.sh --local-console --address <public-ip-or-hostname>
+```
 
-- **`--address`**: the public IP or DNS name people use to reach this server. It goes into the server's certificates. On cloud VMs the network card usually only knows a private address, so give the public one here; you can list several separated by commas.
-- **`--local-console`**: the admin console is reachable only from the server itself; see step 3. Implied by `--tunnel-only`.
-- **`--name NAME`**: run a second, separate instance (its own container and data).
-- **`--version vX.Y.Z`**: install a specific release instead of the newest.
+- You open the admin console through SSH (step 3).
+- Devices connect to the server's device port. Open that port (printed by the installer) in your cloud provider's firewall, and choose option B in step 4.
+- `--address` goes into the server's certificates. On cloud servers, give the public IP or hostname: the server itself usually only knows its private address.
+
+### Server at home or on your local network
+
+```sh
+sudo sh install.sh
+```
+
+- The admin console opens directly in a browser on your network: `https://<server-address>:<console-port>`.
+- Devices on the same network can connect directly. For access from outside, use option A in step 4 (Cloudflare Tunnel), or forward the device port on your router.
+
+**Variations (add to any command above):**
+
+- **`--name NAME`**: a second, separate instance on the same server (its own container and data).
+- **`--version vX.Y.Z`**: a specific release instead of the newest.
+- **`--console-port N`, `--port N`, `--http-port N`**: choose the ports yourself instead of letting the installer pick.
+
+You never need to repeat these options: upgrades read them back from the running gateway.
 
 The installer checks Docker, pulls the release image (pinned to an exact digest), starts it hardened and waits until it is healthy. It then prints:
 
 - **the ports it chose** and whether each is reachable from the network or from the server only;
-- **the console address:** with `--local-console` or `--tunnel-only`, the SSH command to use instead (see step 3);
+- **the console address,** or for a server on the internet the SSH command to use instead (see step 3);
 - **the one-time admin password:** `admin` / `xxxxx-xxxxx-xxxxx-xxxxx`;
 - **the console certificate's SHA-256 fingerprint.**
 
 Keep that output. If you lose the password before using it:
 
 ```sh
-docker exec aegis aegisctl initial-password                           # Docker
-sudo aegisctl initial-password --data-dir /var/lib/aegis              # --native
+docker exec aegis aegisctl initial-password
 ```
 
 ## 3. Open the admin console
 
-**Server installed without `--local-console`** (home/LAN): open `https://<server-address>:8443` in a browser.
+**Server on the internet** (installed with `--tunnel-only` or `--local-console`): the console listens only on the server itself. You reach it through SSH, the same connection you used to run the installer, so no other port is needed.
 
-**Server installed with `--tunnel-only` or `--local-console`** (public servers): the console only listens on the server itself. Reach it through SSH from your computer, using the console port the installer printed (8443 unless it was taken):
+1. On **your own computer**, open a terminal (PowerShell on Windows has `ssh` built in) and run the command below. Use the console port the installer printed, here 8453:
+   ```sh
+   ssh -L 8453:127.0.0.1:8453 <user>@<server-ip>
+   ```
+   Sign in as usual and keep that window open.
+2. In the browser **on your computer**, open **https://localhost:8453**.
 
-```sh
-ssh -L 8443:127.0.0.1:8443 <user>@<server>          # or 8453:127.0.0.1:8453, …
-```
+The browser's traffic goes to your own computer, through the encrypted SSH connection to the server, and to the console there. It doesn't go through Cloudflare (the tunnel only carries device traffic), and the console port is never reachable from the internet. Use the same SSH command whenever you need the console later. PuTTY can do the same: Connection → SSH → Tunnels, source port `8453`, destination `127.0.0.1:8453`.
 
-Keep that session open and browse to **https://localhost:8443** (or the port you forwarded). The console is never exposed to the internet this way.
+**Server at home or on your local network:** open `https://<server-address>:<console-port>` in a browser on your network, for example `https://192.168.1.20:8443`.
 
 **The first time, the browser warns** that the certificate isn't trusted. That's expected: the server made its own certificate. Compare the fingerprint the installer printed with the certificate's fingerprint in the browser (click the warning, then view the certificate), then continue. To get rid of the warning permanently, download the web CA under **Account → Trust this console** and install it on your computer.
 
-> **Want the console public anyway?** Install without `--local-console`, then allow TCP 8443 only from your own IP in the cloud provider's firewall. On Docker hosts, **`ufw` does not filter Docker-published ports**, so use the provider's firewall (or `--local-console`). A fully public console still works: it is HTTPS-only, rate-limits sign-in attempts and forces a password change. Use a long passphrase.
+> **Want the console public anyway?** Install it as for a home server instead, then allow the console port only from your own IP in the cloud provider's firewall. On Docker hosts, **`ufw` does not filter Docker-published ports**, so use the provider's firewall (or `--local-console`). A fully public console still works: it is HTTPS-only, rate-limits sign-in attempts and forces a password change. Use a long passphrase.
 
 ## 4. First-time setup in the browser
 
@@ -131,7 +150,7 @@ Keep that session open and browse to **https://localhost:8443** (or the port you
 
 ## 5. Connect a device
 
-1. Download the client app from the console (**Devices → Client apps**) or from the [latest release](https://github.com/OnTheThirdDay/aegis/releases/latest). It is portable: no installation and no admin rights needed.
+1. Download the client app from the console (**Devices → Client apps**). It is portable: no installation and no admin rights needed.
    - macOS builds are unsigned: the first time, right-click → Open, or run `xattr -d com.apple.quarantine aegis-client-macos-*`.
 2. Open it, press **Paste** (or drop the `.aegis` file on the window), then **Join and connect**.
 3. Point apps at the local proxy:
@@ -145,21 +164,25 @@ Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl conn
 
 ## 6. Upgrade
 
-Download the newest installer and run it:
+Get the installer from the newest image (`--pull always` makes Docker fetch the newest one) and run it:
 
 ```sh
-curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
-sudo sh install.sh                  # add --name NAME / --native if you installed with them
+docker run --rm --pull always --entrypoint cat \
+  ghcr.io/onthethirdday/aegis /usr/share/aegisnet/install.sh > install.sh
 ```
 
-The installer reads the current settings from the running gateway (ports, addresses, whether the console and device port are local only), prints them, and keeps them. To change one, pass just that option, for example `--port 8444`; `--public-console` undoes `--local-console`, `--direct` undoes `--tunnel-only`, and `--fresh` ignores the old settings. With `--native`, port and exposure changes only take effect on a new data directory, because the gateway writes them into its configuration at first start.
+```sh
+sudo sh install.sh                  # add --name NAME if you installed with one
+```
+
+The installer reads the current settings from the running gateway (ports, addresses, whether the console and device port are local only), prints them, and keeps them. To change one, pass just that option, for example `--port 8444`; `--public-console` undoes `--local-console`, `--direct` undoes `--tunnel-only`, and `--fresh` ignores the old settings.
 
 What the upgrade keeps and changes:
 
-- **Kept:** all data, including the admin password, users, devices, certificates and the Cloudflare tunnel. They live in the Docker volume `aegis-data` (or `/var/lib/aegis` with `--native`). The console certificate stays the same, so the browser does not warn again.
+- **Kept:** all data, including the admin password, users, devices, certificates and the Cloudflare tunnel. They live in the Docker volume `aegis-data`. The console certificate stays the same, so the browser does not warn again.
 - **Changed:** only the program. Devices reconnect automatically within seconds.
 
-The settings live in the gateway's container (or, with `--native`, its systemd unit). After `--uninstall` they are gone; data is kept, but a reinstall starts from the defaults again unless you pass the options.
+The settings live in the gateway's container. After `--uninstall` they are gone; data is kept, but a reinstall starts from the defaults again unless you pass the options.
 
 **If an upgrade fails to start** (usually a port another service took in the meantime), the gateway is stopped but no data is lost. Run the installer again with the port options it needs.
 
@@ -189,7 +212,7 @@ sudo sh install.sh --uninstall            # keeps the data (Docker volume aegis-
 sudo sh install.sh --uninstall --purge    # also deletes all data, keys and settings
 ```
 
-Add `--native` if it was installed with `--native`. Removing AegisNet does not delete its Cloudflare tunnel. To remove the tunnel and its DNS record, disconnect it in **Connectivity** before uninstalling.
+Removing AegisNet does not delete its Cloudflare tunnel. To remove the tunnel and its DNS record, disconnect it in **Connectivity** before uninstalling.
 
 ## Troubleshooting
 
@@ -197,7 +220,7 @@ Add `--native` if it was installed with `--native`. Removing AegisNet does not d
 |---|---|
 | `could not start the container (port … in use?)` | Another service holds the port: re-run with `--port`/`--console-port` (see step 1) |
 | `could not pull ghcr.io/…` | No internet from the server, or a wrong `--version` |
-| Browser can't reach the console | With `--local-console`, use the SSH command. Otherwise, check the provider's firewall for TCP 8443 |
+| Browser can't reach the console | Server on the internet: use the SSH command from step 3 and browse to `https://localhost:<port>`. Home server: check the console port the installer printed |
 | Cloudflare status `failed` | The error text says why (missing token permission, existing DNS name, connector blocked). Fix it, paste the token and press **Retry setup**; nothing is duplicated |
 | Client says "Cannot reach the server" | Check the device port is open (direct mode), the Cloudflare status (tunnel mode), or whether the device was removed in **Devices** |
 | Anything else, or the cause isn't clear | Record it: console **Diagnostics** plus **Troubleshooting** in the client app, then read the analysis. See [DIAGNOSTICS.md](DIAGNOSTICS.md) |

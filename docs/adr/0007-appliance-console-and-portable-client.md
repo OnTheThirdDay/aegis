@@ -6,7 +6,7 @@ Status: accepted (owner direction, 2026-10-25). Supersedes parts of SPEC-12 as n
 
 The owner asked for setup without CLI or file editing:
 
-- one command installs the server (Docker or native);
+- one command installs the server (Docker or native; later narrowed to Docker only, with the installer shipped inside the public image so the repository can be private);
 - the server generates a random admin password;
 - the admin opens a browser at the server, signs in, changes the password and configures everything there, including Cloudflare and "plugins";
 - end users get their own pages;

@@ -3,12 +3,12 @@
 # .github/workflows/release.yml). Run on Linux/WSL from the repository:
 #
 #   sh deploy/build-bundle.sh [OUT_DIR]
-#   sudo sh OUT_DIR/aegisnet-gateway/install.sh --from OUT_DIR/aegisnet-gateway [--native]
+#   sudo sh OUT_DIR/aegisnet-gateway/install.sh --from OUT_DIR/aegisnet-gateway
 #
 # Produces OUT_DIR/aegisnet-gateway/ with the same layout as the release
-# packages and image context: bin/<arch>/{aegisd,aegisctl,cloudflared},
-# clients/, Dockerfile and install.sh. cloudflared is checked against the
-# pinned SHA-256 before it is included.
+# image context: bin/<arch>/{aegisd,aegisctl,cloudflared}, clients/,
+# Dockerfile and install.sh; the installer builds the image from it.
+# cloudflared is checked against the pinned SHA-256 before it is included.
 set -eu
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)

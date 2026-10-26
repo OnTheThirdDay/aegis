@@ -1,13 +1,14 @@
 #!/bin/sh
-# AegisNet gateway installer.
+# AegisNet gateway installer (Docker). It ships inside the gateway image, so
+# everything comes from the public registry; no GitHub access is needed:
 #
-#   curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
+#   docker run --rm --pull always --entrypoint cat \
+#     ghcr.io/onthethirdday/aegis /usr/share/aegisnet/install.sh > install.sh
 #   sudo sh install.sh [options]
 #
-# Docker (default): pulls the release image (pinned by digest in release
-# builds) and runs it hardened. --native (Linux/systemd): downloads the
-# release binaries, verifies SHA256SUMS and installs a hardened service.
-# Then open the printed console URL and finish setup in the browser.
+# The copy from an image installs that image's release (the :staging image's
+# copy installs :staging). Then open the console it prints and finish setup
+# in the browser.
 #
 # Public servers: --tunnel-only exposes nothing to the internet. The console
 # listens on this machine only (reach it with ssh -L) and devices arrive
@@ -16,8 +17,8 @@
 # Ports that are not given and already in use (nginx, v2ray, ...) are
 # replaced by free ones automatically; the summary shows which.
 #
-# Upgrading: run the newest install.sh again (with --name / --native if the
-# instance was installed with them). Ports, addresses and exposure are read
+# Upgrading: fetch install.sh again as above and run it (with --name if the
+# instance was installed with one). Ports, addresses and exposure are read
 # back from the running instance; options given now override them.
 #
 # Options:
@@ -31,18 +32,17 @@
 #   --local-console    console on this machine only (reach it with ssh -L)
 #   --public-console   undo --local-console on an upgrade
 #   --fresh            ignore the existing instance's settings; use defaults
-#   --name NAME        container / service name               (default aegis)
-#   --version vX.Y.Z   release to install                     (default: this installer's)
+#   --name NAME        container name                         (default aegis)
+#   --version vX.Y.Z   release to install (default: this installer's)
 #   --image REF        Docker image to run instead of the release image
-#   --from DIR         offline: use binaries from DIR/bin/<arch>/ (deploy/build-bundle.sh)
-#   --native           install as a Linux systemd service instead of Docker
-#   --uninstall        remove the container/service (keeps data unless --purge)
+#   --from DIR         offline: build the image from DIR (deploy/build-bundle.sh)
+#   --uninstall        remove the container (keeps data unless --purge)
 #   --purge            with --uninstall: also delete all gateway data
 set -eu
 
-# Stamped by the release workflow; unstamped copies use the latest release.
+# Stamped when the image is built: the image this copy installs by default.
+# Unstamped copies (from the source tree) use :latest.
 REPO="OnTheThirdDay/aegis"
-RELEASE="@VERSION@"
 RELEASE_IMAGE="@IMAGE@"
 
 NAME=aegis
@@ -54,7 +54,6 @@ ADDRESSES=""
 LOCAL_CONSOLE=""
 TUNNEL_ONLY=""
 FRESH=0
-MODE=docker
 UNINSTALL=0
 PURGE=0
 IMAGE=""
@@ -79,7 +78,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION=${2:?}; shift 2 ;;
     --image) IMAGE=${2:?}; shift 2 ;;
     --from) FROM=${2:?}; shift 2 ;;
-    --native) MODE=native; shift ;;
+    --native) die "--native is no longer supported; AegisNet installs with Docker" ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
     -h|--help) sed -n '2,40p' "$0" 2>/dev/null || true; exit 0 ;;
@@ -124,22 +123,8 @@ recall_docker() {
   RECALLED=1
 }
 
-recall_native() {
-  unit=/etc/systemd/system/$NAME.service
-  [ -f "$unit" ] || return 0
-  env_of() { sed -n "s/^Environment=$1=//p" "$unit" | head -n 1; }
-  if [ -z "$CONSOLE_PORT" ]; then CONSOLE_PORT=$(env_of AEGIS_CONSOLE_PORT); fi
-  if [ -z "$EDGE_PORT" ]; then EDGE_PORT=$(env_of AEGIS_EDGE_PORT); fi
-  if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$(env_of AEGIS_HTTP_PORT); fi
-  if [ -z "$ADDRESSES" ]; then ADDRESSES=$(env_of AEGIS_PUBLIC_ADDRESSES); fi
-  if [ -z "$LOCAL_CONSOLE" ]; then LOCAL_CONSOLE=$(env_of AEGIS_CONSOLE_LOOPBACK); fi
-  if [ -z "$TUNNEL_ONLY" ]; then TUNNEL_ONLY=$(env_of AEGIS_EDGE_LOOPBACK); fi
-  RECALLED=1
-}
-
 instance_exists() {
-  if [ "$MODE" = native ]; then [ -f "/etc/systemd/system/$NAME.service" ]
-  else command -v docker >/dev/null 2>&1 && docker inspect "$NAME" >/dev/null 2>&1; fi
+  command -v docker >/dev/null 2>&1 && docker inspect "$NAME" >/dev/null 2>&1
 }
 
 # Whether something on this machine already listens on TCP port $1. Without
@@ -164,9 +149,7 @@ pick_port() {
   printf '%s' "$1"
 }
 
-if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then
-  if [ "$MODE" = native ]; then recall_native; else recall_docker; fi
-fi
+if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then recall_docker; fi
 [ -n "$TUNNEL_ONLY" ] || TUNNEL_ONLY=0
 if [ "$TUNNEL_ONLY" = 1 ]; then
   # Nothing public: the console needs ssh -L, and HTTP-01 can't reach us.
@@ -209,25 +192,9 @@ fi
 for p in "$CONSOLE_PORT" "$EDGE_PORT" "$HTTP_PORT"; do
   case "$p" in *[!0-9]*|"") die "ports must be numbers" ;; esac
 done
-case "$RELEASE" in @*) RELEASE="" ;; esac
 case "$RELEASE_IMAGE" in @*) RELEASE_IMAGE="" ;; esac
-[ -z "$VERSION" ] && VERSION=$RELEASE
 case "$VERSION" in ""|latest|v[0-9]*) ;; *) die "--version must look like v1.2.3" ;; esac
 LOWER_REPO=$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')
-
-release_url() { # file
-  if [ -n "$VERSION" ] && [ "$VERSION" != latest ]; then
-    printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$VERSION" "$1"
-  else
-    printf 'https://github.com/%s/releases/latest/download/%s' "$REPO" "$1"
-  fi
-}
-
-fetch() { # url dest
-  if command -v curl >/dev/null 2>&1; then curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"
-  elif command -v wget >/dev/null 2>&1; then wget -q --https-only -O "$2" "$1"
-  else die "curl or wget is required"; fi
-}
 
 host_arch() {
   case "$(uname -m)" in
@@ -307,7 +274,7 @@ wait_healthy() { # command...
 # ---------------------------------------------------------------- docker
 
 docker_install() {
-  command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it (Linux: curl -fsSL https://get.docker.com | sudo sh) or use --native"
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it (Linux: curl -fsSL https://get.docker.com | sudo sh)"
   docker info >/dev/null 2>&1 || die "Docker is not running (or this user may not use it: try sudo)"
   if [ "$UNINSTALL" = 1 ]; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -322,16 +289,16 @@ docker_install() {
     docker build -q --build-arg TARGETARCH="$(host_arch)" -t "$IMAGE" "$FROM" >/dev/null
   else
     if [ -z "$IMAGE" ]; then
-      if [ -n "$RELEASE_IMAGE" ] && { [ -z "$VERSION" ] || [ "$VERSION" = "$RELEASE" ]; }; then
-        IMAGE=$RELEASE_IMAGE
-      elif [ -n "$VERSION" ] && [ "$VERSION" != latest ]; then
+      if [ -n "$VERSION" ] && [ "$VERSION" != latest ]; then
         IMAGE="ghcr.io/$LOWER_REPO:${VERSION#v}"
+      elif [ -z "$VERSION" ] && [ -n "$RELEASE_IMAGE" ]; then
+        IMAGE=$RELEASE_IMAGE
       else
         IMAGE="ghcr.io/$LOWER_REPO:latest"
       fi
     fi
     say "Pulling $IMAGE…"
-    docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (is the package public, or run: docker login ghcr.io)"
+    docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
   fi
   docker volume create "$NAME-data" >/dev/null
   docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -368,122 +335,9 @@ docker_install() {
   print_summary "$password" "$fingerprint" "$addrs"
   name_opt=""; [ "$NAME" = aegis ] || name_opt=" --name $NAME"
   say "  Manage:  docker logs $NAME | docker restart $NAME | sh install.sh$name_opt --uninstall"
-  say "  Upgrade: run the newest install.sh again; data and settings are kept."
+  say "  Upgrade: fetch install.sh from the newest image again and run it; data and"
+  say "           settings are kept."
   say ""
 }
 
-# ---------------------------------------------------------------- native
-
-write_unit() { # unit data addresses
-  console_loopback=0; [ "$LOCAL_CONSOLE" = 1 ] && console_loopback=1
-  edge_loopback=0; [ "$TUNNEL_ONLY" = 1 ] && edge_loopback=1
-  cat > "$1" <<UNIT
-# AegisNet appliance (native), written by install.sh --native.
-[Unit]
-Description=AegisNet gateway (appliance)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=aegisnet
-Group=aegisnet
-Environment=AEGIS_DATA_DIR=$2
-Environment=AEGIS_CONSOLE_PORT=$CONSOLE_PORT
-Environment=AEGIS_EDGE_PORT=$EDGE_PORT
-Environment=AEGIS_PUBLIC_PORT=$EDGE_PORT
-Environment=AEGIS_HTTP_PORT=$HTTP_PORT
-Environment=AEGIS_PUBLIC_ADDRESSES=$3
-Environment=AEGIS_CONSOLE_LOOPBACK=$console_loopback
-Environment=AEGIS_EDGE_LOOPBACK=$edge_loopback
-Environment=AEGIS_DOWNLOADS_DIR=/usr/local/share/aegisnet/clients
-ExecStart=/usr/local/bin/aegisd --data-dir $2
-StateDirectory=$NAME
-StateDirectoryMode=0700
-UMask=0077
-Restart=on-failure
-RestartSec=2s
-TimeoutStopSec=30s
-LimitNOFILE=65536
-# Binding ports below 1024 needs only this capability; nothing else is granted.
-NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-ProtectSystem=strict
-ReadWritePaths=$2
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-RemoveIPC=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @mount
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-}
-
-native_install() {
-  [ "$(uname -s)" = Linux ] || die "--native supports Linux (systemd) only; use Docker on macOS"
-  [ "$(id -u)" = 0 ] || die "--native needs root: sudo sh install.sh --native"
-  command -v systemctl >/dev/null 2>&1 || die "systemd is required for --native"
-  unit=/etc/systemd/system/$NAME.service
-  data=/var/lib/$NAME
-  if [ "$UNINSTALL" = 1 ]; then
-    systemctl disable --now "$NAME" >/dev/null 2>&1 || true
-    rm -f "$unit"; systemctl daemon-reload
-    if [ "$PURGE" = 1 ]; then rm -rf "$data"; say "Removed $NAME and its data."; else say "Removed $NAME (data kept in $data)."; fi
-    return
-  fi
-  arch=$(host_arch)
-  work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
-  if [ -n "$FROM" ]; then
-    src="$FROM/bin/$arch"
-    [ -x "$src/aegisd" ] || die "--from: $src/aegisd missing"
-    clients="$FROM/clients"
-  else
-    tag=${VERSION:-latest}
-    pkg="aegisnet-gateway-linux-$arch.tar.gz"
-    say "Downloading AegisNet ($tag, $arch)…"
-    fetch "$(release_url "$pkg")" "$work/$pkg"
-    fetch "$(release_url SHA256SUMS)" "$work/SHA256SUMS"
-    ( cd "$work" && grep " $pkg\$" SHA256SUMS | sha256sum -c - >/dev/null ) || die "checksum verification failed for $pkg"
-    tar -xzf "$work/$pkg" -C "$work"
-    src="$work/aegisnet-gateway/bin"
-    clients="$work/aegisnet-gateway/clients"
-  fi
-  id aegisnet >/dev/null 2>&1 || useradd --system --home-dir "$data" --shell /usr/sbin/nologin aegisnet
-  install -m 0755 "$src/aegisd" "$src/aegisctl" /usr/local/bin/
-  [ -f "$src/cloudflared" ] && install -m 0755 "$src/cloudflared" /usr/local/bin/cloudflared
-  install -d -m 0755 /usr/local/share/aegisnet/clients
-  if [ -d "$clients" ]; then cp -f "$clients"/* /usr/local/share/aegisnet/clients/ 2>/dev/null || true; fi
-  addrs=$(detect_addresses)
-  write_unit "$unit" "$data" "$addrs"
-  systemctl daemon-reload
-  systemctl enable "$NAME" >/dev/null 2>&1
-  systemctl restart "$NAME"
-  say "Waiting for the gateway to start…"
-  wait_healthy /usr/local/bin/aegisctl --socket "$data/aegisd.sock" health \
-    || { journalctl -u "$NAME" -n 20 --no-pager >&2 || true; die "the gateway did not become healthy"; }
-  password=$(/usr/local/bin/aegisctl initial-password --data-dir "$data" 2>/dev/null || true)
-  fingerprint=$(/usr/local/bin/aegisctl console-fingerprint --data-dir "$data" 2>/dev/null || echo unknown)
-  print_summary "$password" "$fingerprint" "$addrs"
-  name_opt=""; [ "$NAME" = aegis ] || name_opt=" --name $NAME"
-  say "  Manage:  systemctl status $NAME | sudo sh install.sh --native$name_opt --uninstall"
-  say "  Upgrade: run the newest install.sh --native again; data and settings are kept."
-  say ""
-}
-
-if [ "$MODE" = native ]; then native_install; else docker_install; fi
+docker_install

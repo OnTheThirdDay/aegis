@@ -5,6 +5,8 @@
 # Build context:
 #   bin/<amd64|arm64>/aegisd  aegisctl  cloudflared
 #   clients/                  (client app builds offered in the console)
+#   install.sh                (the installer, stamped with this image's tag;
+#                              servers fetch it from the image, see INSTALL.md)
 #
 # Runtime contract: unprivileged uid 10001, read-only root filesystem, no
 # capabilities, one volume for all state. The console (8443) is HTTPS-only;
@@ -34,6 +36,7 @@ RUN set -e; \
     echo "$sum  /usr/local/bin/cloudflared" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/aegisd /usr/local/bin/aegisctl /usr/local/bin/cloudflared
 COPY clients/ /usr/share/aegisnet/clients/
+COPY install.sh /usr/share/aegisnet/install.sh
 ENV AEGIS_DATA_DIR=/var/lib/aegisnet
 USER 10001:10001
 VOLUME ["/var/lib/aegisnet"]
