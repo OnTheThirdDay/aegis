@@ -1,10 +1,13 @@
 name: Release
 
 # Publishes builds of the branch flow (see docs/RELEASING.md):
-#   staging  -> image ghcr.io/<owner>/aegis:staging (+ :sha-xxxxxxx) for pre-release testing
-#   main     -> when the workspace version has no tag yet: tag vX.Y.Z, multi-arch image
-#               ghcr.io/<owner>/aegis:X.Y.Z + :latest, and a GitHub Release with the
-#               client apps and SHA256SUMS
+#   main (push)        -> when the workspace version has no tag yet: tag vX.Y.Z,
+#                         multi-arch image ghcr.io/<owner>/aegis:X.Y.Z + :latest, and a
+#                         GitHub Release with the client apps and SHA256SUMS
+#   manual run (Actions -> Release -> Run workflow), to test before a release:
+#     on staging       -> image ghcr.io/<owner>/aegis:staging (+ :sha-xxxxxxx)
+#     on a work branch -> image ghcr.io/<owner>/aegis:test-<branch> (+ :sha-xxxxxxx)
+# Merging into staging builds nothing by itself (a full build takes ~30 minutes).
 # Versions are bumped by version.yml, never by hand on main.
 #
 # Also runs the main gate (main only holds content tested on staging) and
@@ -12,8 +15,7 @@ name: Release
 #
 # Cost (private repository, free plan): all builds run on Linux (the Windows
 # client cross-compiles with mingw); macOS clients are built only for releases
-# on main, in one job. Staging pushes that change only documentation build
-# nothing.
+# on main, in one job; test images only when asked for.
 #
 # Servers install from the public image alone: it carries install.sh, stamped
 # with its own tag (the repository itself may be private).
@@ -25,7 +27,7 @@ name: Release
 
 on:
   push:
-    branches: [main, staging]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -49,6 +51,8 @@ jobs:
       channel: ${{ steps.plan.outputs.channel }}
       version: ${{ steps.plan.outputs.version }}
       image: ${{ steps.plan.outputs.image }}
+      # Image tag of a test build (staging or test-<branch>).
+      tag: ${{ steps.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -60,14 +64,10 @@ jobs:
           version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          tag=""
           case "$GITHUB_REF" in
             refs/heads/staging)
-              channel=staging
-              # Nothing to rebuild when the push only changed documentation.
-              if git rev-parse -q --verify HEAD^1 >/dev/null \
-                && ! git diff --name-only HEAD^1 HEAD | grep -qvE '(\.md$|^docs/|^LICENSE)'; then
-                channel=none; echo "Documentation only; the staging image is unchanged."
-              fi ;;
+              channel=staging; tag=staging ;;
             refs/heads/main)
               # Main gate: main only holds content that was tested on staging.
               # (fetch-depth 0 already brought origin/staging and all tags.)
@@ -79,10 +79,16 @@ jobs:
               else
                 channel=release
               fi ;;
+            refs/heads/*)
+              # A test build of a work branch (manual runs only).
+              branch=${GITHUB_REF#refs/heads/}
+              slug=$(printf '%s' "$branch" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-' | cut -c1-100)
+              channel=staging; tag="test-$slug" ;;
             *) channel=none ;;
           esac
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-          echo "Channel: $channel, version $version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Channel: $channel, version $version${tag:+, image tag $tag}"
 
   gateway:
     needs: plan
@@ -222,12 +228,13 @@ jobs:
           IMAGE: ${{ needs.plan.outputs.image }}
           VERSION: ${{ needs.plan.outputs.version }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
           cp deploy/Dockerfile.prebuilt context/Dockerfile
           chmod 0755 context/bin/*/* context/clients/*
           # The image's installer installs this image's tag by default.
-          if [ "$CHANNEL" = release ]; then tag=$VERSION; else tag=staging; fi
+          if [ "$CHANNEL" = release ]; then tag=$VERSION; else tag=$TAG; fi
           sed -e "s|^RELEASE_IMAGE=\"@IMAGE@\"|RELEASE_IMAGE=\"$IMAGE:$tag\"|" \
             deploy/install.sh > context/install.sh
           grep -q "^RELEASE_IMAGE=\"$IMAGE:$tag\"" context/install.sh
@@ -245,12 +252,13 @@ jobs:
           IMAGE: ${{ needs.plan.outputs.image }}
           VERSION: ${{ needs.plan.outputs.version }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           short=${GITHUB_SHA::7}
           if [ "$CHANNEL" = release ]; then
             tags="$IMAGE:$VERSION,$IMAGE:latest,$IMAGE:sha-$short"
           else
-            tags="$IMAGE:staging,$IMAGE:sha-$short"
+            tags="$IMAGE:$TAG,$IMAGE:sha-$short"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
       - id: push
