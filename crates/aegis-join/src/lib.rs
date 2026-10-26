@@ -499,7 +499,9 @@ pub fn adopt_endpoint(dir: &DeviceDir, endpoint: &Endpoint) -> Result<Device, Jo
             let _ = std::fs::remove_file(&outer);
         }
     }
-    let _ = std::fs::remove_file(dir.identity().join(STAGED_OUTER_CA));
+    // The staged copy stays: the verified trial node keeps running with it
+    // and reads it again whenever it rebuilds its tunnel (e.g. after a
+    // certificate renewal). The next trial overwrites it.
     device.url = endpoint.url.clone();
     device.enroll_url = endpoint.enroll_url.clone();
     device.server_name = endpoint.server_name.clone();

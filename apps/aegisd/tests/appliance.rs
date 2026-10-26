@@ -424,6 +424,10 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
             .call(reqwest::Method::POST, "/system/device-ca/export-root-key", Some(json!({"password": "a much better passphrase"})))
             .await;
         assert_eq!(s, 404, "exporting the root key stays local-only");
+        let (s, _) = admin
+            .call(reqwest::Method::POST, "/system/device-ca/export%2Droot-key", Some(json!({"password": "a much better passphrase"})))
+            .await;
+        assert_eq!(s, 404, "an encoded path doesn't get past the rule");
         let mut again = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
         again.base = admin.base.clone();
         let (s, _) = again

@@ -119,25 +119,53 @@ async fn route_edge_inner(
             .and_then(|h| std::str::from_utf8(h.value).ok())
             .map(str::trim)
     };
-    let length = header("content-length").and_then(|v| v.parse::<usize>().ok());
-    // Reverse proxies (e.g. a Cloudflare tunnel) may forward the body
-    // chunked; accept exactly `chunked`, never both framings.
+    let length = match header("content-length") {
+        None => None,
+        Some(v) => match v.parse::<usize>() {
+            Ok(l) => Some(l),
+            Err(_) => {
+                refuse(io, "400 Bad Request").await;
+                return None;
+            }
+        },
+    };
+    // Proxies such as Cloudflare's forward a body with Content-Length, as
+    // chunked, or with both headers. Chunked takes precedence (RFC 9112
+    // 6.3); this connection serves one request and then closes, so a
+    // conflicting length can't desynchronize a following request.
     let chunked = match header("transfer-encoding") {
         None => false,
-        Some(v) if v.eq_ignore_ascii_case("chunked") && length.is_none() => true,
-        Some(_) => return None,
+        Some(v) if v.eq_ignore_ascii_case("chunked") => true,
+        Some(_) => {
+            refuse(io, "501 Not Implemented").await;
+            return None;
+        }
     };
     let mut body = buf[head_end..].to_vec();
     if chunked {
-        body = read_chunked(io, body).await?;
+        body = match read_chunked(io, body).await {
+            Ok(b) => b,
+            Err(BodyError::TooLarge) => {
+                refuse(io, "413 Content Too Large").await;
+                return None;
+            }
+            Err(BodyError::Malformed) => {
+                refuse(io, "400 Bad Request").await;
+                return None;
+            }
+            Err(BodyError::Closed) => return None,
+        };
     } else {
-        let Some(length) = length.filter(|l| *l <= EDGE_MAX_BODY) else {
-            let _ = io
-                .write_all(b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await;
+        let Some(length) = length else {
+            refuse(io, "411 Length Required").await;
             return None;
         };
+        if length > EDGE_MAX_BODY {
+            refuse(io, "413 Content Too Large").await;
+            return None;
+        }
         if body.len() > length {
+            refuse(io, "400 Bad Request").await;
             return None;
         }
         while body.len() < length {
@@ -170,9 +198,36 @@ async fn route_edge_inner(
     None
 }
 
-/// Decode a chunked body (bounded by `EDGE_MAX_BODY`); trailers ignored.
-async fn read_chunked(io: &mut Box<dyn Duplex>, mut raw: Vec<u8>) -> Option<Vec<u8>> {
+/// Answer a refused edge request and close: a proxy in front (Cloudflare)
+/// then relays a meaningful status instead of a bare 502.
+async fn refuse(io: &mut Box<dyn Duplex>, status: &str) {
+    use tokio::io::AsyncWriteExt;
+    let head = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let _ = io.write_all(head.as_bytes()).await;
+    let _ = io.shutdown().await;
+}
+
+/// Read more of a request body into `raw`.
+async fn fill(io: &mut Box<dyn Duplex>, raw: &mut Vec<u8>) -> Result<(), BodyError> {
     use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 4096];
+    let n = io.read(&mut chunk).await.map_err(|_| BodyError::Closed)?;
+    if n == 0 {
+        return Err(BodyError::Closed);
+    }
+    raw.extend_from_slice(&chunk[..n]);
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BodyError {
+    TooLarge,
+    Malformed,
+    Closed,
+}
+
+/// Decode a chunked body (bounded by `EDGE_MAX_BODY`); trailers ignored.
+async fn read_chunked(io: &mut Box<dyn Duplex>, mut raw: Vec<u8>) -> Result<Vec<u8>, BodyError> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     loop {
@@ -182,36 +237,31 @@ async fn read_chunked(io: &mut Box<dyn Duplex>, mut raw: Vec<u8>) -> Option<Vec<
                 break pos + i;
             }
             if raw.len() > EDGE_MAX_BODY * 2 {
-                return None;
+                return Err(BodyError::TooLarge);
             }
-            let mut chunk = [0u8; 4096];
-            let n = io.read(&mut chunk).await.ok()?;
-            if n == 0 {
-                return None;
-            }
-            raw.extend_from_slice(&chunk[..n]);
+            fill(io, &mut raw).await?;
         };
-        let size_text = std::str::from_utf8(&raw[pos..line_end]).ok()?;
-        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        let size_text =
+            std::str::from_utf8(&raw[pos..line_end]).map_err(|_| BodyError::Malformed)?;
+        let size = size_text
+            .split(';')
+            .next()
+            .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())
+            .ok_or(BodyError::Malformed)?;
         pos = line_end + 2;
         if size == 0 {
-            return Some(out);
+            return Ok(out);
         }
         // Bound the size before arithmetic: a huge hex size must not overflow.
         if size > EDGE_MAX_BODY - out.len() {
-            return None;
+            return Err(BodyError::TooLarge);
         }
         while raw.len() < pos + size + 2 {
-            let mut chunk = [0u8; 4096];
-            let n = io.read(&mut chunk).await.ok()?;
-            if n == 0 {
-                return None;
-            }
-            raw.extend_from_slice(&chunk[..n]);
+            fill(io, &mut raw).await?;
         }
         out.extend_from_slice(&raw[pos..pos + size]);
         if &raw[pos + size..pos + size + 2] != b"\r\n" {
-            return None;
+            return Err(BodyError::Malformed);
         }
         pos += size + 2;
     }
@@ -491,9 +541,72 @@ mod tests {
     use super::*;
 
     async fn chunked(raw: &[u8]) -> Option<Vec<u8>> {
+        chunked_result(raw).await.ok()
+    }
+
+    async fn chunked_result(raw: &[u8]) -> Result<Vec<u8>, BodyError> {
         let (io, _peer) = tokio::io::duplex(64);
         let mut io: Box<dyn Duplex> = Box::new(io);
         read_chunked(&mut io, raw.to_vec()).await
+    }
+
+    /// One request through the edge router; returns the response text and
+    /// the body the hook received.
+    async fn edge(request: &str) -> (String, Option<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let s2 = Arc::clone(&seen);
+        let hook: crate::EdgeHook = Arc::new(move |_req, body| {
+            *s2.lock().expect("lock") = Some(body);
+            Box::pin(async { (200, b"{}".to_vec()) })
+        });
+        let route = tokio::spawn(async move {
+            let io: Box<dyn Duplex> = Box::new(server);
+            let _ = route_edge(io, "/agp", hook, false).await;
+        });
+        client.write_all(request.as_bytes()).await.expect("write");
+        // A malformed request must not wait forever for more input.
+        client.shutdown().await.expect("shutdown");
+        let mut out = Vec::new();
+        let _ = client.read_to_end(&mut out).await;
+        route.await.expect("join");
+        let body = seen.lock().expect("lock").take();
+        (String::from_utf8_lossy(&out).into_owned(), body)
+    }
+
+    #[tokio::test]
+    async fn proxied_framings_are_accepted_and_refusals_answered() {
+        // Both headers, as a proxy may forward: chunked wins.
+        let (resp, body) = edge(
+            "POST /renew HTTP/1.1\r\nHost: x\r\nContent-Length: 999\r\nTransfer-Encoding: chunked\r\n\r\n\
+             3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert_eq!(body.as_deref(), Some(&b"abcde"[..]));
+        // Plain length.
+        let (resp, body) =
+            edge("POST /renew HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nxyz").await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert_eq!(body.as_deref(), Some(&b"xyz"[..]));
+        // Refusals are answered, never a silent close (a proxy's 502).
+        let big = format!(
+            "POST /renew HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            EDGE_MAX_BODY + 1
+        );
+        let (resp, body) = edge(&big).await;
+        assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+        assert!(body.is_none());
+        let (resp, _) = edge("POST /renew HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 411"), "{resp}");
+        let (resp, _) =
+            edge("POST /renew HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 501"), "{resp}");
+        let (resp, _) =
+            edge("POST /renew HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")
+                .await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
     }
 
     #[tokio::test]
@@ -515,5 +628,11 @@ mod tests {
             None,
             "missing CRLF after data"
         );
+        // Each refusal has its reason (answered as 413 / 400).
+        assert_eq!(
+            chunked_result(format!("{:x}\r\n", EDGE_MAX_BODY + 1).as_bytes()).await,
+            Err(BodyError::TooLarge)
+        );
+        assert_eq!(chunked_result(b"zz\r\n").await, Err(BodyError::Malformed));
     }
 }

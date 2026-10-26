@@ -13,6 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// How often a connected client checks whether its certificate is due for
+/// renewal (renewal itself starts 10 days before expiry).
+const RENEWAL_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// A changed server address that couldn't be verified from this network is
+/// tried again after this long (each try can take ~15 s before falling back).
+const ENDPOINT_RETRY: Duration = Duration::from_secs(3600);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     NotEnrolled,
@@ -127,6 +134,7 @@ impl Engine {
             node: None,
             repaint,
             proxy_saved: None,
+            endpoint_failed: None,
         };
         runtime.spawn(worker.run(rx));
         Ok(Engine {
@@ -164,6 +172,9 @@ struct Worker {
     node: Option<aegis_node::NodeRuntime>,
     repaint: Box<dyn Fn() + Send + Sync>,
     proxy_saved: Option<sysproxy::Saved>,
+    /// A changed server address that failed its check here, and when: it
+    /// isn't tried again on every reconnect (see ENDPOINT_RETRY).
+    endpoint_failed: Option<(String, Instant)>,
 }
 
 impl Worker {
@@ -207,6 +218,7 @@ impl Worker {
         }
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         let mut checks = 0u32;
+        let mut renewal_checked = Instant::now();
         loop {
             tokio::select! {
                 cmd = rx.recv() => {
@@ -262,6 +274,12 @@ impl Worker {
                 _ = tick.tick() => {
                     checks = checks.wrapping_add(1);
                     self.refresh(checks.is_multiple_of(15)).await;
+                    // A device left connected for weeks never passes through
+                    // connect(): renew in the background too.
+                    if self.node.is_some() && renewal_checked.elapsed() >= RENEWAL_CHECK {
+                        renewal_checked = Instant::now();
+                        self.renew_connected().await;
+                    }
                     let recording = self.diag.is_recording();
                     if self.diag_was_recording && !recording {
                         // The recording ran out: hand it to the server.
@@ -328,7 +346,7 @@ impl Worker {
                     self.update(|s| {
                         s.status = Status::Disconnected;
                         s.error = Some(format!(
-                            "This device's certificate expired and could not be renewed ({e}). Ask for a new invitation."
+                            "This device's certificate expired and could not be renewed ({e}). If it expired over 90 days ago or the device was removed, ask for a new invitation."
                         ));
                     });
                     return;
@@ -419,6 +437,13 @@ impl Worker {
                 return None;
             }
         };
+        if self
+            .endpoint_failed
+            .as_ref()
+            .is_some_and(|(url, at)| *url == endpoint.url && at.elapsed() < ENDPOINT_RETRY)
+        {
+            return None;
+        }
         self.diag.note(
             Severity::Info,
             "client.endpoint.changed",
@@ -437,6 +462,7 @@ impl Worker {
                     s.server = Some(host.clone());
                     s.info = Some(format!("The server's address changed; now using {host}."));
                 });
+                self.endpoint_failed = None;
                 return Some(node);
             }
         }
@@ -445,6 +471,7 @@ impl Worker {
             "client.endpoint.rejected",
             &[("url", &endpoint.url)],
         );
+        self.endpoint_failed = Some((endpoint.url.clone(), Instant::now()));
         node.shutdown(Duration::from_secs(1)).await;
         None
     }
@@ -499,6 +526,33 @@ impl Worker {
             s.system_proxy_active = false;
             s.error = None;
         });
+    }
+
+    /// Renew a due certificate while connected and switch the running node
+    /// to it; established sessions keep going.
+    async fn renew_connected(&mut self) {
+        match aegis_join::renew_if_due(&self.device, false).await {
+            Ok(true) => {
+                if let Some(node) = &self.node {
+                    if let Err(e) = node.ctx.reload_certificates() {
+                        self.diag.note(
+                            Severity::Warn,
+                            "client.renew.reload_failed",
+                            &[("error", &e)],
+                        );
+                    }
+                }
+                let exp = self.device.certificate_expires_at().ok();
+                self.update(|s| s.certificate_expires_at = exp);
+                self.diag.note(Severity::Info, "client.renew.ok", &[]);
+            }
+            Ok(false) => {}
+            Err(e) => self.diag.note(
+                Severity::Warn,
+                "client.renew.failed",
+                &[("error", &e.to_string())],
+            ),
+        }
     }
 
     /// Refresh counters; with `probe`, verify the gateway end to end.

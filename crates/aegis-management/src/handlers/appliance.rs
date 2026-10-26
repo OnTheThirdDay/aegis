@@ -246,6 +246,7 @@ pub async fn put_portal(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) 
 /// or put it back (owner only). Exporting the key needs the password again.
 pub async fn device_ca(
     State(ctx): State<Ctx>,
+    portal: Option<axum::Extension<crate::portal::PortalRequest>>,
     headers: HeaderMap,
     Path(action): Path<String>,
     body: Body,
@@ -258,16 +259,22 @@ pub async fn device_ca(
     ) {
         return Err(ApiError::not_found());
     }
+    // The root key never leaves through the public address, however the
+    // path was spelled (the portal guard sees it still percent-encoded).
+    if portal.is_some() && action == "export-root-key" {
+        return Err(ApiError::not_found());
+    }
     let v = read_json(&headers, body, &["application/json"]).await?;
     let appliance = ctx
         .appliance()
         .ok_or_else(|| ApiError::conflict("appliance_mode_required"))?;
     let (c, actor) = (ctx.clone(), p.id.clone());
     let export = action == "export-root-key";
+    let portal = portal.is_some();
     let out = blocking(move || {
         if export {
             let password = v.get("password").and_then(Value::as_str).unwrap_or("");
-            c.confirm_password(&actor, password)?;
+            c.confirm_password(&actor, password, portal)?;
         }
         appliance
             .device_ca(&action, &actor, v)

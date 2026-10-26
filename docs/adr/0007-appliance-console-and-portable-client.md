@@ -39,8 +39,10 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
    - **The console is never published through Cloudflare:** tunnel ingress routes only the device paths and, since ADR-0010, the restricted user portal: `^/(agp|enroll|renew|portal(/.*)?)$`.
 4. **Edge enrollment.** Devices enroll and renew through the public data-plane listener (`POST /enroll`, `POST /renew`), so the console need not be reachable from the internet.
    - Both endpoints share one implementation and one rate limiter with the API endpoint.
-   - Bodies are bounded at 32 KiB; chunked bodies are accepted for proxies.
-   - Renewal is **same-key**: the CSR must carry the enrolled public key. rcgen verifies the CSR signature, which proves possession of that key. Revoked or expired devices cannot renew.
+   - Bodies are bounded at 2 MiB (diagnostic reports travel on `/renew`). Proxies may forward a body with a length, chunked, or with both headers; chunked then wins (RFC 9112 §6.3). Refused requests are answered with a status (400, 411, 413, 501) rather than a closed connection, which a proxy would turn into a bare 502.
+   - Renewal is **same-key**: the CSR must carry the enrolled public key. rcgen verifies the CSR signature, which proves possession of that key. Revoked devices cannot renew.
+   - Clients renew 10 days before expiry: when connecting, and every 6 hours while connected (the running node switches to the new certificate without dropping sessions).
+   - **Grace renewal** (owner decision, 2026-10-27): a device whose certificate expired up to 90 days ago may still renew. The chain is checked as of the certificate's last valid second, and the registry must still list the device as active. The renewal is audited with how long the certificate had been expired. Past 90 days, or once revoked, the device needs a new invitation.
 5. **Invitation codes.** Codes have the form `aegis1:` + base64url JSON. They carry:
    - the endpoint;
    - the inner server name;

@@ -113,11 +113,16 @@ impl Appliance {
     /// Renew the device issuer now with `root_key_pem`, then re-issue the
     /// gateway's identity from it and reload.
     fn renew_issuer_with(&self, root_key_pem: &str) -> Result<Value, (u16, String)> {
-        let issuer = appliance::rotate_issuer_with(&self.secrets, root_key_pem).map_err(|_| {
-            (
-                400,
-                "that file is not this gateway's device root key".to_owned(),
-            )
+        let issuer = appliance::rotate_issuer_with(&self.secrets, root_key_pem).map_err(|e| {
+            if e == "E_NOT_ROOT_KEY" {
+                (
+                    400,
+                    "that file is not this gateway's device root key".to_owned(),
+                )
+            } else {
+                // The key was right; the server failed (e.g. a full disk).
+                (500, format!("the device issuer could not be renewed: {e}"))
+            }
         })?;
         appliance::issue_gateway_identity(&self.secrets, &issuer).map_err(|e| {
             (

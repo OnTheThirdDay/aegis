@@ -35,7 +35,7 @@ pub(crate) struct PortalRequest;
 
 /// Portal connections served at once.
 pub const MAX_CONNECTIONS: usize = 64;
-/// An idle keep-alive connection closes after this long.
+/// A connection whose request head hasn't arrived closes after this long.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The routes a portal user needs, nothing else.
@@ -68,8 +68,35 @@ fn allowed(method: &Method, path: &str) -> bool {
 
 /// Console actions never offered on the public address, even to an
 /// administrator signed in with 2FA: taking the device root key off the server.
+/// Compared decoded; the handler refuses portal requests for it as well.
 fn local_only(method: &Method, path: &str) -> bool {
-    *method == Method::POST && path == "/api/v1/system/device-ca/export-root-key"
+    *method == Method::POST
+        && percent_decode(path).as_deref() == Some("/api/v1/system/device-ca/export-root-key")
+}
+
+/// Percent-decode a URI path; `None` when the result isn't UTF-8.
+fn percent_decode(path: &str) -> Option<String> {
+    let b = path.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (
+            b[i],
+            b.get(i + 1).copied().and_then(hex),
+            b.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Whether the portal is switched on (default: on).
@@ -179,24 +206,44 @@ pub fn router(ctx: Arc<ManagementContext>) -> Router {
     Router::new().nest_service("/portal", inner)
 }
 
-/// Serve one HTTP/1.1 connection handed over by the gateway's edge (its
-/// path starts with `/portal`). Returns when the connection closes.
-pub async fn serve_connection<I>(ctx: Arc<ManagementContext>, mut io: I)
-where
-    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let Ok(_slot) = Arc::clone(&ctx.portal_slots).try_acquire_owned() else {
-        let _ = io
-            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+/// Serves the connections the gateway's edge hands over (their first path
+/// starts with `/portal`). The router is built once.
+#[derive(Clone)]
+pub struct Server {
+    ctx: Arc<ManagementContext>,
+    router: Router,
+}
+
+impl Server {
+    pub fn new(ctx: Arc<ManagementContext>) -> Server {
+        Server {
+            router: router(Arc::clone(&ctx)),
+            ctx,
+        }
+    }
+
+    /// Serve one request on a handed-over HTTP/1.1 connection, then close
+    /// it. The edge routes a connection by its first request, so keeping it
+    /// alive would let a proxy that pools connections (cloudflared) send a
+    /// device's `/renew` or `/agp` here, where it would get a 404.
+    pub async fn serve_connection<I>(self, mut io: I)
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let Ok(_slot) = Arc::clone(&self.ctx.portal_slots).try_acquire_owned() else {
+            let _ = io
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            return;
+        };
+        let service = hyper_util::service::TowerToHyperService::new(self.router);
+        let _ = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(HEADER_TIMEOUT)
+            .keep_alive(false)
+            .serve_connection(hyper_util::rt::TokioIo::new(io), service)
             .await;
-        return;
-    };
-    let service = hyper_util::service::TowerToHyperService::new(router(ctx));
-    let _ = hyper::server::conn::http1::Builder::new()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(HEADER_TIMEOUT)
-        .serve_connection(hyper_util::rt::TokioIo::new(io), service)
-        .await;
+    }
 }
 
 /// `GET/PUT /api/v1/system/portal` (console): show or switch the portal.
@@ -210,6 +257,24 @@ pub(crate) fn status_json(ctx: &ManagementContext) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_key_export_is_local_only_however_spelled() {
+        for p in [
+            "/api/v1/system/device-ca/export-root-key",
+            "/api/v1/system/device-ca/export%2Droot-key",
+            "/api/v1/system/device-ca/%65xport-root-key",
+            "/api/v1/system/device%2Dca/export%2droot%2Dkey",
+        ] {
+            assert!(local_only(&Method::POST, p), "{p}");
+        }
+        assert!(!local_only(
+            &Method::POST,
+            "/api/v1/system/device-ca/renew-issuer"
+        ));
+        assert_eq!(percent_decode("/a%2"), Some("/a%2".into()));
+        assert_eq!(percent_decode("/%ff"), None);
+    }
 
     #[test]
     fn only_self_service_routes() {
