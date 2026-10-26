@@ -1,22 +1,37 @@
-# Branch / nightly gates (06 §2, 07 §11). Branch flow (docs/RELEASING.md):
-#   work branches -> staging -> main, by pull request only. Every branch push
-#   runs the full gates; pull request events only run branch-policy. main
-#   additionally verifies its content already passed through staging.
+# Branch / weekly gates (06 §2, 07 §11). Branch flow (docs/RELEASING.md):
+#   work branches -> staging -> main, by pull request only.
 #
-# Reference implementation only:
-# protected environments, Pi/CF lab runners and signing are NOT configured
-# here and remain BLOCKED until provisioned.
+# Sized for the free plan of a private repository (2,000 Linux minutes a
+# month; Windows counts 2x, macOS 10x, and every job rounds up to whole
+# minutes), so:
+#   * one cached Linux job does fmt, clippy, architecture rules, tests and a
+#     Windows compile check (mingw), on code pushes to any branch but main
+#     (main only ever receives content already tested on staging; its gate
+#     runs in release.yml);
+#   * documentation-only pushes run nothing;
+#   * staging additionally runs the dependency gates (cargo-deny, cargo-audit);
+#   * fuzzing and the large property budget run weekly (and on demand);
+#   * pull requests only run branch-policy, and only into main;
+#   * macOS is built only by release.yml for releases on main.
 #
-# Supply chain: before enabling on a real repository, pin every `uses:` to a
-# reviewed full commit SHA (06 §2.2). Tags below are placeholders.
+# Reference implementation only: protected environments, Pi/CF lab runners
+# and signing are NOT configured here and remain BLOCKED until provisioned.
+# Supply chain: pin every `uses:` to a reviewed full commit SHA (06 §2.2).
 name: ci
 
 on:
-  pull_request:
   push:
+    branches-ignore: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE*", ".gitattributes"]
+  pull_request:
+    branches: [main]
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 3 * * 0" # Sundays
   workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per fuzz target (0 = skip fuzzing)
+        default: "180"
 
 permissions:
   contents: read
@@ -28,112 +43,93 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  CARGO_DENY_VERSION: "0.20.2"
+  CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_AUDIT_SHA256: 7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
 
 jobs:
-  lint:
-    if: github.event_name != 'pull_request'
+  check:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: rustup show active-toolchain || rustup toolchain install
+      - name: Windows cross toolchain
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 >/dev/null
+          rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Only the long-lived branches write the cache; work branches read it.
+          save-if: ${{ github.ref == 'refs/heads/staging' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Architecture rules (A-002 / TC-U01)
         run: |
           cargo run --locked -q -p xtask -- arch-check
           cargo run --locked -q -p xtask -- arch-check --self-test
+      - run: cargo test --locked --workspace
+      - name: Windows compile check
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+          CFLAGS_x86_64_pc_windows_gnu: -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00
+        run: cargo check --locked --workspace --target x86_64-pc-windows-gnu
+      - name: Dependency gates (staging)
+        if: github.ref == 'refs/heads/staging' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          tools=$(mktemp -d)
+          curl -fsSL -o "$tools/deny.tgz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$CARGO_DENY_SHA256  $tools/deny.tgz" | sha256sum -c -
+          curl -fsSL -o "$tools/audit.tgz" \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv$CARGO_AUDIT_VERSION/cargo-audit-x86_64-unknown-linux-musl-v$CARGO_AUDIT_VERSION.tgz"
+          echo "$CARGO_AUDIT_SHA256  $tools/audit.tgz" | sha256sum -c -
+          tar -xzf "$tools/deny.tgz" -C "$tools" --strip-components=1
+          tar -xzf "$tools/audit.tgz" -C "$tools" --strip-components=1
+          "$tools/cargo-deny" --locked check advisories bans licenses sources
+          "$tools/cargo-audit" audit --deny warnings
+          "$tools/cargo-audit" audit --deny warnings --file fuzz/Cargo.lock
 
-  test-linux-x86_64:
-    if: github.event_name != 'pull_request'
+  weekly:
+    # Fuzzing (07 §11) and the large property budget. Weekly, or on demand
+    # with workflow_dispatch (fuzz_seconds per target; 0 skips fuzzing).
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_seconds != '0')
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - run: cargo build --locked --workspace
-      - run: cargo test --locked --workspace
-      - name: Property budget on schedule (07 §11 MAIN/NIGHTLY)
-        if: github.event_name == 'schedule'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Property budget (07 §11 MAIN/NIGHTLY)
         env:
           PROPTEST_CASES: "100000"
         run: cargo test --locked -p aegis-agp --release
-
-  cross-linux-aarch64:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - run: rustup target add aarch64-unknown-linux-gnu
-      - name: Cross build (real Pi 4B tests run only on the protected lab runner)
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --locked --target aarch64-unknown-linux-gnu -p aegisd -p aegisctl
-
-  build-probes:
-    # Windows/macOS compile probes (the client app is built for real by release.yml).
-    if: github.event_name != 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, macos-14]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - run: cargo check --locked --workspace
-
-  supply-chain:
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - run: cargo install --locked cargo-deny --version 0.20.2
-      - run: cargo deny --locked check advisories bans licenses sources
-
-  audit:
-    if: github.event_name != 'pull_request'
-    # RustSec advisories for direct + transitive deps (TC-S01). Runs on every
-    # PR/push and nightly, so advisories published after merge still fail
-    # the scheduled run. Unmaintained/yanked warnings are errors.
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - run: cargo install --locked cargo-audit --version 0.22.2
-      - run: cargo audit --deny warnings
-      - run: cargo audit --deny warnings --file fuzz/Cargo.lock
-
-  fuzz-smoke:
-    if: github.event_name != 'pull_request'
-    # PR: 60 s per parser target (07 §11). Requires nightly + cargo-fuzz.
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
       - run: rustup toolchain install nightly --profile minimal
       - run: cargo +nightly install --locked cargo-fuzz --version 0.13.2
       - name: Fuzz each target
+        env:
+          SECS: ${{ inputs.fuzz_seconds || '180' }}
         run: |
-          secs=60
-          if [ "${{ github.event_name }}" = "schedule" ]; then secs=1800; fi
           for t in agp_decoder agp_control config_toml http_connect_head destination; do
-            cargo +nightly fuzz run "$t" -- -max_total_time=$secs -rss_limit_mb=2048
+            cargo +nightly fuzz run "$t" -- -max_total_time="$SECS" -timeout=30 -rss_limit_mb=2048
           done
 
   branch-policy:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Only staging may be merged into main
         env:
@@ -145,62 +141,3 @@ jobs:
             exit 1
           fi
           echo "OK: $HEAD -> $BASE"
-
-  main-gate:
-    # Rulesets need a paid plan for private repos, so main enforces the flow
-    # itself: its file tree must equal a commit that exists on staging.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify main only contains staged content
-        run: |
-          tree=$(git rev-parse 'HEAD^{tree}')
-          if git log origin/staging --format=%T | grep -qx "$tree"; then
-            echo "OK: this exact content exists on staging"
-          else
-            echo "::error::main contains changes that never went through staging. Merge them into staging, then use the release pull request staging -> main."
-            exit 1
-          fi
-
-  required:
-    # Aggregate gate: fails if any required child failed, was cancelled or
-    # skipped. A missing result is never an implicit pass.
-    if: always() && github.event_name != 'pull_request'
-    needs: [lint, test-linux-x86_64, cross-linux-aarch64, build-probes, supply-chain, audit, fuzz-smoke]
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check results
-        env:
-          RESULTS: ${{ toJSON(needs.*.result) }}
-        run: |
-          echo "$RESULTS"
-          if echo "$RESULTS" | grep -qE '"(failure|cancelled|skipped)"'; then exit 1; fi
-
-  # After a release reaches main, move staging up to main so GitHub doesn't
-  # report staging as "behind" by the release merge commit. Fast-forward only;
-  # staging with new work is left alone. GITHUB_TOKEN pushes trigger nothing.
-  sync-staging:
-    needs: [required, main-gate]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Fast-forward staging to main
-        run: |
-          set -euo pipefail
-          if [ "$(git rev-parse origin/staging)" = "$(git rev-parse origin/main)" ]; then
-            echo "staging is already at main."
-          elif git merge-base --is-ancestor origin/staging origin/main; then
-            git push origin "$(git rev-parse origin/main):refs/heads/staging"
-            echo "Fast-forwarded staging to $(git rev-parse --short origin/main)."
-          else
-            echo "staging has commits that aren't on main yet; leaving it as is."
-          fi
