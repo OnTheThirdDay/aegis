@@ -154,3 +154,38 @@ fn offline_root_intermediate_chain_and_forbidden_csr_extensions() {
     )
     .is_err());
 }
+
+#[test]
+fn client_certificates_validate_as_of_a_given_time() {
+    let root = pki::generate_offline_root("offline root").expect("root");
+    let issuer =
+        pki::generate_intermediate(&root, "issuer", std::time::Duration::from_secs(365 * 86400))
+            .expect("issuer");
+    let (_, csr) = pki::generate_key_and_csr("device").expect("CSR");
+    let cert = pki::sign_csr(
+        &issuer,
+        &csr,
+        "device",
+        Role::Client,
+        &[],
+        pki::DEFAULT_NODE_VALIDITY,
+    )
+    .expect("sign");
+    let chain = format!("{cert}{}", issuer.cert_pem);
+    let peer = tls::validate_client_certificate(&chain, &root.cert_pem).expect("valid now");
+    // Grace renewal checks an expired certificate as of its last valid second.
+    tls::validate_client_certificate_at(&chain, &root.cert_pem, peer.not_after - 1)
+        .expect("valid at its last second");
+    assert!(
+        tls::validate_client_certificate_at(&chain, &root.cert_pem, peer.not_after + 1).is_err()
+    );
+    assert!(
+        tls::validate_client_certificate_at(&chain, &other_root(), peer.not_after - 1).is_err()
+    );
+}
+
+fn other_root() -> String {
+    pki::generate_offline_root("someone else")
+        .expect("root")
+        .cert_pem
+}

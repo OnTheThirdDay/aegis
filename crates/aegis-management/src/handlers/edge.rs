@@ -175,10 +175,16 @@ pub(crate) async fn redeem(
     .await
 }
 
-/// Renew an enrolled, unexpired, unrevoked device certificate. The CSR must
-/// reuse the enrolled key (proof of possession); the new certificate keeps
-/// the device's name, role and owner. Old certificates stay valid until
-/// they expire or the device is revoked.
+/// How long after expiry a device may still renew: a laptop that stayed
+/// offline past its certificate's lifetime reconnects without a new
+/// invitation, as long as it still holds its key and wasn't revoked.
+pub(crate) const RENEW_GRACE_SECONDS: i64 = 90 * 86_400;
+
+/// Renew an enrolled, unrevoked device certificate that is unexpired or
+/// expired within [`RENEW_GRACE_SECONDS`]. The CSR must reuse the enrolled
+/// key (proof of possession); the new certificate keeps the device's name,
+/// role and owner. Old certificates stay valid until they expire or the
+/// device is revoked.
 pub(crate) async fn renew_self(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
     let permit = ctx.auth.enrollment_permit()?;
     let b: RenewBody =
@@ -193,7 +199,8 @@ pub(crate) async fn renew_self(ctx: &Ctx, body: Value) -> Result<Value, ApiError
     let c = ctx.clone();
     blocking(move || {
         let _permit = permit;
-        let device = authenticate_device(&c, &anchor, &b.certificate_pem)?;
+        let device = authenticate_device(&c, &anchor, &b.certificate_pem, RENEW_GRACE_SECONDS)?;
+        let expired_for = (db::now_unix() - device.not_after).max(0);
         let (node_id, name, der) = (device.node_id, device.name, device.der);
         let store = c.coord.store();
         let cert = pki::sign_renewal_csr(
@@ -234,7 +241,11 @@ pub(crate) async fn renew_self(ctx: &Ctx, body: Value) -> Result<Value, ApiError
                     target_id: Some(&node_id),
                     decision: "allowed",
                     revision_digest: None,
-                    metadata: json!({}),
+                    metadata: if expired_for > 0 {
+                        json!({"expired_for_seconds": expired_for})
+                    } else {
+                        json!({})
+                    },
                 },
             )
         })?;
@@ -257,17 +268,36 @@ pub(crate) struct Device {
     pub name: String,
     /// Leaf certificate DER.
     pub der: Vec<u8>,
+    /// Unix seconds.
+    pub not_after: i64,
 }
 
 /// Authenticate a presented device certificate exactly as the data plane
 /// would: chain to the device trust anchor, then registry lookup. Blocking.
+///
+/// `grace` seconds after expiry, the certificate is still accepted, checked
+/// as of its last valid second (only for renewal; 0 everywhere else).
 pub(crate) fn authenticate_device(
     ctx: &ManagementContext,
     anchor: &str,
     certificate_pem: &str,
+    grace: i64,
 ) -> Result<Device, ApiError> {
-    let peer = aegis_identity::tls::validate_client_certificate(certificate_pem, anchor)
-        .map_err(|_| ApiError::unauthenticated().detail("certificate not trusted"))?;
+    let untrusted = || ApiError::unauthenticated().detail("certificate not trusted");
+    let now = db::now_unix();
+    let peer = match aegis_identity::tls::validate_client_certificate(certificate_pem, anchor) {
+        Ok(peer) => peer,
+        Err(_) if grace > 0 => {
+            // Expired within the grace period: validate the chain as of the
+            // certificate's last valid second instead.
+            let der = parse_certs(certificate_pem).map_err(|_| untrusted())?;
+            let leaf = PeerIdentity::from_der(der[0].as_ref()).map_err(|_| untrusted())?;
+            let at = grace_validation_time(leaf.not_after, now, grace).ok_or_else(untrusted)?;
+            aegis_identity::tls::validate_client_certificate_at(certificate_pem, anchor, at)
+                .map_err(|_| untrusted())?
+        }
+        Err(_) => return Err(untrusted()),
+    };
     let der =
         parse_certs(certificate_pem).map_err(|_| ApiError::bad_request("invalid_certificate"))?;
     let fp = peer.fingerprint_hex();
@@ -282,7 +312,7 @@ pub(crate) fn authenticate_device(
         return Err(ApiError::unauthenticated().detail("device is not enrolled or was revoked"));
     };
     if status != "active" && status != "rotating"
-        || not_after <= db::now_unix()
+        || not_after.saturating_add(grace) <= now
         || name != peer.node_id
     {
         return Err(ApiError::unauthenticated().detail("device is not enrolled or was revoked"));
@@ -294,7 +324,14 @@ pub(crate) fn authenticate_device(
         node_id,
         name,
         der: der[0].as_ref().to_vec(),
+        not_after: peer.not_after,
     })
+}
+
+/// For a certificate that expired at `not_after`, `grace` seconds or less
+/// before `now`: the time to validate its chain at (its last valid second).
+fn grace_validation_time(not_after: i64, now: i64, grace: i64) -> Option<i64> {
+    (not_after < now && now - not_after <= grace).then(|| not_after - 1)
 }
 
 /// Note a failed edge request in a running diagnostics recording.
@@ -355,7 +392,7 @@ async fn endpoint_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
     let anchor = device_trust_anchor(ctx)?;
     let c = ctx.clone();
     blocking(move || {
-        authenticate_device(&c, &anchor, &certificate_pem)?;
+        authenticate_device(&c, &anchor, &certificate_pem, 0)?;
         Ok(json!({ "endpoint": super::devices::current_endpoint(&c)? }))
     })
     .await
@@ -379,4 +416,38 @@ pub async fn edge_renew(ctx: Arc<ManagementContext>, body: Vec<u8>) -> (u16, Vec
     };
     note_failure(&ctx, request, &result);
     respond(result, 200)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grace_renewal_window() {
+        let day = 86_400;
+        let exp = 1_000 * day;
+        assert_eq!(
+            grace_validation_time(exp, exp - 1, RENEW_GRACE_SECONDS),
+            None,
+            "not expired"
+        );
+        assert_eq!(
+            grace_validation_time(exp, exp + 30 * day, RENEW_GRACE_SECONDS),
+            Some(exp - 1)
+        );
+        assert_eq!(
+            grace_validation_time(exp, exp + RENEW_GRACE_SECONDS, RENEW_GRACE_SECONDS),
+            Some(exp - 1)
+        );
+        assert_eq!(
+            grace_validation_time(exp, exp + RENEW_GRACE_SECONDS + 1, RENEW_GRACE_SECONDS),
+            None,
+            "too late"
+        );
+        assert_eq!(
+            grace_validation_time(exp, exp + 1, 0),
+            None,
+            "no grace elsewhere"
+        );
+    }
 }

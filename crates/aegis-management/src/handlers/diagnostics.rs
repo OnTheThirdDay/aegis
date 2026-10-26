@@ -257,7 +257,7 @@ pub(crate) async fn device_report(ctx: &Ctx, body: Value) -> Result<Value, ApiEr
     let c = ctx.clone();
     let count = blocking(move || {
         let _permit = permit;
-        let device = authenticate_device(&c, &anchor, &certificate_pem)?;
+        let device = authenticate_device(&c, &anchor, &certificate_pem, 0)?;
         let message = aegis_identity::pki::diagnostic_upload_message(signed_at, &gz);
         if !aegis_identity::pki::verify_with_certificate(&device.der, &message, &signature) {
             return Err(ApiError::unauthenticated().detail("report signature invalid"));

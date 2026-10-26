@@ -156,11 +156,31 @@ pub fn validate_client_certificate(
     ca_pem: &str,
 ) -> Result<PeerIdentity, IdentityError> {
     let certs = parse_certs(cert_pem)?;
+    validate_client_chain(&certs, ca_pem, UnixTime::now())
+}
+
+/// [`validate_client_certificate`] as of `at_unix` seconds (e.g. the last
+/// second a recently expired certificate was valid, for grace renewal).
+pub fn validate_client_certificate_at(
+    cert_pem: &str,
+    ca_pem: &str,
+    at_unix: i64,
+) -> Result<PeerIdentity, IdentityError> {
+    let certs = parse_certs(cert_pem)?;
+    let at = UnixTime::since_unix_epoch(Duration::from_secs(u64::try_from(at_unix).unwrap_or(0)));
+    validate_client_chain(&certs, ca_pem, at)
+}
+
+fn validate_client_chain(
+    certs: &[CertificateDer<'static>],
+    ca_pem: &str,
+    at: UnixTime,
+) -> Result<PeerIdentity, IdentityError> {
     let verifier =
         WebPkiClientVerifier::builder_with_provider(Arc::new(root_store(ca_pem)?), provider())
             .build()
             .map_err(|_| IdentityError::Certificate("client verifier unavailable".into()))?;
-    verifier.verify_client_cert(&certs[0], &certs[1..], UnixTime::now())?;
+    verifier.verify_client_cert(&certs[0], &certs[1..], at)?;
     let peer = PeerIdentity::from_der(certs[0].as_ref())?;
     if peer.role != Some(Role::Client)
         || peer.not_after - peer.not_before > MAX_NODE_VALIDITY.as_secs() as i64 + 600

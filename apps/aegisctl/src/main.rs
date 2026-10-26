@@ -683,7 +683,23 @@ fn cmd_connect(o: &Opts) -> Result<bool, String> {
             "socks5": node.bound_addr("socks").map(|a| a.to_string()),
             "http": node.bound_addr("http").map(|a| a.to_string()),
         }));
-        let _ = tokio::signal::ctrl_c().await;
+        // Renew in the background while connected (checked every 6 hours).
+        let mut renewal = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        renewal.tick().await;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = renewal.tick() => match aegis_join::renew_if_due(&dir, false).await {
+                    Ok(true) => {
+                        if let Err(e) = node.ctx.reload_certificates() {
+                            eprintln!("aegisctl: renewed certificate not loaded: {e}");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("aegisctl: renewal skipped: {e}"),
+                },
+            }
+        }
         node.shutdown(std::time::Duration::from_secs(2)).await;
         Ok::<_, String>(true)
     })
