@@ -26,6 +26,7 @@ jobs:
   into-staging:
     if: github.event_name == 'push' && !github.event.deleted
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Open a pull request into staging
         env:
@@ -43,7 +44,7 @@ jobs:
           fi
           title=$(printf '%s\n' "$COMMIT_MESSAGE" | head -n 1)
           gh pr create --base staging --head "$BRANCH" --title "${title:-$BRANCH}" \
-            --body "Merging this publishes \`ghcr.io/${GH_REPO,,}:staging\` for testing. A release pull request into \`main\` is then opened automatically."
+            --body "After merging, build a test image when needed with **Actions → Release → Run workflow** on \`staging\` (\`ghcr.io/${GH_REPO,,}:staging\`). A release pull request into \`main\` is opened automatically."
 
   release:
     if: >-
@@ -51,6 +52,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Open or update the release pull request staging -> main
         env:
@@ -70,7 +72,7 @@ jobs:
             note="Merging publishes release **v$version**: tag, image \`ghcr.io/${GH_REPO,,}:$version\` and a GitHub Release."
           fi
           body=$(
-            echo "Changes on \`staging\` that aren't on \`main\` yet. Test them with \`ghcr.io/${GH_REPO,,}:staging\` first."
+            echo "Changes on \`staging\` that aren't on \`main\` yet. To test them first, run **Actions → Release → Run workflow** on \`staging\` and install \`ghcr.io/${GH_REPO,,}:staging\`."
             echo
             echo "$note"
             echo

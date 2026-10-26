@@ -92,6 +92,19 @@ pub enum EdgeRequest {
 pub type EdgeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = (u16, Vec<u8>)> + Send>>;
 pub type EdgeHook = Arc<dyn Fn(EdgeRequest, Vec<u8>) -> EdgeFuture + Send + Sync>;
 
+/// A byte stream handed over by the edge.
+pub trait EdgeIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> EdgeIo for T {}
+
+/// Serves a whole HTTP connection whose first request targets `/portal`
+/// (the user portal), installed by the composition root. The request bytes
+/// already read are replayed at the start of the stream.
+pub type PortalHook = Arc<
+    dyn Fn(Box<dyn EdgeIo>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Identity material loaded from secrets.
 #[derive(Clone)]
 pub(crate) struct LoadedIdentity {
@@ -125,12 +138,18 @@ pub struct NodeContext {
     resolver_cache: Mutex<Option<(String, Arc<Resolver>)>>,
     shutdown: watch::Sender<bool>,
     pub(crate) edge_hook: std::sync::OnceLock<EdgeHook>,
+    pub(crate) portal_hook: std::sync::OnceLock<PortalHook>,
 }
 
 impl NodeContext {
     /// Install the enrollment/renewal handler for the public edge (once).
     pub fn set_edge_hook(&self, hook: EdgeHook) {
         let _ = self.edge_hook.set(hook);
+    }
+
+    /// Install the user-portal handler for `/portal` on the public edge.
+    pub fn set_portal_hook(&self, hook: PortalHook) {
+        let _ = self.portal_hook.set(hook);
     }
 
     /// Validate replacements before publishing TLS state. Existing sessions
@@ -467,6 +486,11 @@ impl NodeRuntime {
         for t in &self.tasks {
             t.abort();
         }
+        // Wait until the aborted tasks are gone, so their listeners are
+        // closed (and the ports free) when shutdown returns.
+        for t in self.tasks {
+            let _ = t.await;
+        }
         ctx.coord.agent().transition(AgentState::Stopped);
     }
 }
@@ -602,6 +626,7 @@ pub async fn start_with_diagnostics(
         resolver_cache: Mutex::new(None),
         shutdown,
         edge_hook: std::sync::OnceLock::new(),
+        portal_hook: std::sync::OnceLock::new(),
     });
     {
         let sessions = Arc::clone(&sessions);
@@ -667,4 +692,34 @@ pub fn validate_offline(cfg: &NodeConfig) -> Result<aegis_config::CompiledConfig
 
 pub(crate) fn now_unix() -> i64 {
     aegis_storage::now_unix()
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    /// Browsers open connections in bursts; the default limits must leave
+    /// ample room on one session, within the per-peer budget (session window
+    /// plus each stream's initial transmit reservation).
+    #[test]
+    fn default_session_carries_a_browser() {
+        let core = aegis_config::CoreConfig::default();
+        let cfg = aegis_session::SessionConfig {
+            max_streams: core.max_streams_per_session,
+            stream_window: core.stream_buffer_budget_bytes,
+            session_window: core.session_window_bytes,
+            stream_tx_buffer: core.stream_buffer_budget_bytes,
+            ..aegis_session::SessionConfig::default()
+        };
+        let streams = cfg.effective_max_streams(core.session_window_bytes);
+        assert!(
+            streams >= 400,
+            "only {streams} concurrent connections per session"
+        );
+        let needed = u64::from(core.session_window_bytes)
+            + u64::from(streams) * u64::from(cfg.initial_stream_window);
+        assert!(
+            needed <= core.peer_buffer_budget_bytes,
+            "peer budget too small: {needed}"
+        );
+        assert!(core.peer_buffer_budget_bytes <= core.process_buffer_budget_bytes);
+    }
 }

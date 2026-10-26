@@ -194,7 +194,7 @@ fn tc_u02_equivalent_inputs_same_digest() {
     let reordered = with(
         GATEWAY,
         "[core]\nmax_sessions = 128",
-        "[core]\nmax_streams_per_session = 64\nmax_sessions   =   128",
+        "[core]\nmax_streams_per_session = 512\nmax_sessions   =   128",
     );
     let c = parse_toml(&reordered).expect("toml");
     assert_eq!(config_digest(&a), config_digest(&c));

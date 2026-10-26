@@ -2,7 +2,7 @@
 
 mod appliance;
 mod auth;
-mod devices;
+pub(crate) mod devices;
 pub mod diagnostics;
 pub mod edge;
 mod nodes;
@@ -51,6 +51,11 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
         .route("/api/v1/system/info", get(appliance::info))
         .route("/api/v1/system/connection", put(appliance::put_connection))
         .route("/api/v1/system/web-ca.pem", get(appliance::web_ca))
+        .route("/api/v1/system/portal", put(appliance::put_portal))
+        .route(
+            "/api/v1/system/device-ca/{action}",
+            post(appliance::device_ca),
+        )
         .route("/api/v1/system/downloads", get(appliance::downloads))
         .route("/downloads/{name}", get(appliance::download_file))
         .route("/api/v1/integrations", get(appliance::integrations))
@@ -59,6 +64,11 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
             post(appliance::integration_action),
         )
         .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/auth/2fa", get(auth::two_factor_status))
+        .route("/api/v1/auth/2fa/setup", post(auth::two_factor_setup))
+        .route("/api/v1/auth/2fa/enable", post(auth::two_factor_enable))
+        .route("/api/v1/auth/2fa/disable", post(auth::two_factor_disable))
+        .route("/api/v1/users/{id}/reset-2fa", post(auth::two_factor_reset))
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/bootstrap/claim", post(auth::bootstrap_claim))
         .route("/api/v1/system/health", get(system::health))

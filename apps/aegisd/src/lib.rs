@@ -34,6 +34,7 @@ pub struct Running {
     pub appliance: Option<Arc<services::Appliance>>,
     /// Bound console address (management listener).
     pub console: Option<SocketAddr>,
+    console_task: Option<tokio::task::JoinHandle<()>>,
     stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -42,6 +43,17 @@ impl Running {
     /// grace period.
     pub async fn shutdown(self) {
         let _ = self.stop_tx.send(true);
+        // Wait for the console to close its listener (bounded: open
+        // keep-alive connections are cut after 5 s).
+        if let Some(task) = self.console_task {
+            let abort = task.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .is_err()
+            {
+                abort.abort();
+            }
+        }
         if let Some(app) = &self.appliance {
             app.integrations.stop().await;
         }
@@ -57,13 +69,24 @@ pub async fn launch(
     store_path: PathBuf,
     appliance_dir: Option<PathBuf>,
 ) -> Result<Running, &'static str> {
-    let node = start(StartOptions {
-        config: cfg,
-        store_path,
+    let seed = StartOptions {
+        config: cfg.clone(),
+        store_path: store_path.clone(),
         failpoints: None,
-    })
-    .await
-    .map_err(|e| e.code())?;
+    };
+    let mut node = start(seed).await.map_err(|e| e.code())?;
+    // Session limits are read at start: after upgrading stored ones, start
+    // again (once; nothing is connected yet).
+    if appliance_dir.is_some() && upgrade_session_limits(&node.ctx.coord).await {
+        node.shutdown(Duration::from_secs(1)).await;
+        node = start(StartOptions {
+            config: cfg,
+            store_path,
+            failpoints: None,
+        })
+        .await
+        .map_err(|e| e.code())?;
+    }
     let ctx = Arc::clone(&node.ctx);
     // The file only locates/seeds the store. Once recovered, every
     // listener and shutdown setting comes from the active revision.
@@ -75,6 +98,7 @@ pub async fn launch(
         mgmt: None,
         appliance: None,
         console: None,
+        console_task: None,
         stop_tx,
     };
     if !cfg.management.enabled {
@@ -99,6 +123,8 @@ pub async fn launch(
         bound,
         cfg.management.allowed_hosts.clone(),
     );
+    // Set by the installer for --tunnel-only (devices via Cloudflare only).
+    m.set_tunnel_only(std::env::var("AEGIS_TUNNEL_ONLY").is_ok_and(|v| v == "1"));
     let reload_ctx = Arc::clone(&ctx);
     *m.certificate_reload
         .lock()
@@ -113,6 +139,7 @@ pub async fn launch(
     if downloads.is_dir() {
         *m.downloads_dir.lock().unwrap_or_else(|e| e.into_inner()) = Some(downloads);
     }
+    let m2 = Arc::clone(&m);
     let mut rx = stop_rx.clone();
     let stop = async move {
         let _ = rx.wait_for(|s| *s).await;
@@ -124,15 +151,14 @@ pub async fn launch(
                 bundle.clone(),
             )
             .map_err(|_| "E_CONSOLE_TLS")?;
-            tokio::spawn(aegis_management::serve_tls(
-                Arc::clone(&m),
-                listener,
-                tls,
-                stop,
-            ));
+            running.console_task = Some(tokio::spawn(async move {
+                let _ = aegis_management::serve_tls(Arc::clone(&m2), listener, tls, stop).await;
+            }));
         }
         None => {
-            tokio::spawn(aegis_management::serve(Arc::clone(&m), listener, stop));
+            running.console_task = Some(tokio::spawn(async move {
+                let _ = aegis_management::serve(Arc::clone(&m2), listener, stop).await;
+            }));
         }
     }
     if cfg.role == aegis_contracts::Role::Gateway {
@@ -147,6 +173,11 @@ pub async fn launch(
                     EdgeRequest::Renew => aegis_management::edge_renew(mc, body).await,
                 }
             })
+        }));
+        // Users sign in to the self-service portal on the same public edge.
+        let portal = aegis_management::portal::Server::new(Arc::clone(&m));
+        ctx.set_portal_hook(Arc::new(move |io| {
+            Box::pin(portal.clone().serve_connection(io))
         }));
     }
     if let (Some(dir), aegis_contracts::Role::Gateway) = (&appliance_dir, cfg.role) {
@@ -164,4 +195,84 @@ pub async fn launch(
     running.console = Some(bound);
     running.mgmt = Some(m);
     Ok(running)
+}
+
+/// Limits stored by appliances set up before 0.2: a 2 MiB session window
+/// with fixed 64 KiB streams allows only 31 concurrent connections per
+/// device, which a browser exhausts, so pages stall until old connections
+/// close.
+const LEGACY_SESSION_LIMITS: [(&str, u64); 5] = [
+    ("max_streams_per_session", 64),
+    ("stream_buffer_budget_bytes", 64 * 1024),
+    ("session_window_bytes", 2 * 1024 * 1024),
+    ("peer_buffer_budget_bytes", 8 * 1024 * 1024),
+    ("process_buffer_budget_bytes", 32 * 1024 * 1024),
+];
+
+/// One-time upgrade of the active profile's session limits to the current
+/// defaults, only while all of them still hold the legacy values (anything
+/// an operator changed is left alone). Returns whether a new revision was
+/// activated; it applies from the next start.
+async fn upgrade_session_limits(coord: &Arc<aegis_core::Coordinator>) -> bool {
+    let coord = Arc::clone(coord);
+    tokio::task::spawn_blocking(move || -> Option<bool> {
+        let runtime = coord.health().runtime_revision_id?;
+        let profile = coord
+            .store()
+            .read(|c| aegis_storage::list_profiles(c, None, 100))
+            .ok()?
+            .into_iter()
+            .find(|p| p.active_revision_id.as_deref() == Some(runtime.as_str()))?;
+        let revision = coord
+            .store()
+            .read(|c| aegis_storage::get_revision(c, &runtime))
+            .ok()?;
+        let spec: serde_json::Value = serde_json::from_str(&revision.spec_json).ok()?;
+        let legacy = LEGACY_SESSION_LIMITS
+            .iter()
+            .all(|(k, v)| spec["core"][*k].as_u64() == Some(*v));
+        if !legacy {
+            return Some(false);
+        }
+        let d = aegis_config::CoreConfig::default();
+        let patch = serde_json::json!({"core": {
+            "max_streams_per_session": d.max_streams_per_session,
+            "stream_buffer_budget_bytes": d.stream_buffer_budget_bytes,
+            "session_window_bytes": d.session_window_bytes,
+            "peer_buffer_budget_bytes": d.peer_buffer_budget_bytes,
+            "process_buffer_budget_bytes": d.process_buffer_budget_bytes,
+        }});
+        let patched = coord
+            .patch_profile(None, &profile.id, &profile.etag(), None, Some(&patch))
+            .ok()?;
+        let report = coord
+            .validate(
+                None,
+                &patched.id,
+                &patched.etag(),
+                &patched.desired_revision_id,
+            )
+            .ok()?;
+        if !report.valid {
+            return Some(false);
+        }
+        let req = aegis_core::ActivateRequest {
+            actor_id: None,
+            profile_id: patched.id.clone(),
+            if_match: patched.etag(),
+            idempotency_key: format!("session-limits-upgrade-{}", report.target_revision_id),
+            target_revision_id: report.target_revision_id.clone(),
+            config_digest: report.config_digest.clone(),
+            validation_id: report.validation_id.clone(),
+        };
+        let job = coord
+            .submit_activation(&req, &format!("/api/v1/profiles/{}/activate", patched.id))
+            .ok()?;
+        let job = coord.run_job(&job.id).ok()?;
+        Some(job.status == "succeeded")
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }

@@ -15,6 +15,12 @@ pub use types::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error(pub &'static str);
+
+/// Probe outcome for "the provider confirmed tunnel, routes, DNS and
+/// connector, but this host cannot reach its own public endpoint to test
+/// the data path". The saga commits such a plan flagged unverified
+/// (`inventory.verified = false`) instead of failing it.
+pub const DATA_PATH_UNVERIFIED_FROM_HOST: &str = "data_path_unverified_from_host";
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0)

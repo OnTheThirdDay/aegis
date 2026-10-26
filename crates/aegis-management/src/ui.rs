@@ -20,6 +20,33 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
         .into_response()
 }
 
+/// The same pages for the user portal, which lives under `/portal/`.
+fn portal_index() -> &'static str {
+    static INDEX_PORTAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INDEX_PORTAL.get_or_init(|| {
+        INDEX
+            .replace("href=\"/style.css\"", "href=\"/portal/style.css\"")
+            .replace("src=\"/app.js\"", "src=\"/portal/app.js\"")
+            .replace("<title>AegisNet Console</title>", "<title>AegisNet</title>")
+    })
+}
+
+pub fn portal_routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route(
+            "/",
+            get(|| async { asset("text/html; charset=utf-8", portal_index()) }),
+        )
+        .route(
+            "/app.js",
+            get(|| async { asset("text/javascript; charset=utf-8", APP_JS) }),
+        )
+        .route(
+            "/style.css",
+            get(|| async { asset("text/css; charset=utf-8", STYLE) }),
+        )
+}
+
 pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route(

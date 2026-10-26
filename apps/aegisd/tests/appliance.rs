@@ -104,10 +104,18 @@ async fn socks_connect(proxy: SocketAddr, host: &str, port: u16) -> u8 {
 }
 
 async fn start_client(dir: &Path) -> aegis_node::NodeRuntime {
+    start_client_via(dir, None).await
+}
+
+async fn start_client_via(
+    dir: &Path,
+    trial: Option<&aegis_join::Endpoint>,
+) -> aegis_node::NodeRuntime {
     let device = aegis_join::DeviceDir::new(dir);
     let _ = std::fs::remove_file(device.store());
-    let cfg = aegis_join::client_config(&device, aegis_join::Ports { socks: 0, http: 0 })
-        .expect("client config");
+    let cfg =
+        aegis_join::client_config_for(&device, aegis_join::Ports { socks: 0, http: 0 }, trial)
+            .expect("client config");
     aegis_node::start(aegis_node::StartOptions {
         config: cfg,
         store_path: device.store(),
@@ -127,6 +135,8 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
             public_addresses: vec!["127.0.0.1".into()],
             public_port: Some(edge_port),
             console_loopback: true,
+            // Tunnel-only exposure: the device edge listens on loopback.
+            edge_loopback: true,
             console_port: Some(console_port),
             edge_port: Some(edge_port),
             tunnel_port: Some(0),
@@ -287,6 +297,251 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         assert_eq!(v["gateway"]["state"], "off");
         assert_eq!(v["devices"].as_array().map(Vec::len), Some(0));
 
+        // User portal on the public edge: end users sign in and manage their
+        // own devices; administrators and everything else are refused.
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/users", Some(json!({"username": "alice", "roles": ["user"]})))
+            .await;
+        assert_eq!(s, 201, "{v}");
+        let alice_pw = v["temporary_password"].as_str().expect("temporary password").to_owned();
+        let mut portal = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        portal.base = format!("https://127.0.0.1:{edge_port}/portal");
+        let page = portal.http.get(format!("{}/", portal.base)).send().await.expect("portal page");
+        assert_eq!(page.status().as_u16(), 200);
+        assert!(page.text().await.expect("html").contains("src=\"/portal/app.js\""));
+        let (s, v) = portal
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": "a much better passphrase"})))
+            .await;
+        assert_eq!(s, 403, "administrators without 2FA are refused on the portal: {v}");
+        assert_eq!(v["aegis_error_code"], "two_factor_setup_required");
+        let (s, v) = portal
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "alice", "password": alice_pw})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["password_change_required"], true);
+        let (s, v) = portal
+            .call(
+                reqwest::Method::POST,
+                "/auth/password",
+                Some(json!({"current_password": alice_pw, "new_password": "alice's own passphrase"})),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (s, v) = portal.call(reqwest::Method::GET, "/devices", None).await;
+        assert_eq!(s, 200, "{v}");
+        let (s, v) = portal
+            .call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "alice-phone"})))
+            .await;
+        assert_eq!(s, 201, "users invite their own devices on the portal: {v}");
+        assert!(v["code"].as_str().is_some_and(|c| c.starts_with("aegis1:")));
+        let (s, v) = portal.call(reqwest::Method::GET, "/system/downloads", None).await;
+        assert_eq!(s, 200, "{v}");
+        let (s, _) = portal.call(reqwest::Method::GET, "/users", None).await;
+        assert_eq!(s, 404, "console routes don't exist on the portal");
+        let (s, _) = portal.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(s, 404);
+        let resp = portal
+            .http
+            .get(format!("{}/api/v1/devices", portal.base))
+            .header("authorization", "Bearer anything")
+            .send()
+            .await
+            .expect("token request");
+        assert_eq!(resp.status().as_u16(), 403, "API tokens are refused on the portal");
+        let resp = portal
+            .http
+            .get(format!("{}/", portal.base))
+            .header("host", "evil.example")
+            .send()
+            .await
+            .expect("foreign host");
+        assert_eq!(resp.status().as_u16(), 400);
+        // The console shows the portal and can switch it off.
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["portal"]["enabled"], true, "{v}");
+        assert!(v["portal"]["url"].as_str().is_some_and(|u| u.ends_with("/portal/")), "{v}");
+        let (s, _) = c
+            .call(reqwest::Method::PUT, "/system/portal", Some(json!({"enabled": false})))
+            .await;
+        assert_eq!(s, 200);
+        let page = portal.http.get(format!("{}/", portal.base)).send().await.expect("portal off");
+        assert_eq!(page.status().as_u16(), 404);
+        let (s, _) = c
+            .call(reqwest::Method::PUT, "/system/portal", Some(json!({"enabled": true})))
+            .await;
+        assert_eq!(s, 200);
+
+        // Administrators with 2FA get the whole console on the portal.
+        let (s, v) = c.call(reqwest::Method::POST, "/auth/2fa/setup", None).await;
+        assert_eq!(s, 200, "{v}");
+        let secret = aegis_management::totp::base32_decode(v["secret"].as_str().expect("secret")).expect("base32");
+        assert!(v["uri"].as_str().is_some_and(|u| u.starts_with("otpauth://totp/AegisNet:admin?")));
+        assert!(v["qr"].as_array().is_some_and(|rows| rows.len() >= 21));
+        let now = aegis_management::totp::step_of(aegis_storage::now_unix());
+        let code = |step: i64| format!("{:06}", aegis_management::totp::code_at(&secret, step as u64));
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/auth/2fa/enable", Some(json!({"code": "000000"})))
+            .await;
+        assert!(s == 400 || code(now) == "000000", "a wrong code doesn't enable 2FA: {v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/auth/2fa/enable", Some(json!({"code": code(now)})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let recovery: Vec<String> = v["recovery_codes"]
+            .as_array()
+            .expect("recovery codes")
+            .iter()
+            .filter_map(|c| c.as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(recovery.len(), 10);
+        let mut admin = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        admin.base = format!("https://127.0.0.1:{edge_port}/portal");
+        let login = |code: Option<String>| {
+            let mut body = json!({"username": "admin", "password": "a much better passphrase"});
+            if let Some(c) = code {
+                body["code"] = json!(c);
+            }
+            body
+        };
+        let (s, v) = admin.call(reqwest::Method::POST, "/auth/login", Some(login(None))).await;
+        assert_eq!(s, 401, "{v}");
+        assert_eq!(v["aegis_error_code"], "two_factor_required");
+        let (s, v) = admin
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some("123456".into()))))
+            .await;
+        assert!(s == 401 || code(now + 1) == "123456", "wrong code refused: {v}");
+        // The next step's code (the enabling code's step is already spent).
+        let (s, v) = admin
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(code(now + 1)))))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["mfa_session"], true);
+        let (s, v) = admin.call(reqwest::Method::GET, "/users", None).await;
+        assert_eq!(s, 200, "the whole console with 2FA: {v}");
+        let (s, _) = admin.call(reqwest::Method::GET, "/diagnostics", None).await;
+        assert_eq!(s, 200);
+        let (s, _) = admin
+            .call(reqwest::Method::POST, "/system/device-ca/export-root-key", Some(json!({"password": "a much better passphrase"})))
+            .await;
+        assert_eq!(s, 404, "exporting the root key stays local-only");
+        let (s, _) = admin
+            .call(reqwest::Method::POST, "/system/device-ca/export%2Droot-key", Some(json!({"password": "a much better passphrase"})))
+            .await;
+        assert_eq!(s, 404, "an encoded path doesn't get past the rule");
+        let mut again = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        again.base = admin.base.clone();
+        let (s, _) = again
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(code(now + 1)))))
+            .await;
+        assert_eq!(s, 401, "a code works once");
+        let (s, v) = again
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(recovery[0].clone()))))
+            .await;
+        assert_eq!(s, 200, "recovery code: {v}");
+        let mut third = Console::new(SocketAddr::from(([127, 0, 0, 1], edge_port)), &web_ca);
+        third.base = admin.base.clone();
+        let (s, _) = third
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(recovery[0].clone()))))
+            .await;
+        assert_eq!(s, 401, "a recovery code works once");
+        // The local console asks for the code too once 2FA is on.
+        let mut local = Console::new(running.console.expect("console"), &web_ca);
+        let (s, v) = local.call(reqwest::Method::POST, "/auth/login", Some(login(None))).await;
+        assert_eq!(s, 401, "{v}");
+        assert_eq!(v["aegis_error_code"], "two_factor_required");
+        let (s, v) = local
+            .call(reqwest::Method::POST, "/auth/login", Some(login(Some(recovery[1].clone()))))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        // Owners can reset a lost authenticator.
+        let (_, v) = c.call(reqwest::Method::GET, "/users", None).await;
+        assert!(v["items"].as_array().expect("users").iter().any(|u| u["username"] == "admin" && u["two_factor"] == true));
+
+        // Address change: the device learns the gateway's new endpoint on
+        // connect and adopts it only after the pinned gateway answers there.
+        assert_eq!(aegis_join::fetch_endpoint(&device_dir).await.expect("query"), None, "unchanged");
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/connection", Some(json!({"public_host": "localhost", "public_port": edge_port})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let moved = aegis_join::fetch_endpoint(&device_dir)
+            .await
+            .expect("query")
+            .expect("endpoint changed");
+        assert!(moved.url.starts_with("wss://localhost:"), "{moved:?}");
+        // A bogus endpoint (nothing listening) fails the end-to-end check.
+        let mut bogus = moved.clone();
+        bogus.url = format!("wss://127.0.0.1:{}/agp", free_port());
+        let trial = start_client_via(&dev_dir, Some(&bogus)).await;
+        assert!(!aegis_join::verify_tunnel(trial.bound_addr("socks").expect("socks")).await);
+        trial.shutdown(Duration::from_secs(1)).await;
+        // The real one passes and is adopted.
+        let trial = start_client_via(&dev_dir, Some(&moved)).await;
+        assert!(aegis_join::verify_tunnel(trial.bound_addr("socks").expect("socks")).await);
+        trial.shutdown(Duration::from_secs(1)).await;
+        let device = aegis_join::adopt_endpoint(&device_dir, &moved).expect("adopt");
+        assert_eq!(device.url, moved.url);
+        assert_eq!(aegis_join::fetch_endpoint(&device_dir).await.expect("query"), None, "now current");
+        let mut foreign = moved.clone();
+        foreign.device_ca_sha256 = "0".repeat(64);
+        assert!(aegis_join::adopt_endpoint(&device_dir, &foreign).is_err(), "other gateway refused");
+        client.shutdown(Duration::from_secs(1)).await;
+        let client = start_client(&dev_dir).await;
+        let socks = client.bound_addr("socks").expect("socks");
+        assert_eq!(socks_connect(socks, "localhost", 9).await, 2, "connects via the new address");
+
+        // Offline device root: export (password re-checked), remove with
+        // proof of possession, renew the issuer with the offline key (not
+        // stored), and devices keep enrolling/renewing/connecting.
+        let export = |password: &str| {
+            c.http
+                .post(format!("{}/api/v1/system/device-ca/export-root-key", c.base))
+                .header("cookie", format!("aegis_session={}", c.cookie.clone().expect("cookie")))
+                .header("x-csrf-token", c.csrf.clone().expect("csrf"))
+                .json(&json!({ "password": password }))
+                .send()
+        };
+        assert_eq!(export("wrong password!").await.expect("export").status().as_u16(), 403);
+        let resp = export("a much better passphrase").await.expect("export");
+        assert_eq!(resp.status().as_u16(), 200);
+        let root_key = resp.text().await.expect("pem");
+        assert!(root_key.contains("PRIVATE KEY"));
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/remove-root-key", Some(json!({"key_pem": "not a key"})))
+            .await;
+        assert_eq!(s, 400, "removal needs the real key: {v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/remove-root-key", Some(json!({"key_pem": root_key})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["runtime"]["certificates"]["root_key_on_host"], false, "{v}");
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/system/device-ca/renew-issuer", Some(json!({})))
+            .await;
+        assert_eq!(s, 400, "offline root: renewal needs the key file");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/renew-issuer", Some(json!({"key_pem": root_key})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert!(v["issuer_expires_at"].is_string(), "{v}");
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["runtime"]["certificates"]["root_key_on_host"], false, "key not stored by renewal");
+        assert!(aegis_join::renew_if_due(&device_dir, true).await.expect("renew from the new issuer"));
+        client.shutdown(Duration::from_secs(1)).await;
+        let client = start_client(&dev_dir).await;
+        let socks = client.bound_addr("socks").expect("socks");
+        assert_eq!(socks_connect(socks, "localhost", 9).await, 2, "new issuer and gateway identity admitted");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/device-ca/restore-root-key", Some(json!({"key_pem": root_key})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (_, v) = c.call(reqwest::Method::GET, "/audit?limit=20", None).await;
+        let actions: Vec<&str> = v["items"].as_array().expect("audit").iter().filter_map(|a| a["action"].as_str()).collect();
+        for a in ["pki.root_key_exported", "pki.root_key_removed", "pki.issuer_renewed", "pki.root_key_restored"] {
+            assert!(actions.contains(&a), "audited {a}: {actions:?}");
+        }
+
         // Revoke: new sessions/streams are refused.
         let (_, v) = c.call(reqwest::Method::GET, "/devices", None).await;
         let id = v["items"][0]["id"].as_str().expect("id").to_owned();
@@ -320,4 +575,68 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
     })
     .await
     .expect("bounded appliance e2e");
+}
+
+/// Start an appliance whose stored configuration carries `core` (TOML).
+async fn launch_with_core(data: &Path, core: &str) -> aegisd::Running {
+    let opts = InitOptions {
+        public_addresses: vec!["127.0.0.1".into()],
+        console_loopback: true,
+        console_port: Some(free_port()),
+        edge_port: Some(free_port()),
+        tunnel_port: Some(0),
+        ..Default::default()
+    };
+    let path = if data.join("config.toml").exists() {
+        data.join("config.toml")
+    } else {
+        let p = appliance::init(data, &opts).expect("init");
+        let mut text = std::fs::read_to_string(&p).expect("cfg");
+        text.push_str(core);
+        std::fs::write(&p, text).expect("write");
+        p
+    };
+    let cfg = aegisd::parse_config(&std::fs::read_to_string(path).expect("cfg")).expect("parse");
+    let store = std::path::PathBuf::from(&cfg.management.config_store);
+    aegisd::launch(cfg, store, Some(data.to_path_buf()))
+        .await
+        .expect("launch")
+}
+
+fn revisions(data: &Path) -> i64 {
+    let store = aegis_storage::Store::open(data.join("state.db")).expect("store");
+    store
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get::<_, i64>(0))?))
+        .expect("count")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_session_limits_are_upgraded_once_and_operator_values_kept() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Pre-0.2 defaults: 31 concurrent connections per device.
+        let legacy = "\n[core]\nmax_streams_per_session = 64\nstream_buffer_budget_bytes = 65536\nsession_window_bytes = 2097152\npeer_buffer_budget_bytes = 8388608\nprocess_buffer_budget_bytes = 33554432\n";
+        let data = tmp.path().join("legacy");
+        let running = launch_with_core(&data, legacy).await;
+        let core = &running.node.ctx.startup.core;
+        assert_eq!(core.max_streams_per_session, 512, "upgraded and restarted");
+        assert_eq!(core.stream_buffer_budget_bytes, 256 * 1024);
+        assert_eq!(core.session_window_bytes, 8 * 1024 * 1024);
+        let after = revisions(&data);
+        running.shutdown().await;
+        let running = launch_with_core(&data, "").await;
+        assert_eq!(running.node.ctx.startup.core.max_streams_per_session, 512);
+        assert_eq!(revisions(&data), after, "no second upgrade");
+        running.shutdown().await;
+
+        // An operator's own limits are not touched.
+        let custom = "\n[core]\nmax_streams_per_session = 64\nsession_window_bytes = 4194304\npeer_buffer_budget_bytes = 8388608\nprocess_buffer_budget_bytes = 33554432\n";
+        let data = tmp.path().join("custom");
+        let running = launch_with_core(&data, custom).await;
+        assert_eq!(running.node.ctx.startup.core.max_streams_per_session, 64);
+        assert_eq!(running.node.ctx.startup.core.session_window_bytes, 4 * 1024 * 1024);
+        running.shutdown().await;
+    })
+    .await
+    .expect("bounded");
 }

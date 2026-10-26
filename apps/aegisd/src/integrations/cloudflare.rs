@@ -59,6 +59,9 @@ fn provider_error(e: Error) -> (u16, String) {
     (status, explain(e.0))
 }
 
+/// Version of the tunnel routes AegisNet writes; 2 adds the user portal.
+const ROUTES_VERSION: u64 = 2;
+
 /// Human-readable, secret-free explanation of a provider/saga error code.
 pub fn explain(code: &str) -> String {
     let text = match code {
@@ -75,6 +78,7 @@ pub fn explain(code: &str) -> String {
         "cloudflare_connector_not_healthy" => "The connector did not report healthy to Cloudflare in time",
         "connector_not_ready" => "The connector could not connect to Cloudflare from this server (outbound UDP 7844 or TCP 443 may be blocked)",
         "data_path_not_verified" => "The end-to-end test through Cloudflare failed",
+        "data_path_unverified_from_host" => "Active, but not verified from this server: Cloudflare reports the tunnel, its route and DNS record healthy, yet this server could not connect to its own public address to test it. Devices elsewhere are not affected; connect a device to confirm",
         _ => code,
     };
     if text == code {
@@ -171,6 +175,10 @@ impl CloudflareIntegration {
             v["step"] = json!(live.step);
         }
         v["error"] = status["error"].clone();
+        v["warning"] = status["warning"].clone();
+        // Set up before the user portal existed: its routes still lack /portal
+        // until re-verified with the token ("Test again").
+        v["portal_routes"] = json!(settings["routes"].as_u64() >= Some(ROUTES_VERSION));
         v["hostname"] = settings["hostname"].clone();
         v["plan_id"] = settings["plan_id"].clone();
         if let Some(h) = settings["hostname"].as_str() {
@@ -425,18 +433,55 @@ impl CloudflareIntegration {
                 .await;
             progress.abort();
             drop(cf);
-            let settings = Self::record(&app).map(|r| r.settings).unwrap_or(json!({}));
+            let mut settings = Self::record(&app).map(|r| r.settings).unwrap_or(json!({}));
+            if result.is_ok()
+                || matches!(&result, Err(e) if e.0 == aegis_provision::DATA_PATH_UNVERIFIED_FROM_HOST)
+            {
+                // Verification brought the tunnel's routes up to date,
+                // including the user portal (ROUTES_VERSION).
+                settings["routes"] = json!(ROUTES_VERSION);
+            }
+            let warning = |code: &str| {
+                let mut message = explain(code);
+                if let Some(d) = detail.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    message.push_str(". ");
+                    message.push_str(&d);
+                }
+                message
+            };
             match result {
-                Ok(p) => {
+                Ok(p) if p.inventory.verified => {
                     switch_connection(&app, p.desired.hostname.as_deref());
                     Self::save(&app, true, &settings, &json!({"state": "active"}));
                 }
-                Err(e) => {
-                    let mut message = explain(e.0);
-                    if let Some(d) = detail.lock().unwrap_or_else(|p| p.into_inner()).take() {
-                        message.push_str(": ");
-                        message.push_str(&d.replace('_', " "));
+                Ok(p) => {
+                    switch_connection(&app, p.desired.hostname.as_deref());
+                    let w = warning(aegis_provision::DATA_PATH_UNVERIFIED_FROM_HOST);
+                    Self::save(
+                        &app,
+                        true,
+                        &settings,
+                        &json!({"state": "active", "warning": w}),
+                    );
+                }
+                // A re-test of an active plan that again can't reach the
+                // endpoint from here: stays active, with the reason.
+                Err(e) if e.0 == aegis_provision::DATA_PATH_UNVERIFIED_FROM_HOST => {
+                    if let Some(h) = Self::record(&app)
+                        .and_then(|r| r.settings["hostname"].as_str().map(str::to_owned))
+                    {
+                        switch_connection(&app, Some(&h));
                     }
+                    let w = warning(e.0);
+                    Self::save(
+                        &app,
+                        true,
+                        &settings,
+                        &json!({"state": "active", "warning": w}),
+                    );
+                }
+                Err(e) => {
+                    let message = warning(e.0);
                     // Keep a connector that is up so a retry can reuse it;
                     // stop it only if the connector itself was the problem.
                     if !me.connector.ready().await {
@@ -612,8 +657,14 @@ impl Probe for EmbeddedProbe {
             )
             .await
             .map_err(|e| {
-                *self.detail.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-                Error("data_path_not_verified")
+                *self.detail.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(e.detail().to_owned());
+                match e {
+                    probe::ProbeFailure::Unreachable(_) => {
+                        Error(aegis_provision::DATA_PATH_UNVERIFIED_FROM_HOST)
+                    }
+                    probe::ProbeFailure::Failed(_) => Error("data_path_not_verified"),
+                }
             })?;
             // Each flag was demonstrated by the probe above: the session
             // crossed public DNS, the edge, the connector and inner mTLS,

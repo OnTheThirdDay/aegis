@@ -1,18 +1,33 @@
 name: Release
 
 # Publishes builds of the branch flow (see docs/RELEASING.md):
-#   staging  -> image ghcr.io/<owner>/aegis:staging (+ :sha-xxxxxxx) for pre-release testing
-#   main     -> when the workspace version has no tag yet: tag vX.Y.Z, multi-arch image
-#               ghcr.io/<owner>/aegis:X.Y.Z + :latest, and a GitHub Release with the
-#               installer, native gateway packages, client apps and SHA256SUMS
+#   main (push)        -> when the workspace version has no tag yet: tag vX.Y.Z,
+#                         multi-arch image ghcr.io/<owner>/aegis:X.Y.Z + :latest, and a
+#                         GitHub Release with the client apps and SHA256SUMS
+#   manual run (Actions -> Release -> Run workflow), to test before a release:
+#     on staging       -> image ghcr.io/<owner>/aegis:staging (+ :sha-xxxxxxx)
+#     on a work branch -> image ghcr.io/<owner>/aegis:test-<branch> (+ :sha-xxxxxxx)
+# Merging into staging builds nothing by itself (a full build takes ~30 minutes).
 # Versions are bumped by version.yml, never by hand on main.
 #
+# Also runs the main gate (main only holds content tested on staging) and
+# fast-forwards staging after a release, on every push to main.
+#
+# Cost (private repository, free plan): all builds run on Linux (the Windows
+# client cross-compiles with mingw); macOS clients are built only for releases
+# on main, in one job; test images only when asked for.
+#
+# Servers install from the public image alone: it carries install.sh, stamped
+# with its own tag (the repository itself may be private).
+#
 # Supply chain: pin every `uses:` to a reviewed full commit SHA before relying on
-# this for production (06 §2.2). Build provenance is attested for the image and assets.
+# this for production (06 §2.2). The image carries buildx provenance and an SBOM.
+# (GitHub artifact attestations are not used: they need a public repository on
+# the free plan.)
 
 on:
   push:
-    branches: [main, staging]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -31,10 +46,13 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       channel: ${{ steps.plan.outputs.channel }}
       version: ${{ steps.plan.outputs.version }}
       image: ${{ steps.plan.outputs.image }}
+      # Image tag of a test build (staging or test-<branch>).
+      tag: ${{ steps.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -46,28 +64,37 @@ jobs:
           version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          tag=""
           case "$GITHUB_REF" in
-            refs/heads/staging) channel=staging ;;
+            refs/heads/staging)
+              channel=staging; tag=staging ;;
             refs/heads/main)
+              # Main gate: main only holds content that was tested on staging.
+              # (fetch-depth 0 already brought origin/staging and all tags.)
+              if ! git log origin/staging --format=%T | grep -qx "$(git rev-parse 'HEAD^{tree}')"; then
+                echo "::error::main contains changes that never went through staging. Merge them into staging, then use the release pull request staging -> main."; exit 1
+              fi
               if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
                 channel=none; echo "v$version is already released; nothing to publish."
               else
                 channel=release
-                # Same gate as ci.yml: main only releases content that was on staging.
-                # (fetch-depth 0 already brought origin/staging and all tags.)
-                if ! git log origin/staging --format=%T | grep -qx "$(git rev-parse 'HEAD^{tree}')"; then
-                  echo "::error::main contains changes that never went through staging"; exit 1
-                fi
               fi ;;
+            refs/heads/*)
+              # A test build of a work branch (manual runs only).
+              branch=${GITHUB_REF#refs/heads/}
+              slug=$(printf '%s' "$branch" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._-' '-' | cut -c1-100)
+              channel=staging; tag="test-$slug" ;;
             *) channel=none ;;
           esac
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
-          echo "Channel: $channel, version $version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Channel: $channel, version $version${tag:+, image tag $tag}"
 
   gateway:
     needs: plan
     if: needs.plan.outputs.channel != 'none'
     runs-on: ubuntu-22.04 # glibc 2.35: runs on Debian 12+ / Ubuntu 22.04+
+    timeout-minutes: 45
     strategy:
       matrix:
         include:
@@ -87,6 +114,9 @@ jobs:
           echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> "$GITHUB_ENV"
       - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gateway-${{ matrix.target }}
       - run: cargo build --locked --release --target ${{ matrix.target }} -p aegisd -p aegisctl
       - name: Stage binaries and the pinned cloudflared
         env:
@@ -108,53 +138,75 @@ jobs:
           retention-days: 7
 
   clients:
+    # Linux and Windows clients, both built on Linux (Windows via mingw).
     needs: plan
     if: needs.plan.outputs.channel != 'none'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            asset: aegis-client-windows-x86_64.exe
-            bin: aegis-client.exe
-          - os: macos-14
-            target: aarch64-apple-darwin
-            asset: aegis-client-macos-arm64
-            bin: aegis-client
-          - os: macos-14
-            target: x86_64-apple-darwin
-            asset: aegis-client-macos-x86_64
-            bin: aegis-client
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            asset: aegis-client-linux-x86_64
-            bin: aegis-client
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - run: rustup target add ${{ matrix.target }}
-      - run: cargo build --locked --release --target ${{ matrix.target }} -p aegis-client
-      - shell: bash
+      - name: Windows cross toolchain
         run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64 >/dev/null
+          rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clients
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+          AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+          CFLAGS_x86_64_pc_windows_gnu: -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p aegis-client
+          cargo build --locked --release --target x86_64-pc-windows-gnu -p aegis-client
           mkdir -p out
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "out/${{ matrix.asset }}"
+          cp target/release/aegis-client out/aegis-client-linux-x86_64
+          cp target/x86_64-pc-windows-gnu/release/aegis-client.exe out/aegis-client-windows-x86_64.exe
       - uses: actions/upload-artifact@v7
         with:
-          name: client-${{ matrix.asset }}
+          name: client-linux-windows
+          path: out/
+          retention-days: 7
+
+  clients-macos:
+    # macOS runners bill 10x: only for releases, both architectures in one job.
+    needs: plan
+    if: needs.plan.outputs.channel == 'release'
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target aarch64-apple-darwin -p aegis-client
+          cargo build --locked --release --target x86_64-apple-darwin -p aegis-client
+          mkdir -p out
+          cp target/aarch64-apple-darwin/release/aegis-client out/aegis-client-macos-arm64
+          cp target/x86_64-apple-darwin/release/aegis-client out/aegis-client-macos-x86_64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: client-macos
           path: out/
           retention-days: 7
 
   image:
-    needs: [plan, gateway, clients]
+    needs: [plan, gateway, clients, clients-macos]
+    # clients-macos is skipped for staging; any failure still stops here.
+    if: needs.plan.outputs.channel != 'none' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     outputs:
       digest: ${{ steps.push.outputs.digest }}
     steps:
@@ -172,9 +224,20 @@ jobs:
           path: context/clients
           merge-multiple: true
       - name: Prepare build context
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
+          set -euo pipefail
           cp deploy/Dockerfile.prebuilt context/Dockerfile
           chmod 0755 context/bin/*/* context/clients/*
+          # The image's installer installs this image's tag by default.
+          if [ "$CHANNEL" = release ]; then tag=$VERSION; else tag=$TAG; fi
+          sed -e "s|^RELEASE_IMAGE=\"@IMAGE@\"|RELEASE_IMAGE=\"$IMAGE:$tag\"|" \
+            deploy/install.sh > context/install.sh
+          grep -q "^RELEASE_IMAGE=\"$IMAGE:$tag\"" context/install.sh
           find context -type f | sort
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
@@ -189,12 +252,13 @@ jobs:
           IMAGE: ${{ needs.plan.outputs.image }}
           VERSION: ${{ needs.plan.outputs.version }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           short=${GITHUB_SHA::7}
           if [ "$CHANNEL" = release ]; then
             tags="$IMAGE:$VERSION,$IMAGE:latest,$IMAGE:sha-$short"
           else
-            tags="$IMAGE:staging,$IMAGE:sha-$short"
+            tags="$IMAGE:$TAG,$IMAGE:sha-$short"
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
       - id: push
@@ -209,59 +273,29 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           provenance: mode=max
           sbom: true
-      - uses: actions/attest-build-provenance@v4
-        with:
-          subject-name: ${{ needs.plan.outputs.image }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
 
   release:
-    needs: [plan, gateway, clients, image]
-    if: needs.plan.outputs.channel == 'release'
+    needs: [plan, gateway, clients, clients-macos, image]
+    if: needs.plan.outputs.channel == 'release' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
-          pattern: gateway-*
-          path: gateway
-          merge-multiple: true
-      - uses: actions/download-artifact@v8
-        with:
           pattern: client-*
           path: assets
           merge-multiple: true
-      - name: Assemble release assets
-        env:
-          VERSION: ${{ needs.plan.outputs.version }}
-          IMAGE: ${{ needs.plan.outputs.image }}
-          DIGEST: ${{ needs.image.outputs.digest }}
+      - name: Checksums
         run: |
           set -euo pipefail
-          chmod 0755 gateway/*/* assets/*
-          for arch in amd64 arm64; do
-            pkg=$(mktemp -d)/aegisnet-gateway
-            mkdir -p "$pkg/bin" "$pkg/clients"
-            cp gateway/$arch/* "$pkg/bin/"
-            cp assets/aegis-client-* "$pkg/clients/"
-            tar -C "$(dirname "$pkg")" -czf "assets/aegisnet-gateway-linux-$arch.tar.gz" aegisnet-gateway
-          done
-          # The installer pins this release's image by digest.
-          sed -e "s|^RELEASE=\"@VERSION@\"|RELEASE=\"v$VERSION\"|" \
-              -e "s|^RELEASE_IMAGE=\"@IMAGE@\"|RELEASE_IMAGE=\"$IMAGE@$DIGEST\"|" \
-              deploy/install.sh > assets/install.sh
-          grep -q "^RELEASE=\"v$VERSION\"" assets/install.sh
+          chmod 0755 assets/*
           ( cd assets && sha256sum * > SHA256SUMS )
           cat assets/SHA256SUMS
-      - uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: assets/*
       - name: Tag and publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -274,14 +308,40 @@ jobs:
           ## Install or upgrade the gateway
 
           \`\`\`sh
-          curl -fsSLO https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/install.sh
-          sudo sh install.sh                 # Docker; add --native for a systemd service
+          docker run --rm --pull always --entrypoint cat $IMAGE:$VERSION /usr/share/aegisnet/install.sh > install.sh
+          sudo sh install.sh                 # add --tunnel-only on a public server
           \`\`\`
 
           Image: \`$IMAGE:$VERSION\` (\`$IMAGE@$DIGEST\`), linux/amd64 and linux/arm64.
-          Clients: download below or from the gateway's web console. Verify files with \`SHA256SUMS\`
-          or \`gh attestation verify <file> -R $GITHUB_REPOSITORY\`.
+          Clients: download below or from the gateway's web console (Devices > Client apps).
+          Verify files with \`SHA256SUMS\`.
           NOTES
           gh release create "v$VERSION" assets/* \
             --target "$GITHUB_SHA" --title "v$VERSION" \
             --notes-file notes.md --generate-notes
+
+  # After a release reaches main, move staging up to main so GitHub doesn't
+  # report staging as "behind" by the release merge commit. Fast-forward only;
+  # staging with new work is left alone. GITHUB_TOKEN pushes trigger nothing.
+  sync-staging:
+    needs: plan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Fast-forward staging to main
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse origin/staging)" = "$(git rev-parse origin/main)" ]; then
+            echo "staging is already at main."
+          elif git merge-base --is-ancestor origin/staging origin/main; then
+            git push origin "$(git rev-parse origin/main):refs/heads/staging"
+            echo "Fast-forwarded staging to $(git rev-parse --short origin/main)."
+          else
+            echo "staging has commits that aren't on main yet; leaving it as is."
+          fi

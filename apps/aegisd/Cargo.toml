@@ -16,6 +16,7 @@ aegis-core = { workspace = true }
 aegis-identity = { workspace = true }
 aegis-node = { workspace = true }
 aegis-telemetry = { workspace = true }
+aegis-dns = { workspace = true }
 aegis-management = { workspace = true }
 aegis-provision = { workspace = true }
 aegis-storage = { workspace = true }

@@ -131,6 +131,8 @@ struct AdminSession {
     csrf_token: String,
     expires_at: i64,
     kind: CredentialKind,
+    /// Signed in with a second factor (TOTP or recovery code).
+    mfa: bool,
 }
 
 /// Authenticated caller of one request.
@@ -141,6 +143,8 @@ pub struct Principal {
     pub kind: CredentialKind,
     pub expires_at: i64,
     pub csrf_token: Option<String>,
+    /// This session was opened with a second factor.
+    pub mfa: bool,
 }
 
 impl Principal {
@@ -173,6 +177,9 @@ struct Limiter {
 pub struct AuthState {
     sessions: Mutex<HashMap<String, AdminSession>>,
     limiter: Mutex<Limiter>,
+    /// Sign-in attempts through the user portal, counted apart so they can
+    /// never lock an administrator out of the console.
+    portal_limiter: Mutex<Limiter>,
     bootstrap_limiter: Mutex<Limiter>,
     bootstrap_slots: Arc<Semaphore>,
     enrollment_limiter: Mutex<Limiter>,
@@ -184,6 +191,7 @@ impl Default for AuthState {
         Self {
             sessions: Mutex::new(HashMap::new()),
             limiter: Mutex::new(Limiter::default()),
+            portal_limiter: Mutex::new(Limiter::default()),
             bootstrap_limiter: Mutex::new(Limiter::default()),
             // Only one owner can be created. Bound both queued blocking jobs
             // and Argon2 memory, even when a caller abandons its HTTP request.
@@ -364,7 +372,53 @@ impl ManagementContext {
             csrf_token: (kind == CredentialKind::Cookie).then_some(s.csrf_token),
             kind,
             expires_at: s.expires_at,
+            mfa: s.mfa,
         })
+    }
+
+    /// The cookie session of a request, without CSRF or expiry side effects:
+    /// `(scopes, mfa)`. For the portal's routing decision only; handlers
+    /// still authenticate fully.
+    pub(crate) fn peek_session(&self, headers: &HeaderMap) -> Option<(Vec<String>, bool)> {
+        let token = cookie_token(headers)?;
+        let sessions = self.auth.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let s = sessions.get(&token_key(&token))?;
+        (s.kind == CredentialKind::Cookie && s.expires_at > db::now_unix())
+            .then(|| (s.scopes.clone(), s.mfa))
+    }
+
+    /// Whether `scopes` grant anything beyond managing one's own devices.
+    pub(crate) fn administrative(scopes: &[String]) -> bool {
+        scopes
+            .iter()
+            .any(|s| s != Permission::DevicesSelf.as_str() && s != SCOPE_PASSWORD_ONLY)
+    }
+
+    /// Check a second-factor code (TOTP, or a recovery code) and spend it.
+    pub(crate) fn check_second_factor(
+        &self,
+        principal_id: &str,
+        code: &str,
+    ) -> Result<(), ApiError> {
+        let store = self.coord.store();
+        let ok = if crate::totp::looks_like_recovery_code(code) {
+            let hash = crate::totp::recovery_hash(code);
+            store.tx(|c| db::use_recovery_code(c, principal_id, &hash))?
+        } else {
+            match crate::totp::load(self, principal_id, false)
+                .and_then(|secret| crate::totp::verify(&secret, code, db::now_unix()))
+            {
+                Some(step) => store.tx(|c| db::advance_totp_step(c, principal_id, step))?,
+                None => false,
+            }
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(ApiError::unauthenticated()
+                .with_code("invalid_two_factor_code")
+                .detail("the authentication code is wrong or was already used"))
+        }
     }
 
     fn scopes_for(roles: &[String]) -> Vec<String> {
@@ -378,8 +432,18 @@ impl ManagementContext {
         scopes
     }
 
-    fn rate_limited(&self, username: &str) -> bool {
-        let mut l = self.auth.limiter.lock().unwrap_or_else(|e| e.into_inner());
+    /// The sign-in limiter for a request: the portal's own, so traffic on
+    /// the public address can never lock administrators out of the console.
+    fn limiter(&self, portal: bool) -> &Mutex<Limiter> {
+        if portal {
+            &self.auth.portal_limiter
+        } else {
+            &self.auth.limiter
+        }
+    }
+
+    fn limited_in(limiter: &Mutex<Limiter>, username: &str) -> bool {
+        let mut l = limiter.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         // Global bucket: 30 attempts per minute.
         match l.window_start {
@@ -395,8 +459,8 @@ impl ManagementContext {
         matches!(l.failures.get(username), Some((n, t)) if *n >= MAX_FAILURES && now.duration_since(*t) < LOCKOUT)
     }
 
-    fn record_failure(&self, username: &str) {
-        let mut l = self.auth.limiter.lock().unwrap_or_else(|e| e.into_inner());
+    fn failure_in(limiter: &Mutex<Limiter>, username: &str) {
+        let mut l = limiter.lock().unwrap_or_else(|e| e.into_inner());
         let e = l
             .failures
             .entry(username.to_owned())
@@ -408,9 +472,18 @@ impl ManagementContext {
         e.1 = Instant::now();
     }
 
-    /// Password login → cookie session + CSRF token.
-    pub fn login(&self, username: &str, password: &str) -> Result<(String, Principal), ApiError> {
-        if self.rate_limited(username) {
+    /// Password login → cookie session + CSRF token. Through the user
+    /// `portal`, only end users may sign in, and attempts are limited
+    /// separately from the console.
+    pub fn login(
+        &self,
+        username: &str,
+        password: &str,
+        portal: bool,
+        code: Option<&str>,
+    ) -> Result<(String, Principal), ApiError> {
+        let limiter = self.limiter(portal);
+        if Self::limited_in(limiter, username) {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
         }
         let principal = self
@@ -429,7 +502,7 @@ impl ManagementContext {
         };
         let audit_actor = principal.as_ref().map(|p| p.id.clone());
         if !ok {
-            self.record_failure(username);
+            Self::failure_in(limiter, username);
             let _ = self.coord.store().tx(|c| {
                 db::append_audit(
                     c,
@@ -447,6 +520,47 @@ impl ManagementContext {
             return Err(ApiError::unauthenticated().detail("invalid credentials"));
         }
         let p = principal.ok_or_else(ApiError::unauthenticated)?;
+        // Checked after the password, so nothing here reveals which accounts
+        // are administrators or use 2FA.
+        let two_factor = self
+            .coord
+            .store()
+            .read(|c| db::two_factor_enabled(c, &p.id))
+            .map_err(ApiError::from)?;
+        if portal && Self::administrative(&Self::scopes_for(&p.roles)) && !two_factor {
+            let _ = self.coord.store().tx(|c| {
+                db::append_audit(
+                    c,
+                    AuditInsert {
+                        actor_id: Some(&p.id),
+                        action: "auth.login",
+                        target_type: "session",
+                        target_id: None,
+                        decision: "denied",
+                        revision_digest: None,
+                        metadata: serde_json::json!({"portal": true, "reason": "administrator_without_2fa"}),
+                    },
+                )
+            });
+            return Err(ApiError::forbidden().with_code("two_factor_setup_required").detail(
+                "administrators need two-factor authentication to sign in here: set it up under Account on the console",
+            ));
+        }
+        if two_factor {
+            match code.map(str::trim).filter(|c| !c.is_empty()) {
+                None => {
+                    return Err(ApiError::unauthenticated()
+                        .with_code("two_factor_required")
+                        .detail("enter the code from your authenticator app"));
+                }
+                Some(code) => {
+                    if let Err(e) = self.check_second_factor(&p.id, code) {
+                        Self::failure_in(limiter, username);
+                        return Err(e);
+                    }
+                }
+            }
+        }
         let must_change = self
             .coord
             .store()
@@ -457,7 +571,7 @@ impl ManagementContext {
         } else {
             Self::scopes_for(&p.roles)
         };
-        let (token, principal) = self.open_session(&p.id, scopes);
+        let (token, principal) = self.open_session(&p.id, scopes, two_factor);
         let _ = self.coord.store().tx(|c| {
             db::append_audit(
                 c,
@@ -475,7 +589,12 @@ impl ManagementContext {
         Ok((token, principal))
     }
 
-    fn open_session(&self, principal_id: &str, scopes: Vec<String>) -> (String, Principal) {
+    fn open_session(
+        &self,
+        principal_id: &str,
+        scopes: Vec<String>,
+        mfa: bool,
+    ) -> (String, Principal) {
         let token = random_token();
         let csrf = random_token();
         let expires_at = db::now_unix() + SESSION_TTL.as_secs() as i64;
@@ -491,6 +610,7 @@ impl ManagementContext {
                     csrf_token: csrf.clone(),
                     expires_at,
                     kind: CredentialKind::Cookie,
+                    mfa,
                 },
             );
         (
@@ -501,6 +621,7 @@ impl ManagementContext {
                 kind: CredentialKind::Cookie,
                 expires_at,
                 csrf_token: Some(csrf),
+                mfa,
             },
         )
     }
@@ -514,6 +635,34 @@ impl ManagementContext {
             .retain(|_, s| s.principal_id != principal_id);
     }
 
+    /// Re-check the signed-in principal's password before a sensitive
+    /// action (rate limited like sign-in, on the `portal`'s limiter when it
+    /// came through the portal). Blocking.
+    pub fn confirm_password(
+        &self,
+        principal_id: &str,
+        password: &str,
+        portal: bool,
+    ) -> Result<(), ApiError> {
+        let p = self
+            .coord
+            .store()
+            .read(|c| db::get_principal(c, principal_id))
+            .map_err(ApiError::from)?;
+        let limiter = self.limiter(portal);
+        if Self::limited_in(limiter, &p.username) {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+        }
+        if p.status != "active"
+            || password.len() > 1024
+            || !verify_password(password, &p.password_hash)
+        {
+            Self::failure_in(limiter, &p.username);
+            return Err(ApiError::forbidden().detail("password is incorrect"));
+        }
+        Ok(())
+    }
+
     /// Self-service password change. Verifies the current password, ends
     /// all other sessions and returns a fresh, fully scoped session.
     pub fn change_password(
@@ -521,6 +670,8 @@ impl ManagementContext {
         principal_id: &str,
         current: &str,
         new: &str,
+        mfa: bool,
+        portal: bool,
     ) -> Result<(String, Principal), ApiError> {
         check_password_policy(new)?;
         if current == new {
@@ -531,11 +682,12 @@ impl ManagementContext {
         let p = store
             .read(|c| db::get_principal(c, principal_id))
             .map_err(ApiError::from)?;
-        if self.rate_limited(&p.username) {
+        let limiter = self.limiter(portal);
+        if Self::limited_in(limiter, &p.username) {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
         }
         if p.status != "active" || !verify_password(current, &p.password_hash) {
-            self.record_failure(&p.username);
+            Self::failure_in(limiter, &p.username);
             return Err(ApiError::forbidden().detail("current password is incorrect"));
         }
         let hash = hash_password(new)?;
@@ -561,7 +713,8 @@ impl ManagementContext {
                 let _ = std::fs::remove_file(dir.join("initial-admin-password"));
             }
         }
-        Ok(self.open_session(&p.id, Self::scopes_for(&p.roles)))
+        // A session opened with a second factor stays one after the change.
+        Ok(self.open_session(&p.id, Self::scopes_for(&p.roles), mfa))
     }
 
     /// Owner-created account with a one-time temporary password that must
@@ -921,6 +1074,7 @@ impl ManagementContext {
                     csrf_token: random_token(),
                     expires_at,
                     kind: CredentialKind::Bearer,
+                    mfa: false,
                 },
             );
         Ok((token, expires_at))
@@ -999,6 +1153,33 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(hashes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn portal_password_failures_never_lock_the_console() {
+        let store = Arc::new(db::Store::open_in_memory().expect("store"));
+        let ctx = context(Arc::clone(&store));
+        insert_owner(&store);
+        for _ in 0..40 {
+            let _ = ctx.confirm_password("test-owner", "wrong", true);
+        }
+        assert_eq!(
+            ctx.confirm_password("test-owner", "wrong", true)
+                .expect_err("portal limited")
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // The console's limiter is untouched: a wrong password is just wrong.
+        let err = ctx
+            .login("owner", "wrong", false, None)
+            .expect_err("wrong password");
+        assert_ne!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_ne!(
+            ctx.confirm_password("test-owner", "wrong", false)
+                .expect_err("wrong")
+                .status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]

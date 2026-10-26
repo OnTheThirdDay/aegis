@@ -988,3 +988,49 @@ async fn body_limit_and_media_type_enforced() {
     assert!(!text.contains("correct horse"));
     assert!(text.contains("bootstrap.claim"));
 }
+
+#[tokio::test]
+async fn tunnel_only_refuses_direct_addresses_and_early_invitations() {
+    let t = setup(true);
+    let (cookie, csrf) = owner_session(&t).await;
+    let send = |method: &str, path: &str, body: Value| {
+        req(method, path)
+            .header(header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .expect("req")
+    };
+    let direct = json!({"public_host": "203.0.113.7", "public_port": 8444});
+    t.ctx.set_tunnel_only(true);
+    let r = call(
+        &t.app,
+        send("PUT", "/api/v1/system/connection", direct.clone()),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{:?}", r.body);
+    assert_eq!(r.body["aegis_error_code"], "tunnel_only");
+    // An address set before (or by a direct install) still can't be used
+    // for invitations while the tunnel isn't the device path.
+    t.ctx.set_tunnel_only(false);
+    let r = call(&t.app, send("PUT", "/api/v1/system/connection", direct)).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    t.ctx.set_tunnel_only(true);
+    let r = call(
+        &t.app,
+        send("POST", "/api/v1/devices/invite", json!({"name": "laptop"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{:?}", r.body);
+    assert_eq!(r.body["aegis_error_code"], "tunnel_not_ready");
+    let info = req("GET", "/api/v1/system/info")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .expect("req");
+    let r = call(&t.app, info).await;
+    assert_eq!(r.body["tunnel_only"], true);
+    assert_eq!(
+        r.body["checklist"]["server_address_set"], false,
+        "a direct address doesn't count"
+    );
+}

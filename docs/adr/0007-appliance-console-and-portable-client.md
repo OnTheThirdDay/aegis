@@ -6,7 +6,7 @@ Status: accepted (owner direction, 2026-10-25). Supersedes parts of SPEC-12 as n
 
 The owner asked for setup without CLI or file editing:
 
-- one command installs the server (Docker or native);
+- one command installs the server (Docker or native; later narrowed to Docker only, with the installer shipped inside the public image so the repository can be private);
 - the server generates a random admin password;
 - the admin opens a browser at the server, signs in, changes the password and configures everything there, including Cloudflare and "plugins";
 - end users get their own pages;
@@ -36,11 +36,13 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
      - loopback console: the existing allowlist still applies, as protection against DNS rebinding.
    - HSTS is set. Cookies are `Secure; HttpOnly; SameSite=Strict`; mutations still require the CSRF header.
    - `--local-console` (`AEGIS_CONSOLE_LOOPBACK=1`) keeps the console on loopback only.
-   - **The console is never published through Cloudflare:** tunnel ingress routes only `^/(agp|enroll|renew)$`.
+   - **The console is never published through Cloudflare:** tunnel ingress routes only the device paths and, since ADR-0010, the restricted user portal: `^/(agp|enroll|renew|portal(/.*)?)$`.
 4. **Edge enrollment.** Devices enroll and renew through the public data-plane listener (`POST /enroll`, `POST /renew`), so the console need not be reachable from the internet.
    - Both endpoints share one implementation and one rate limiter with the API endpoint.
-   - Bodies are bounded at 32 KiB; chunked bodies are accepted for proxies.
-   - Renewal is **same-key**: the CSR must carry the enrolled public key. rcgen verifies the CSR signature, which proves possession of that key. Revoked or expired devices cannot renew.
+   - Bodies are bounded at 2 MiB (diagnostic reports travel on `/renew`). Proxies may forward a body with a length, chunked, or with both headers; chunked then wins (RFC 9112 §6.3). Refused requests are answered with a status (400, 411, 413, 501) rather than a closed connection, which a proxy would turn into a bare 502.
+   - Renewal is **same-key**: the CSR must carry the enrolled public key. rcgen verifies the CSR signature, which proves possession of that key. Revoked devices cannot renew.
+   - Clients renew 10 days before expiry: when connecting, and every 6 hours while connected (the running node switches to the new certificate without dropping sessions).
+   - **Grace renewal** (owner decision, 2026-10-27): a device whose certificate expired up to 90 days ago may still renew. The chain is checked as of the certificate's last valid second, and the registry must still list the device as active. The renewal is audited with how long the certificate had been expired. Past 90 days, or once revoked, the device needs a new invitation.
 5. **Invitation codes.** Codes have the form `aegis1:` + base64url JSON. They carry:
    - the endpoint;
    - the inner server name;
@@ -79,7 +81,10 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
 
 - **Exposed console.** The console listens on the LAN by default; the residual risk is password guessing. Mitigations: Argon2id hashing, per-user lockout and a global rate limit, and the forced password change.
   - The console certificate is self-issued, so the browser warns until the web CA is installed or replaced. The installer prints the SHA-256 fingerprint for out-of-band checking.
-- **Lab-mode root key.** The device root key stays on the appliance host. Hardened, offline-root operation exists only on the CLI/Compose path.
+- **Root key custody.** The device root key starts on the appliance host, so the issuer renews by itself.
+  - The owner can take it offline from the console (Account → Device certificate authority). Export needs the password again; removal needs the key file back as proof.
+  - With the root key offline, the issuer is renewed in the console with the key file. The key is used in memory and not stored. The console warns 60 days before expiry.
+  - All steps are audited (`pki.root_key_exported`, `pki.root_key_removed`, `pki.issuer_renewed`, `pki.root_key_restored`).
 - **Platforms.** The GUI client is built for Windows (cross-compiled with mingw) and Linux. macOS needs a native build. The Windows system-proxy toggle is implemented but has not been exercised on a real desktop.
 - **Cloudflare evidence.**
   - Adapter: mock contract tests only.

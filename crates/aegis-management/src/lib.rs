@@ -19,6 +19,8 @@ mod cursor;
 mod handlers;
 mod http_util;
 pub mod ipc;
+pub mod portal;
+pub mod totp;
 mod ui;
 
 pub use auth::{hash_password, Permission, Principal, ROLE_OWNER};
@@ -63,6 +65,9 @@ pub struct ManagementContext {
     /// HTTPS console reachable beyond loopback: Host may be any address the
     /// operator uses, and Origin must then equal `https://<Host>`.
     remote_console: AtomicBool,
+    /// Installed with `--tunnel-only`: the device port is not reachable from
+    /// the network, so devices can only use Cloudflare Tunnel.
+    tunnel_only: AtomicBool,
     pub(crate) console_tls: Mutex<Option<Arc<console::ConsoleTls>>>,
     /// Appliance services (integrations, certificate lifecycle) installed by
     /// the composition root; absent on hand-configured nodes.
@@ -70,6 +75,8 @@ pub struct ManagementContext {
     /// Directory of client app builds offered to signed-in users.
     pub downloads_dir: Mutex<Option<PathBuf>>,
     pub(crate) download_digests: Mutex<std::collections::HashMap<String, (u64, String)>>,
+    /// Concurrent user-portal connections.
+    pub(crate) portal_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Hooks the composition root (aegisd) provides in appliance mode. The
@@ -91,6 +98,17 @@ pub trait ApplianceServices: Send + Sync {
         actor: &str,
         body: serde_json::Value,
     ) -> IntegrationFuture;
+    /// Device CA custody (blocking): `export-root-key`, `remove-root-key`,
+    /// `restore-root-key`, `renew-issuer`. Callers check the permission and,
+    /// for an export, the password.
+    fn device_ca(
+        &self,
+        _action: &str,
+        _actor: &str,
+        _body: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        Err((404, "unsupported".into()))
+    }
 }
 
 impl ManagementContext {
@@ -137,10 +155,12 @@ impl ManagementContext {
             certificate_reload: Mutex::new(None),
             data_dir: Mutex::new(None),
             remote_console: AtomicBool::new(false),
+            tunnel_only: AtomicBool::new(false),
             console_tls: Mutex::new(None),
             appliance: Mutex::new(None),
             downloads_dir: Mutex::new(None),
             download_digests: Mutex::new(std::collections::HashMap::new()),
+            portal_slots: Arc::new(tokio::sync::Semaphore::new(portal::MAX_CONNECTIONS)),
             coord,
             metrics,
             gauges,
@@ -169,6 +189,14 @@ impl ManagementContext {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn set_tunnel_only(&self, on: bool) {
+        self.tunnel_only.store(on, Ordering::Relaxed);
+    }
+
+    pub fn tunnel_only(&self) -> bool {
+        self.tunnel_only.load(Ordering::Relaxed)
     }
 
     pub(crate) fn remote_console(&self) -> bool {

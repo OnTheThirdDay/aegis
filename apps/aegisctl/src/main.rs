@@ -640,22 +640,66 @@ fn cmd_connect(o: &Opts) -> Result<bool, String> {
         if let Err(e) = aegis_join::renew_if_due(&dir, false).await {
             eprintln!("aegisctl: renewal skipped: {e}");
         }
-        let cfg = aegis_join::client_config(&dir, ports).map_err(|e| e.to_string())?;
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(dir.root.join(format!("state.db{suffix}")));
+        let start = |cfg| {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(dir.root.join(format!("state.db{suffix}")));
+            }
+            aegis_node::start(aegis_node::StartOptions {
+                config: cfg,
+                store_path: dir.store(),
+                failpoints: None,
+            })
+        };
+        // Follow a changed server address, keeping it only if the gateway's
+        // pinned identity answers there (see aegis_join::fetch_endpoint).
+        let mut node = None;
+        if let Ok(Some(endpoint)) = aegis_join::fetch_endpoint(&dir).await {
+            if let Ok(cfg) = aegis_join::client_config_for(&dir, ports, Some(&endpoint)) {
+                if let Ok(trial) = start(cfg).await {
+                    let ok = match trial.bound_addr("socks") {
+                        Some(socks) => aegis_join::verify_tunnel(socks).await,
+                        None => false,
+                    };
+                    if ok && aegis_join::adopt_endpoint(&dir, &endpoint).is_ok() {
+                        eprintln!(
+                            "aegisctl: the server's address changed; now using {}",
+                            endpoint.url
+                        );
+                        node = Some(trial);
+                    } else {
+                        trial.shutdown(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
         }
-        let node = aegis_node::start(aegis_node::StartOptions {
-            config: cfg,
-            store_path: dir.store(),
-            failpoints: None,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        let node = match node {
+            Some(n) => n,
+            None => {
+                let cfg = aegis_join::client_config(&dir, ports).map_err(|e| e.to_string())?;
+                start(cfg).await.map_err(|e| e.to_string())?
+            }
+        };
         print(&json!({
             "socks5": node.bound_addr("socks").map(|a| a.to_string()),
             "http": node.bound_addr("http").map(|a| a.to_string()),
         }));
-        let _ = tokio::signal::ctrl_c().await;
+        // Renew in the background while connected (checked every 6 hours).
+        let mut renewal = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        renewal.tick().await;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = renewal.tick() => match aegis_join::renew_if_due(&dir, false).await {
+                    Ok(true) => {
+                        if let Err(e) = node.ctx.reload_certificates() {
+                            eprintln!("aegisctl: renewed certificate not loaded: {e}");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("aegisctl: renewal skipped: {e}"),
+                },
+            }
+        }
         node.shutdown(std::time::Duration::from_secs(2)).await;
         Ok::<_, String>(true)
     })

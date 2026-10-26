@@ -222,6 +222,9 @@ pub struct WsClientConfig {
     /// host. With it, `outer_ca_pem` is the only trust anchor: a pinned
     /// private outer CA never widens to public roots.
     pub outer_server_name: Option<String>,
+    /// Connect to these addresses (in order) instead of resolving the URL
+    /// host; TLS and the WebSocket Host still use the URL host.
+    pub connect_addresses: Vec<std::net::SocketAddr>,
     pub connect_timeout: Duration,
     pub handshake_timeout: Duration,
     pub max_message_bytes: usize,
@@ -347,13 +350,29 @@ fn outer_tls_config(
 
 pub async fn connect(cfg: &WsClientConfig) -> Result<WsDuplex<OuterStream>, WsError> {
     let url = parse_url(&cfg.url)?;
-    let tcp = tokio::time::timeout(
-        cfg.connect_timeout,
-        TcpStream::connect((url.host.as_str(), url.port)),
-    )
-    .await
-    .map_err(|_| WsError::Timeout)?
-    .map_err(WsError::Connect)?;
+    let tcp = if cfg.connect_addresses.is_empty() {
+        tokio::time::timeout(
+            cfg.connect_timeout,
+            TcpStream::connect((url.host.as_str(), url.port)),
+        )
+        .await
+        .map_err(|_| WsError::Timeout)?
+        .map_err(WsError::Connect)?
+    } else {
+        let mut last = WsError::Timeout;
+        let mut connected = None;
+        for addr in &cfg.connect_addresses {
+            match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => {
+                    connected = Some(s);
+                    break;
+                }
+                Ok(Err(e)) => last = WsError::Connect(e),
+                Err(_) => last = WsError::Timeout,
+            }
+        }
+        connected.ok_or(last)?
+    };
     let _ = tcp.set_nodelay(true);
     let outer = if url.tls {
         let config =

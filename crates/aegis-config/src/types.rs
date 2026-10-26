@@ -70,11 +70,17 @@ impl Default for CoreConfig {
         CoreConfig {
             shutdown_grace_seconds: 15,
             max_sessions: 128,
-            max_streams_per_session: 64,
-            process_buffer_budget_bytes: 32 * 1024 * 1024,
-            peer_buffer_budget_bytes: 8 * 1024 * 1024,
-            stream_buffer_budget_bytes: 64 * 1024,
-            session_window_bytes: 2 * 1024 * 1024,
+            // Streams start with a 16 KiB window that grows (up to
+            // stream_buffer_budget_bytes) only while busy, inside the 8 MiB
+            // session window less one full stream window as the working
+            // share: ~500 concurrent connections, idle ones nearly free.
+            // The peer budget covers the session window plus each stream's
+            // initial transmit reservation, with room to grow.
+            max_streams_per_session: 512,
+            process_buffer_budget_bytes: 256 * 1024 * 1024,
+            peer_buffer_budget_bytes: 24 * 1024 * 1024,
+            stream_buffer_budget_bytes: 256 * 1024,
+            session_window_bytes: 8 * 1024 * 1024,
             max_frame_payload_bytes: 16 * 1024,
             fail_closed: true,
             connect_timeout_ms: 10_000,
@@ -308,6 +314,12 @@ pub struct OutboundConfig {
     /// trust anchor (public roots are not consulted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_server_name: Option<String>,
+    /// agp_tunnel: connect to these IP addresses (`ip`, `ip:port` or
+    /// `[v6]:port`; the URL's port when omitted) instead of resolving the URL
+    /// host, like `curl --resolve`. TLS verification and the WebSocket Host
+    /// still use the URL host. At most 8.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connect_addresses: Vec<String>,
     /// agp_tunnel: acknowledge a plaintext `ws://` outer hop to a non-loopback
     /// host (inner mTLS still protects data). Never implied.
     #[serde(default)]

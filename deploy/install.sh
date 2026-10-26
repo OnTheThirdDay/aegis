@@ -1,41 +1,59 @@
 #!/bin/sh
-# AegisNet gateway installer.
+# AegisNet gateway installer (Docker). It ships inside the gateway image, so
+# everything comes from the public registry; no GitHub access is needed:
 #
-#   curl -fsSLO https://github.com/OnTheThirdDay/aegis/releases/latest/download/install.sh
+#   docker run --rm --pull always --entrypoint cat \
+#     ghcr.io/onthethirdday/aegis /usr/share/aegisnet/install.sh > install.sh
 #   sudo sh install.sh [options]
 #
-# Docker (default): pulls the release image (pinned by digest in release
-# builds) and runs it hardened. --native (Linux/systemd): downloads the
-# release binaries, verifies SHA256SUMS and installs a hardened service.
-# Then open the printed console URL and finish setup in the browser.
+# The copy from an image installs that image's release (the :staging image's
+# copy installs :staging). Then open the console it prints and finish setup
+# in the browser.
+#
+# Public servers: --tunnel-only exposes nothing to the internet. The console
+# listens on this machine only (reach it with ssh -L) and devices arrive
+# through the Cloudflare Tunnel you set up in the console.
+#
+# Ports that are not given and already in use (nginx, v2ray, ...) are
+# replaced by free ones automatically; the summary shows which.
+#
+# Upgrading: fetch install.sh again as above and run it (with --name if the
+# instance was installed with one). Ports, addresses and exposure are read
+# back from the running instance; options given now override them.
 #
 # Options:
+#   --tunnel-only      nothing public: console and device port on this machine
+#                      only, no HTTP-01 port; devices use Cloudflare Tunnel
+#   --direct           undo --tunnel-only on an upgrade
 #   --console-port N   host port of the HTTPS console        (default 8443)
 #   --port N           host port devices connect to           (default 443)
 #   --http-port N      host port for Let's Encrypt HTTP-01    (default 80; 0 = none)
 #   --address A[,B]    public IP/DNS names for certificates   (default: detected)
 #   --local-console    console on this machine only (reach it with ssh -L)
-#   --name NAME        container / service name               (default aegis)
-#   --version vX.Y.Z   release to install                     (default: this installer's)
+#   --public-console   undo --local-console on an upgrade
+#   --fresh            ignore the existing instance's settings; use defaults
+#   --name NAME        container name                         (default aegis)
+#   --version vX.Y.Z   release to install (default: this installer's)
 #   --image REF        Docker image to run instead of the release image
-#   --from DIR         offline: use binaries from DIR/bin/<arch>/ (deploy/build-bundle.sh)
-#   --native           install as a Linux systemd service instead of Docker
-#   --uninstall        remove the container/service (keeps data unless --purge)
+#   --from DIR         offline: build the image from DIR (deploy/build-bundle.sh)
+#   --uninstall        remove the container (keeps data unless --purge)
 #   --purge            with --uninstall: also delete all gateway data
 set -eu
 
-# Stamped by the release workflow; unstamped copies use the latest release.
+# Stamped when the image is built: the image this copy installs by default.
+# Unstamped copies (from the source tree) use :latest.
 REPO="OnTheThirdDay/aegis"
-RELEASE="@VERSION@"
 RELEASE_IMAGE="@IMAGE@"
 
 NAME=aegis
-CONSOLE_PORT=8443
-EDGE_PORT=443
-HTTP_PORT=80
+# Empty = not given: taken from the existing instance, else the default.
+CONSOLE_PORT=""
+EDGE_PORT=""
+HTTP_PORT=""
 ADDRESSES=""
-LOCAL_CONSOLE=0
-MODE=docker
+LOCAL_CONSOLE=""
+TUNNEL_ONLY=""
+FRESH=0
 UNINSTALL=0
 PURGE=0
 IMAGE=""
@@ -52,41 +70,131 @@ while [ $# -gt 0 ]; do
     --http-port) HTTP_PORT=${2:?}; shift 2 ;;
     --address) ADDRESSES=${2:?}; shift 2 ;;
     --local-console) LOCAL_CONSOLE=1; shift ;;
+    --public-console) LOCAL_CONSOLE=0; shift ;;
+    --tunnel-only) TUNNEL_ONLY=1; shift ;;
+    --direct) TUNNEL_ONLY=0; shift ;;
+    --fresh) FRESH=1; shift ;;
     --name) NAME=${2:?}; shift 2 ;;
     --version) VERSION=${2:?}; shift 2 ;;
     --image) IMAGE=${2:?}; shift 2 ;;
     --from) FROM=${2:?}; shift 2 ;;
-    --native) MODE=native; shift ;;
+    --native) die "--native is no longer supported; AegisNet installs with Docker" ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
-    -h|--help) sed -n '2,26p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,40p' "$0" 2>/dev/null || true; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
 
 case "$NAME" in *[!A-Za-z0-9_.-]*|"") die "invalid --name" ;; esac
-for p in "$CONSOLE_PORT" "$EDGE_PORT" "$HTTP_PORT"; do
-  case "$p" in *[!0-9]*|"") die "ports must be numbers" ;; esac
-done
-case "$RELEASE" in @*) RELEASE="" ;; esac
-case "$RELEASE_IMAGE" in @*) RELEASE_IMAGE="" ;; esac
-[ -z "$VERSION" ] && VERSION=$RELEASE
-case "$VERSION" in ""|latest|v[0-9]*) ;; *) die "--version must look like v1.2.3" ;; esac
-LOWER_REPO=$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')
 
-release_url() { # file
-  if [ -n "$VERSION" ] && [ "$VERSION" != latest ]; then
-    printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$VERSION" "$1"
+# ---------------------------------------------------------------- settings of an existing instance
+
+RECALLED=0
+
+recall_docker() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker inspect "$NAME" >/dev/null 2>&1 || return 0
+  # "8443/tcp=127.0.0.1:8453 8444/tcp=:8454 ..." (container port=host ip:port)
+  ports=$(docker inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{$p}}={{range $b}}{{.HostIp}}:{{.HostPort}}{{end}} {{end}}' "$NAME" 2>/dev/null) || return 0
+  http_seen=0
+  for entry in $ports; do
+    key=${entry%%=*}; val=${entry#*=}
+    host_port=${val##*:}; host_ip=${val%:*}
+    case "$key" in
+      8443/tcp)
+        if [ -z "$CONSOLE_PORT" ]; then CONSOLE_PORT=$host_port; fi
+        if [ -z "$LOCAL_CONSOLE" ]; then
+          if [ "$host_ip" = 127.0.0.1 ]; then LOCAL_CONSOLE=1; else LOCAL_CONSOLE=0; fi
+        fi ;;
+      8444/tcp)
+        if [ -z "$EDGE_PORT" ]; then EDGE_PORT=$host_port; fi
+        if [ -z "$TUNNEL_ONLY" ]; then
+          if [ "$host_ip" = 127.0.0.1 ]; then TUNNEL_ONLY=1; else TUNNEL_ONLY=0; fi
+        fi ;;
+      8080/tcp) http_seen=1; if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$host_port; fi ;;
+    esac
+  done
+  if [ -z "$HTTP_PORT" ] && [ "$http_seen" = 0 ]; then HTTP_PORT=0; fi
+  if [ -z "$ADDRESSES" ]; then
+    ADDRESSES=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+      | sed -n 's/^AEGIS_PUBLIC_ADDRESSES=//p' | head -n 1)
+  fi
+  RECALLED=1
+}
+
+instance_exists() {
+  command -v docker >/dev/null 2>&1 && docker inspect "$NAME" >/dev/null 2>&1
+}
+
+# Whether something on this machine already listens on TCP port $1. Without
+# a tool to ask, assume free (the start then fails with a clear message).
+port_busy() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -an 2>/dev/null | grep -i listen | awk '{print $4}' | grep -qE "[:.]$1\$"
   else
-    printf 'https://github.com/%s/releases/latest/download/%s' "$REPO" "$1"
+    return 1
   fi
 }
 
-fetch() { # url dest
-  if command -v curl >/dev/null 2>&1; then curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"
-  elif command -v wget >/dev/null 2>&1; then wget -q --https-only -O "$2" "$1"
-  else die "curl or wget is required"; fi
+# First free port of the candidates (the first one when none is free).
+pick_port() {
+  for candidate in "$@"; do
+    if ! port_busy "$candidate"; then printf '%s' "$candidate"; return; fi
+  done
+  printf '%s' "$1"
 }
+
+if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then recall_docker; fi
+[ -n "$TUNNEL_ONLY" ] || TUNNEL_ONLY=0
+if [ "$TUNNEL_ONLY" = 1 ]; then
+  # Nothing public: the console needs ssh -L, and HTTP-01 can't reach us.
+  [ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=1
+  [ -n "$HTTP_PORT" ] || HTTP_PORT=0
+fi
+[ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=0
+# Defaults, skipping ports another service already uses. Not on an upgrade
+# or reinstall of this instance: its own ports would look taken.
+auto=0
+if [ "$UNINSTALL" = 0 ] && ! instance_exists; then auto=1; fi
+if [ -z "$CONSOLE_PORT" ]; then
+  if [ "$auto" = 1 ]; then CONSOLE_PORT=$(pick_port 8443 8453 8463 9443); else CONSOLE_PORT=8443; fi
+fi
+if [ -z "$EDGE_PORT" ]; then
+  if [ "$auto" = 1 ]; then EDGE_PORT=$(pick_port 443 8444 8454 9444); else EDGE_PORT=443; fi
+fi
+if [ -z "$HTTP_PORT" ]; then
+  HTTP_PORT=80
+  if [ "$auto" = 1 ] && port_busy 80; then
+    HTTP_PORT=0
+    say "Port 80 is in use; Let's Encrypt HTTP validation is off (DNS validation still works)."
+  fi
+fi
+describe_settings() {
+  console_where="reachable from the network"; [ "$LOCAL_CONSOLE" = 1 ] && console_where="this machine only"
+  devices_where="all addresses"; [ "$TUNNEL_ONLY" = 1 ] && devices_where="this machine only; devices use Cloudflare Tunnel"
+  say "  console port $CONSOLE_PORT ($console_where); device port $EDGE_PORT ($devices_where); HTTP validation port $HTTP_PORT (0 = none)"
+  if [ -n "$ADDRESSES" ]; then say "  addresses $ADDRESSES"; fi
+}
+if [ "$UNINSTALL" = 0 ]; then
+  if [ "$RECALLED" = 1 ]; then
+    say "Upgrading $NAME with its current settings (options given now override them; --fresh ignores them):"
+  else
+    say "Installing $NAME with:"
+  fi
+  describe_settings
+fi
+
+for p in "$CONSOLE_PORT" "$EDGE_PORT" "$HTTP_PORT"; do
+  case "$p" in *[!0-9]*|"") die "ports must be numbers" ;; esac
+done
+case "$RELEASE_IMAGE" in @*) RELEASE_IMAGE="" ;; esac
+case "$VERSION" in ""|latest|v[0-9]*) ;; *) die "--version must look like v1.2.3" ;; esac
+LOWER_REPO=$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')
 
 host_arch() {
   case "$(uname -m)" in
@@ -143,8 +251,14 @@ print_summary() { # password fingerprint addresses
   say "  its own. Check its SHA-256 fingerprint matches:"
   say "      $2"
   say ""
-  say "  Devices connect to TCP port $EDGE_PORT. For access from the internet, open that"
-  say "  port in your firewall, or set up Cloudflare Tunnel in the console (no open ports)."
+  if [ "$TUNNEL_ONLY" = 1 ]; then
+    say "  Nothing on this server is reachable from the internet. Devices connect through"
+    say "  Cloudflare Tunnel: set it up in the console under Connectivity."
+  else
+    say "  Devices connect to TCP port $EDGE_PORT. For access from the internet, open that"
+    say "  port in your firewall, or set up Cloudflare Tunnel in the console (no open ports;"
+    say "  install with --tunnel-only to keep this port off the network)."
+  fi
   say ""
 }
 
@@ -160,7 +274,7 @@ wait_healthy() { # command...
 # ---------------------------------------------------------------- docker
 
 docker_install() {
-  command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it (Linux: curl -fsSL https://get.docker.com | sudo sh) or use --native"
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it (Linux: curl -fsSL https://get.docker.com | sudo sh)"
   docker info >/dev/null 2>&1 || die "Docker is not running (or this user may not use it: try sudo)"
   if [ "$UNINSTALL" = 1 ]; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -175,21 +289,22 @@ docker_install() {
     docker build -q --build-arg TARGETARCH="$(host_arch)" -t "$IMAGE" "$FROM" >/dev/null
   else
     if [ -z "$IMAGE" ]; then
-      if [ -n "$RELEASE_IMAGE" ] && { [ -z "$VERSION" ] || [ "$VERSION" = "$RELEASE" ]; }; then
-        IMAGE=$RELEASE_IMAGE
-      elif [ -n "$VERSION" ] && [ "$VERSION" != latest ]; then
+      if [ -n "$VERSION" ] && [ "$VERSION" != latest ]; then
         IMAGE="ghcr.io/$LOWER_REPO:${VERSION#v}"
+      elif [ -z "$VERSION" ] && [ -n "$RELEASE_IMAGE" ]; then
+        IMAGE=$RELEASE_IMAGE
       else
         IMAGE="ghcr.io/$LOWER_REPO:latest"
       fi
     fi
     say "Pulling $IMAGE…"
-    docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (is the package public, or run: docker login ghcr.io)"
+    docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
   fi
   docker volume create "$NAME-data" >/dev/null
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   addrs=$(detect_addresses)
   console_bind="0.0.0.0"; [ "$LOCAL_CONSOLE" = 1 ] && console_bind="127.0.0.1"
+  edge_bind="0.0.0.0"; [ "$TUNNEL_ONLY" = 1 ] && edge_bind="127.0.0.1"
   err=$(mktemp)
   run() { # extra publish flags
     # shellcheck disable=SC2086
@@ -198,7 +313,8 @@ docker_install() {
       --pids-limit 256 --memory 512m --tmpfs /tmp:rw,noexec,nosuid,size=16m \
       -v "$NAME-data:/var/lib/aegisnet" \
       -e AEGIS_PUBLIC_ADDRESSES="$addrs" -e AEGIS_PUBLIC_PORT="$EDGE_PORT" \
-      -p "$console_bind:$CONSOLE_PORT:8443" -p "$EDGE_PORT:8444" $1 \
+      -e AEGIS_TUNNEL_ONLY="$TUNNEL_ONLY" \
+      -p "$console_bind:$CONSOLE_PORT:8443" -p "$edge_bind:$EDGE_PORT:8444" $1 \
       "$IMAGE" >/dev/null 2>"$err"
   }
   extra=""; [ "$HTTP_PORT" != 0 ] && extra="-p $HTTP_PORT:8080"
@@ -218,120 +334,11 @@ docker_install() {
   password=$(docker exec "$NAME" aegisctl initial-password 2>/dev/null || true)
   fingerprint=$(docker exec "$NAME" aegisctl console-fingerprint 2>/dev/null || echo unknown)
   print_summary "$password" "$fingerprint" "$addrs"
-  say "  Manage:  docker logs $NAME | docker restart $NAME | sh install.sh --uninstall"
-  say "  Upgrade: run the newest install.sh again (data is kept)."
+  name_opt=""; [ "$NAME" = aegis ] || name_opt=" --name $NAME"
+  say "  Manage:  docker logs $NAME | docker restart $NAME | sh install.sh$name_opt --uninstall"
+  say "  Upgrade: fetch install.sh from the newest image again and run it; data and"
+  say "           settings are kept."
   say ""
 }
 
-# ---------------------------------------------------------------- native
-
-write_unit() { # unit data addresses
-  console_loopback=0; [ "$LOCAL_CONSOLE" = 1 ] && console_loopback=1
-  cat > "$1" <<UNIT
-# AegisNet appliance (native), written by install.sh --native.
-[Unit]
-Description=AegisNet gateway (appliance)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=aegisnet
-Group=aegisnet
-Environment=AEGIS_DATA_DIR=$2
-Environment=AEGIS_CONSOLE_PORT=$CONSOLE_PORT
-Environment=AEGIS_EDGE_PORT=$EDGE_PORT
-Environment=AEGIS_PUBLIC_PORT=$EDGE_PORT
-Environment=AEGIS_HTTP_PORT=$HTTP_PORT
-Environment=AEGIS_PUBLIC_ADDRESSES=$3
-Environment=AEGIS_CONSOLE_LOOPBACK=$console_loopback
-Environment=AEGIS_DOWNLOADS_DIR=/usr/local/share/aegisnet/clients
-ExecStart=/usr/local/bin/aegisd --data-dir $2
-StateDirectory=$NAME
-StateDirectoryMode=0700
-UMask=0077
-Restart=on-failure
-RestartSec=2s
-TimeoutStopSec=30s
-LimitNOFILE=65536
-# Binding ports below 1024 needs only this capability; nothing else is granted.
-NoNewPrivileges=yes
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-ProtectSystem=strict
-ReadWritePaths=$2
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-RemoveIPC=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @mount
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-}
-
-native_install() {
-  [ "$(uname -s)" = Linux ] || die "--native supports Linux (systemd) only; use Docker on macOS"
-  [ "$(id -u)" = 0 ] || die "--native needs root: sudo sh install.sh --native"
-  command -v systemctl >/dev/null 2>&1 || die "systemd is required for --native"
-  unit=/etc/systemd/system/$NAME.service
-  data=/var/lib/$NAME
-  if [ "$UNINSTALL" = 1 ]; then
-    systemctl disable --now "$NAME" >/dev/null 2>&1 || true
-    rm -f "$unit"; systemctl daemon-reload
-    if [ "$PURGE" = 1 ]; then rm -rf "$data"; say "Removed $NAME and its data."; else say "Removed $NAME (data kept in $data)."; fi
-    return
-  fi
-  arch=$(host_arch)
-  work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
-  if [ -n "$FROM" ]; then
-    src="$FROM/bin/$arch"
-    [ -x "$src/aegisd" ] || die "--from: $src/aegisd missing"
-    clients="$FROM/clients"
-  else
-    tag=${VERSION:-latest}
-    pkg="aegisnet-gateway-linux-$arch.tar.gz"
-    say "Downloading AegisNet ($tag, $arch)…"
-    fetch "$(release_url "$pkg")" "$work/$pkg"
-    fetch "$(release_url SHA256SUMS)" "$work/SHA256SUMS"
-    ( cd "$work" && grep " $pkg\$" SHA256SUMS | sha256sum -c - >/dev/null ) || die "checksum verification failed for $pkg"
-    tar -xzf "$work/$pkg" -C "$work"
-    src="$work/aegisnet-gateway/bin"
-    clients="$work/aegisnet-gateway/clients"
-  fi
-  id aegisnet >/dev/null 2>&1 || useradd --system --home-dir "$data" --shell /usr/sbin/nologin aegisnet
-  install -m 0755 "$src/aegisd" "$src/aegisctl" /usr/local/bin/
-  [ -f "$src/cloudflared" ] && install -m 0755 "$src/cloudflared" /usr/local/bin/cloudflared
-  install -d -m 0755 /usr/local/share/aegisnet/clients
-  if [ -d "$clients" ]; then cp -f "$clients"/* /usr/local/share/aegisnet/clients/ 2>/dev/null || true; fi
-  addrs=$(detect_addresses)
-  write_unit "$unit" "$data" "$addrs"
-  systemctl daemon-reload
-  systemctl enable "$NAME" >/dev/null 2>&1
-  systemctl restart "$NAME"
-  say "Waiting for the gateway to start…"
-  wait_healthy /usr/local/bin/aegisctl --socket "$data/aegisd.sock" health \
-    || { journalctl -u "$NAME" -n 20 --no-pager >&2 || true; die "the gateway did not become healthy"; }
-  password=$(/usr/local/bin/aegisctl initial-password --data-dir "$data" 2>/dev/null || true)
-  fingerprint=$(/usr/local/bin/aegisctl console-fingerprint --data-dir "$data" 2>/dev/null || echo unknown)
-  print_summary "$password" "$fingerprint" "$addrs"
-  say "  Manage:  systemctl status $NAME | sudo sh install.sh --native --uninstall"
-  say "  Upgrade: run the newest install.sh --native again (data is kept)."
-  say ""
-}
-
-if [ "$MODE" = native ]; then native_install; else docker_install; fi
+docker_install

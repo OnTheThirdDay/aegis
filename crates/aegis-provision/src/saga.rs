@@ -207,10 +207,28 @@ impl Controller {
         host.apply(p, token.as_deref().map(String::as_str)).await?;
         p.inventory.host_applied = true;
         self.transition(p, PlanState::Verifying, "data_path", None)?;
-        let revision = self.verify(p, provider, host, probe).await?;
+        let (revision, verified) = match self.verify(p, provider, host, probe).await {
+            Ok(revision) => (revision, true),
+            // Everything the provider and host can confirm is healthy; only
+            // this host's own route to the public endpoint failed. Commit,
+            // flagged unverified, rather than strand a working setup.
+            Err(Error(code)) if code == crate::DATA_PATH_UNVERIFIED_FROM_HOST => {
+                (host.verify(p).await?, false)
+            }
+            Err(e) => return Err(e),
+        };
         p.inventory.config_revision = Some(revision);
-        p.inventory.verified = true;
-        self.transition(p, PlanState::Active, "committed", None)
+        p.inventory.verified = verified;
+        if verified {
+            self.transition(p, PlanState::Active, "committed", None)
+        } else {
+            self.transition(
+                p,
+                PlanState::Active,
+                "committed_unverified",
+                Some(crate::DATA_PATH_UNVERIFIED_FROM_HOST),
+            )
+        }
     }
 
     pub async fn verify<P: InfrastructureProvider, H: HostProvisioner, V: Probe>(

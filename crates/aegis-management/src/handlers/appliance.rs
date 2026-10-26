@@ -48,11 +48,14 @@ pub async fn info(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
         &json!({
             "version": env!("CARGO_PKG_VERSION"),
             "appliance": appliance.is_some(),
+            "tunnel_only": ctx.tunnel_only(),
+            "portal": crate::portal::status_json(&ctx),
             "console_certificate_sha256": ctx.console_fingerprint(),
             "connection": conn,
             "checklist": {
                 "owner_password_changed": owners_pending == 0,
-                "server_address_set": conn.public_host.is_some(),
+                "server_address_set": conn.public_host.is_some()
+                    && (!ctx.tunnel_only() || conn.mode.as_deref() == Some("cloudflare")),
                 "devices_enrolled": devices,
             },
             "runtime": appliance.map(|a| a.status()).unwrap_or(Value::Null),
@@ -76,6 +79,11 @@ pub async fn put_connection(State(ctx): State<Ctx>, headers: HeaderMap, body: Bo
     let v = read_json(&headers, body, &["application/json"]).await?;
     let b: ConnectionBody =
         serde_json::from_value(v).map_err(|_| ApiError::bad_request("invalid_body"))?;
+    if ctx.tunnel_only() {
+        return Err(ApiError::conflict("tunnel_only").detail(
+            "this gateway was installed with --tunnel-only, so its device port is not reachable from the network; use Cloudflare Tunnel (or reinstall with --direct)",
+        ));
+    }
     let host = b.public_host.trim().to_ascii_lowercase();
     if !valid_public_host(&host) || b.public_port == 0 {
         return Err(ApiError::bad_request("invalid_public_address")
@@ -196,6 +204,102 @@ pub async fn integration_action(
             Err(ApiError::new(status, "integration_failed").detail(code))
         }
     }
+}
+
+/// Switch the user portal on or off (`{"enabled": bool}`).
+pub async fn put_portal(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::PUT)?;
+    p.require(Permission::SystemConfigure)?;
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let on = v
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad_request("invalid_body"))?;
+    let (c, actor) = (ctx.clone(), p.id.clone());
+    blocking(move || {
+        c.coord.store().tx(|tx| {
+            db::put_setting(tx, "portal", &json!({"enabled": on}))?;
+            db::append_audit(
+                tx,
+                AuditInsert {
+                    actor_id: Some(&actor),
+                    action: if on {
+                        "portal.enabled"
+                    } else {
+                        "portal.disabled"
+                    },
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata: json!({}),
+                },
+            )
+        })?;
+        Ok(())
+    })
+    .await?;
+    Ok(json(StatusCode::OK, &crate::portal::status_json(&ctx), &[]))
+}
+
+/// Device CA custody: take the root key offline, renew the issuer with it,
+/// or put it back (owner only). Exporting the key needs the password again.
+pub async fn device_ca(
+    State(ctx): State<Ctx>,
+    portal: Option<axum::Extension<crate::portal::PortalRequest>>,
+    headers: HeaderMap,
+    Path(action): Path<String>,
+    body: Body,
+) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::POST)?;
+    p.require(Permission::SystemConfigure)?;
+    if !matches!(
+        action.as_str(),
+        "export-root-key" | "remove-root-key" | "restore-root-key" | "renew-issuer"
+    ) {
+        return Err(ApiError::not_found());
+    }
+    // The root key never leaves through the public address, however the
+    // path was spelled (the portal guard sees it still percent-encoded).
+    if portal.is_some() && action == "export-root-key" {
+        return Err(ApiError::not_found());
+    }
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let appliance = ctx
+        .appliance()
+        .ok_or_else(|| ApiError::conflict("appliance_mode_required"))?;
+    let (c, actor) = (ctx.clone(), p.id.clone());
+    let export = action == "export-root-key";
+    let portal = portal.is_some();
+    let out = blocking(move || {
+        if export {
+            let password = v.get("password").and_then(Value::as_str).unwrap_or("");
+            c.confirm_password(&actor, password, portal)?;
+        }
+        appliance
+            .device_ca(&action, &actor, v)
+            .map_err(|(status, detail)| {
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+                ApiError::new(status, "device_ca_failed").detail(detail)
+            })
+    })
+    .await?;
+    if export {
+        let pem = out["key_pem"].as_str().unwrap_or("").to_owned();
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "application/x-pem-file"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"aegisnet-device-root-key.pem\"",
+                ),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            pem,
+        )
+            .into_response());
+    }
+    Ok(json(StatusCode::OK, &out, &[]))
 }
 
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;

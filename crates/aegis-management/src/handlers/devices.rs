@@ -129,13 +129,15 @@ fn endpoint(host: &str, port: u16, path: &str, scheme: &str) -> String {
     }
 }
 
-pub(crate) fn invite_code(
-    ctx: &ManagementContext,
-    name: &str,
-    token: &str,
-    expires: i64,
-) -> Result<(String, Value), ApiError> {
+/// How devices reach and trust this gateway right now: the non-secret part
+/// of an invitation. Devices fetch it on connect to follow address changes.
+pub(crate) fn current_endpoint(ctx: &ManagementContext) -> Result<Value, ApiError> {
     let conn = connection(ctx)?;
+    if ctx.tunnel_only() && conn.mode.as_deref() != Some("cloudflare") {
+        return Err(ApiError::conflict("tunnel_not_ready").detail(
+            "this gateway accepts devices only through Cloudflare Tunnel; finish setting it up under Connectivity first, and invitations will point at the tunnel's hostname",
+        ));
+    }
     let host = conn
         .public_host
         .clone()
@@ -158,18 +160,27 @@ pub(crate) fn invite_code(
             .map_err(|_| ApiError::conflict("edge_trust_unavailable"))?;
         (json!(DEFAULT_EDGE_SERVER_NAME), json!(ca))
     };
-    let invite = json!({
-        "v": 1,
-        "name": name,
-        "token": token,
-        "expires_at": expires,
+    Ok(json!({
         "url": endpoint(&host, port, "/agp", "wss"),
         "enroll_url": endpoint(&host, port, "/enroll", "https"),
         "server_name": conn.inner_server_name.as_deref().unwrap_or(DEFAULT_INNER_SERVER_NAME),
         "outer_server_name": outer_server_name,
         "outer_ca_pem": outer_ca_pem,
         "device_ca_sha256": device_ca_sha256,
-    });
+    }))
+}
+
+pub(crate) fn invite_code(
+    ctx: &ManagementContext,
+    name: &str,
+    token: &str,
+    expires: i64,
+) -> Result<(String, Value), ApiError> {
+    let mut invite = current_endpoint(ctx)?;
+    invite["v"] = json!(1);
+    invite["name"] = json!(name);
+    invite["token"] = json!(token);
+    invite["expires_at"] = json!(expires);
     let code = format!(
         "{INVITE_PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(invite.to_string())

@@ -44,6 +44,12 @@ impl ApiError {
         }
     }
 
+    /// Replace the machine-readable error code (keeps the status).
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = code;
+        self
+    }
+
     pub fn detail(mut self, d: impl Into<String>) -> Self {
         let d: String = d.into();
         self.detail = Some(d.chars().take(2048).collect());
@@ -296,7 +302,7 @@ fn valid_host_header(h: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
 }
 
-fn finish(mut resp: Response, no_store: bool) -> Response {
+pub(crate) fn finish(mut resp: Response, no_store: bool) -> Response {
     let h = resp.headers_mut();
     let set = |h: &mut HeaderMap, k: &'static str, v: &'static str| {
         h.insert(k, HeaderValue::from_static(v));
