@@ -17,6 +17,7 @@ use hickory_resolver::config::{
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::NetError;
+use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::TokioResolver;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -144,11 +145,7 @@ impl Resolver {
                 let lookup = tokio::time::timeout(self.timeout * 3, fut)
                     .await
                     .map_err(|_| DnsError::Timeout)?
-                    .map_err(|e| match e {
-                        _ if e.is_no_records_found() => DnsError::NotFound,
-                        NetError::Timeout => DnsError::Timeout,
-                        _ => DnsError::Failure,
-                    })?;
+                    .map_err(net_error)?;
                 lookup.iter().collect()
             }
         };
@@ -168,6 +165,40 @@ impl Resolver {
             return Err(DnsError::NotFound);
         }
         Ok(out)
+    }
+
+    /// Nameserver host names of `zone` (its `NS` records), without the
+    /// trailing dot. Only an explicit resolver looks up other record types.
+    pub async fn nameservers(&self, zone: &str) -> Result<Vec<String>, DnsError> {
+        let Inner::Explicit(r) = &self.inner else {
+            return Err(DnsError::Failure);
+        };
+        let fqdn = format!("{}.", zone.trim_end_matches('.'));
+        let lookup = tokio::time::timeout(self.timeout * 3, r.lookup(fqdn, RecordType::NS))
+            .await
+            .map_err(|_| DnsError::Timeout)?
+            .map_err(net_error)?;
+        let names: Vec<String> = lookup
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::NS(ns) => Some(ns.0.to_ascii().trim_end_matches('.').to_owned()),
+                _ => None,
+            })
+            .take(MAX_ADDRESSES)
+            .collect();
+        if names.is_empty() {
+            return Err(DnsError::NotFound);
+        }
+        Ok(names)
+    }
+}
+
+fn net_error(e: NetError) -> DnsError {
+    match e {
+        _ if e.is_no_records_found() => DnsError::NotFound,
+        NetError::Timeout => DnsError::Timeout,
+        _ => DnsError::Failure,
     }
 }
 
