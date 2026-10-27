@@ -61,14 +61,9 @@ jobs:
       - name: Windows cross toolchain
         # A stalled package mirror fails here quickly instead of holding the
         # job until its limit; retried requests usually get through.
-        timeout-minutes: 8
+        timeout-minutes: 12
         run: |
-          apt="sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
-          # Rebuilding the man-page index after installing can take many
-          # minutes on hosted runners, silently; nothing here needs it.
-          sudo rm -f /var/lib/man-db/auto-update
-          $apt update -qq
-          $apt install -y -qq gcc-mingw-w64-x86-64
+          bash .github/scripts/apt-install.sh gcc-mingw-w64-x86-64
           rustup target add x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
         with:
