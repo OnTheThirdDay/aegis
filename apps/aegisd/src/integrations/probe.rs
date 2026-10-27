@@ -8,10 +8,10 @@
 //! 2. fetches the operator's HTTP and HTTPS verification URLs through SOCKS
 //!    with remote DNS (the HTTPS certificate is verified normally).
 //!
-//! The public hostname is looked up through public resolvers and the probe
-//! connects to those addresses (TLS and Host still use the name): this
-//! server's own resolver may still cache "no such name" from before the
-//! record existed, which says nothing about devices.
+//! The public hostname is looked up at the zone's own nameservers and the
+//! probe connects to those addresses (TLS and Host still use the name):
+//! resolvers, this server's or public ones, may still cache "no such name"
+//! from before the record existed, which says nothing about devices.
 
 use crate::appliance;
 use crate::services::Appliance;
@@ -176,24 +176,36 @@ fn url_host(url: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
-/// Addresses of `host` per public DNS, waiting up to two minutes while a new
-/// record propagates. Falls back to this server's resolver only when public
-/// DNS is unreachable from here (UDP 53 blocked).
+/// Addresses of `host` as devices will see them, waiting up to two minutes
+/// while a new record appears. Asked of the zone's own nameservers, which
+/// answer as soon as the record exists: public resolvers keep "no such name"
+/// for the zone's negative TTL (30 minutes on Cloudflare) if anything looked
+/// the name up before setup created it. Public DNS is the fallback when the
+/// nameservers can't be reached from here, and this server's resolver when
+/// neither can (UDP 53 blocked).
 async fn resolve_public(host: &str) -> Result<Vec<String>, ProbeFailure> {
-    let servers: Vec<std::net::SocketAddr> = PUBLIC_RESOLVERS
+    let public: Vec<SocketAddr> = PUBLIC_RESOLVERS
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
-    let public = aegis_dns::Resolver::explicit(&servers, Duration::from_secs(4), true)
-        .map_err(|_| ProbeFailure::Failed("dns_resolver_unavailable".into()))?;
+    let authoritative = zone_nameservers(host, &public).await;
     let system = aegis_dns::Resolver::system(Duration::from_secs(4), true);
     let mut last = String::new();
     for _ in 0..24 {
-        match public.resolve(host).await {
-            Ok(ips) if !ips.is_empty() => {
-                return Ok(ips.iter().map(ToString::to_string).collect());
+        if !authoritative.is_empty() {
+            match lookup(&authoritative, host).await {
+                Ok(ips) => return Ok(ips),
+                Err(aegis_dns::DnsError::NotFound) => {
+                    last = format!("the zone's nameservers have no record for {host}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                // Not reachable from here: ask public DNS instead.
+                Err(_) => {}
             }
-            Ok(_) => last = format!("public DNS returns no address for {host}"),
+        }
+        match lookup(&public, host).await {
+            Ok(ips) => return Ok(ips),
             Err(aegis_dns::DnsError::Timeout) => {
                 // Public resolvers unreachable from here: use this server's.
                 if let Ok(ips) = system.resolve(host).await {
@@ -210,6 +222,47 @@ async fn resolve_public(host: &str) -> Result<Vec<String>, ProbeFailure> {
     Err(ProbeFailure::Failed(format!(
         "{last}; check that the DNS record exists in Cloudflare"
     )))
+}
+
+/// One lookup through a fresh resolver: a reused one would answer from its
+/// own cache of the last "no such name".
+async fn lookup(servers: &[SocketAddr], host: &str) -> Result<Vec<String>, aegis_dns::DnsError> {
+    let resolver = aegis_dns::Resolver::explicit(servers, Duration::from_secs(4), true)?;
+    Ok(resolver
+        .resolve(host)
+        .await?
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// Addresses of the nameservers for the zone holding `host`: the NS records
+/// of its closest parent that has them, per public DNS. The zone existed
+/// long before setup added the record, so no negative answer is cached for
+/// these names. Empty when they can't be found.
+async fn zone_nameservers(host: &str, public: &[SocketAddr]) -> Vec<SocketAddr> {
+    let Ok(resolver) = aegis_dns::Resolver::explicit(public, Duration::from_secs(4), true) else {
+        return Vec::new();
+    };
+    let mut name = host;
+    while let Some((_, parent)) = name.split_once('.') {
+        // A top-level domain's servers only refer onward.
+        if !parent.contains('.') {
+            break;
+        }
+        name = parent;
+        let Ok(servers) = resolver.nameservers(name).await else {
+            continue;
+        };
+        let mut addresses = Vec::new();
+        for server in servers {
+            if let Ok(ips) = resolver.resolve(&server).await {
+                addresses.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, 53)));
+            }
+        }
+        return addresses;
+    }
+    Vec::new()
 }
 
 fn probe_config(
@@ -467,6 +520,28 @@ mod tests {
             );
         }
         s
+    }
+
+    /// Needs internet access: `cargo test -p aegisd -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn zone_nameservers_answer_for_a_host() {
+        let public: Vec<SocketAddr> = PUBLIC_RESOLVERS
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let servers = zone_nameservers("www.example.com", &public).await;
+        assert!(!servers.is_empty());
+        assert!(!lookup(&servers, "www.example.com")
+            .await
+            .expect("answer")
+            .is_empty());
+        assert_eq!(
+            lookup(&servers, "aegis-no-such-name.example.com").await,
+            Err(aegis_dns::DnsError::NotFound)
+        );
+        // Nothing to find above a top-level domain.
+        assert!(zone_nameservers("example", &public).await.is_empty());
     }
 
     #[test]

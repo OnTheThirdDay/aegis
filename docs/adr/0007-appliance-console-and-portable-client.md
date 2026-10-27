@@ -55,7 +55,10 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
 7. **Built-in integrations instead of plugins.** No third-party code runs.
    - **Cloudflare Tunnel:**
      - It reuses the SPEC-12 saga and API adapter, with an *embedded* host provisioner.
-     - The bundled `cloudflared` 2026.10.0 is digest-checked at image build and again before every start. It runs as a supervised child with `--token-file` (owner-only file) and its output discarded.
+     - `cloudflared` runs as a supervised child with `--token-file` (owner-only file) and its output discarded. Every build is checked against the SHA-256 that Cloudflare publishes in its release notes (and GitHub's asset digest when listed): at image build and again before every start.
+     - It is kept current (owner direction, 2026-10-27). Images bundle the release that is current when they are built. While the tunnel is active, the gateway checks weekly and at every start, and installs a newer build into the data volume. The image itself is read-only.
+     - The newest build whose binary matches its manifest runs. A connector that doesn't reconnect within 90 s after an update is rolled back.
+     - Automatic updates are on by default. They can be switched off in the console or with `aegisctl cloudflared auto-update off`; `aegisctl cloudflared update` updates on demand.
      - The API token is held in memory for one operation unless the owner opts to store it (owner-only file), which DNS-validated renewals need.
      - The tunnel origin is a container-loopback WebSocket inbound.
      - ACTIVE requires an end-to-end probe through the public hostname:

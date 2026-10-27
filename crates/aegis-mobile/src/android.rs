@@ -32,13 +32,26 @@ pub extern "system" fn Java_net_aegis_app_Native_enroll(
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_device(
+pub extern "system" fn Java_net_aegis_app_Native_servers(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
 ) -> jstring {
     let dir = arg(&mut env, &dir);
-    let v = crate::device(&dir);
+    let v = crate::servers(&dir);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_net_aegis_app_Native_select(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+    id: JString,
+) -> jstring {
+    let (dir, id) = (arg(&mut env, &dir), arg(&mut env, &id));
+    let v = crate::select(&dir, &id);
     ret(&mut env, v)
 }
 
@@ -48,9 +61,10 @@ pub extern "system" fn Java_net_aegis_app_Native_forget(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
+    id: JString,
 ) -> jstring {
-    let dir = arg(&mut env, &dir);
-    let v = crate::forget(&dir);
+    let (dir, id) = (arg(&mut env, &dir), arg(&mut env, &id));
+    let v = crate::forget(&dir, &id);
     ret(&mut env, v)
 }
 

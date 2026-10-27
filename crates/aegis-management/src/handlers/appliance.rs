@@ -68,23 +68,33 @@ pub async fn info(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConnectionBody {
-    public_host: String,
+    #[serde(default)]
+    public_host: Option<String>,
     public_port: u16,
 }
 
-/// Set the address devices use to reach this server in direct mode.
+/// Set the address devices use to reach this server in direct mode, or,
+/// with Cloudflare Tunnel, the port (one of Cloudflare's HTTPS ports).
+/// Enrolled devices follow the change on their next connection.
 pub async fn put_connection(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
     let p = ctx.authenticate(&headers, &Method::PUT)?;
     p.require(Permission::SystemConfigure)?;
     let v = read_json(&headers, body, &["application/json"]).await?;
     let b: ConnectionBody =
         serde_json::from_value(v).map_err(|_| ApiError::bad_request("invalid_body"))?;
+    if connection(&ctx)?.mode.as_deref() == Some("cloudflare") {
+        return put_cloudflare_port(&ctx, &p.id, b.public_port).await;
+    }
+    let Some(public_host) = b.public_host else {
+        return Err(ApiError::bad_request("invalid_public_address")
+            .detail("enter an IP address or DNS name and a port"));
+    };
     if ctx.tunnel_only() {
         return Err(ApiError::conflict("tunnel_only").detail(
             "this gateway was installed with --tunnel-only, so its device port is not reachable from the network; use Cloudflare Tunnel (or reinstall with --direct)",
         ));
     }
-    let host = b.public_host.trim().to_ascii_lowercase();
+    let host = public_host.trim().to_ascii_lowercase();
     if !valid_public_host(&host) || b.public_port == 0 {
         return Err(ApiError::bad_request("invalid_public_address")
             .detail("enter an IP address or DNS name and a port"));
@@ -138,6 +148,43 @@ pub async fn put_connection(State(ctx): State<Ctx>, headers: HeaderMap, body: Bo
         })
         .await?;
     }
+    Ok(json(StatusCode::OK, &json!({"connection": updated}), &[]))
+}
+
+/// With Cloudflare Tunnel the hostname belongs to the integration; only the
+/// port devices use can change, among the ports Cloudflare proxies.
+async fn put_cloudflare_port(ctx: &Ctx, actor: &str, port: u16) -> ApiResult {
+    if !crate::portal::CLOUDFLARE_HTTPS_PORTS.contains(&port) {
+        return Err(ApiError::bad_request("invalid_public_port").detail(format!(
+            "through Cloudflare Tunnel devices can use Cloudflare's HTTPS ports only: {}",
+            crate::portal::CLOUDFLARE_HTTPS_PORTS
+                .map(|p| p.to_string())
+                .join(", ")
+        )));
+    }
+    let (c, actor) = (ctx.clone(), actor.to_owned());
+    let updated = blocking(move || {
+        let mut conn = connection(&c)?;
+        conn.public_port = Some(port);
+        let value = serde_json::to_value(&conn).map_err(|_| ApiError::unavailable())?;
+        c.coord.store().tx(|tx| {
+            db::put_setting(tx, "connection", &value)?;
+            db::append_audit(
+                tx,
+                AuditInsert {
+                    actor_id: Some(&actor),
+                    action: "system.connection_updated",
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata: json!({"public_port": port}),
+                },
+            )
+        })?;
+        Ok(conn)
+    })
+    .await?;
     Ok(json(StatusCode::OK, &json!({"connection": updated}), &[]))
 }
 
@@ -206,35 +253,79 @@ pub async fn integration_action(
     }
 }
 
-/// Switch the user portal on or off (`{"enabled": bool}`).
+/// Configure the user portal: `{"enabled": bool}` switches it on or off,
+/// `{"public_port": port|null}` sets (or clears) the port in its address.
+/// Either or both; the other stays as it was.
 pub async fn put_portal(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
     let p = ctx.authenticate(&headers, &Method::PUT)?;
     p.require(Permission::SystemConfigure)?;
     let v = read_json(&headers, body, &["application/json"]).await?;
-    let on = v
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| ApiError::bad_request("invalid_body"))?;
+    let on = match v.get("enabled") {
+        None => None,
+        Some(e) => Some(e.as_bool().ok_or_else(|| {
+            ApiError::bad_request("invalid_body").detail("enabled must be true or false")
+        })?),
+    };
+    // Outer None: unchanged; Some(None): cleared.
+    let port = match v.get("public_port") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(n) => {
+            let port = n
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .filter(|n| *n != 0)
+                .ok_or_else(|| {
+                    ApiError::bad_request("invalid_body")
+                        .detail("public_port must be a port number (1-65535)")
+                })?;
+            if let Some(why) = crate::portal::port_problem(&ctx, port) {
+                return Err(ApiError::bad_request("invalid_portal_port").detail(why));
+            }
+            Some(Some(port))
+        }
+    };
+    if on.is_none() && port.is_none() {
+        return Err(ApiError::bad_request("invalid_body").detail("set enabled or public_port"));
+    }
+    let mut setting = crate::portal::setting(&ctx);
+    if !setting.is_object() {
+        setting = json!({});
+    }
+    if let Some(on) = on {
+        setting["enabled"] = json!(on);
+    }
+    if let Some(port) = port {
+        setting["public_port"] = json!(port);
+    }
     let (c, actor) = (ctx.clone(), p.id.clone());
     blocking(move || {
         c.coord.store().tx(|tx| {
-            db::put_setting(tx, "portal", &json!({"enabled": on}))?;
-            db::append_audit(
-                tx,
-                AuditInsert {
-                    actor_id: Some(&actor),
-                    action: if on {
-                        "portal.enabled"
-                    } else {
-                        "portal.disabled"
-                    },
-                    target_type: "system",
-                    target_id: None,
-                    decision: "allowed",
-                    revision_digest: None,
-                    metadata: json!({}),
-                },
-            )
+            db::put_setting(tx, "portal", &setting)?;
+            let audit = |action, metadata| AuditInsert {
+                actor_id: Some(&actor),
+                action,
+                target_type: "system",
+                target_id: None,
+                decision: "allowed",
+                revision_digest: None,
+                metadata,
+            };
+            if let Some(on) = on {
+                let action = if on {
+                    "portal.enabled"
+                } else {
+                    "portal.disabled"
+                };
+                db::append_audit(tx, audit(action, json!({})))?;
+            }
+            if let Some(port) = port {
+                db::append_audit(
+                    tx,
+                    audit("portal.public_port", json!({"public_port": port})),
+                )?;
+            }
+            Ok(())
         })?;
         Ok(())
     })

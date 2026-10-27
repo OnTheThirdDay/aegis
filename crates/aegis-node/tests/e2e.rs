@@ -1230,7 +1230,18 @@ async fn gateway_limits_cover_pending_agp_and_live_sessions() {
         })
         .await
         .expect("slots released");
-        let replacement = connect().await.expect("reusable quota after close");
+        // The session leaves the registry a moment before its connection task
+        // ends and gives its slots back, so a replacement may need a retry.
+        let replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match connect().await {
+                    Ok(session) => break session,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("reusable quota after close");
         drop(replacement);
         gw.shutdown(Duration::from_millis(100)).await;
     }
