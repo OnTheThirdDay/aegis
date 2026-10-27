@@ -315,7 +315,9 @@ fn download_name_ok(name: &str) -> bool {
 
 fn download_label(name: &str) -> String {
     let n = name.to_ascii_lowercase();
-    let os = if n.contains("windows") || n.ends_with(".exe") {
+    let os = if n.contains("android") || n.ends_with(".apk") {
+        "Android"
+    } else if n.contains("windows") || n.ends_with(".exe") {
         "Windows"
     } else if n.contains("macos") || n.contains("darwin") {
         "macOS"
@@ -422,12 +424,37 @@ pub async fn download_file(
     let disposition = format!("attachment; filename=\"{name}\"");
     let mut resp = axum::response::Response::new(axum::body::Body::from(bytes));
     let h = resp.headers_mut();
+    // Phones offer to install an APK only with its own media type.
+    let content_type = if name.ends_with(".apk") {
+        "application/vnd.android.package-archive"
+    } else {
+        "application/octet-stream"
+    };
     h.insert(
         header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/octet-stream"),
+        http::HeaderValue::from_static(content_type),
     );
     if let Ok(v) = http::HeaderValue::from_str(&disposition) {
         h.insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_labels() {
+        assert_eq!(
+            download_label("aegis-client-android-arm64.apk"),
+            "AegisNet client for Android (ARM64)"
+        );
+        assert_eq!(
+            download_label("aegis-client-windows-x86_64.exe"),
+            "AegisNet client for Windows (x64)"
+        );
+        assert_eq!(download_label("notes.txt"), "notes.txt");
+        assert!(download_name_ok("aegis-client-android-arm64.apk"));
+    }
 }

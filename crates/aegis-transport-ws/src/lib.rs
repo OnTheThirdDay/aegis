@@ -32,7 +32,13 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     module_version: env!("CARGO_PKG_VERSION"),
     api_version: 1,
     roles: &[Role::Client, Role::Gateway],
-    operating_systems: &[OsFamily::Linux, OsFamily::Windows, OsFamily::Macos],
+    operating_systems: &[
+        OsFamily::Linux,
+        OsFamily::Windows,
+        OsFamily::Macos,
+        OsFamily::Android,
+        OsFamily::Ios,
+    ],
     provides: &[
         Capability::ByteStream,
         Capability::Ordered,

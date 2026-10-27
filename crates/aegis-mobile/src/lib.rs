@@ -1,0 +1,465 @@
+//! Mobile client core.
+//!
+//! The app (Flutter UI, platform VPN service) calls a small JSON API:
+//! enroll with an invitation, show the device, connect with a VPN interface
+//! descriptor, disconnect, and poll status. Underneath it is the desktop
+//! client's stack: `aegis-join` for enrollment and renewal, the client node
+//! (local SOCKS proxy, AGP tunnel to the gateway), plus the VPN packet path
+//! that feeds captured connections into that proxy.
+//!
+//! Every function returns a JSON object with `"ok": true` and its fields, or
+//! `"ok": false` and an `"error"` message for the user.
+//!
+//! Unsafe code is denied, not forbidden (ADR-0011): only the platform
+//! boundary allows it, item by item (`fd`, `android`).
+#![deny(unsafe_code)]
+
+mod dns;
+#[cfg(unix)]
+mod fd;
+mod packet;
+mod routes;
+mod socks;
+
+#[cfg(target_os = "android")]
+mod android;
+
+use aegis_join::{DeviceDir, JoinError, Ports};
+use serde_json::{json, Value};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::runtime::Runtime;
+use tokio::sync::watch;
+
+/// How often a connected device checks whether its certificate is due for
+/// renewal (renewal itself starts 10 days before expiry).
+const RENEWAL_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// Status refresh while connected; every `PROBE_EVERY` refreshes (and
+/// whenever no session is up) the tunnel is checked end to end.
+const TICK: Duration = Duration::from_secs(2);
+const PROBE_EVERY: u32 = 15;
+
+/// What the app shows.
+#[derive(Clone, Default)]
+struct Snapshot {
+    state: State,
+    error: Option<String>,
+    info: Option<String>,
+    server: Option<String>,
+    connected_since: Option<u64>,
+    bytes_up: u64,
+    bytes_down: u64,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum State {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+}
+
+impl State {
+    fn as_str(self) -> &'static str {
+        match self {
+            State::Disconnected => "disconnected",
+            State::Connecting => "connecting",
+            State::Connected => "connected",
+        }
+    }
+}
+
+struct Running {
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct Client {
+    rt: Runtime,
+    snapshot: Arc<Mutex<Snapshot>>,
+    stats: Mutex<Arc<packet::Stats>>,
+    running: Mutex<Option<Running>>,
+}
+
+fn client() -> Result<&'static Client, String> {
+    static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("aegis")
+                .enable_all()
+                .build()
+                .map_err(|e| format!("runtime: {e}"))?;
+            Ok(Client {
+                rt,
+                snapshot: Arc::default(),
+                stats: Mutex::default(),
+                running: Mutex::default(),
+            })
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn ok(mut v: Value) -> Value {
+    v["ok"] = json!(true);
+    v
+}
+
+fn fail(error: impl std::fmt::Display) -> Value {
+    json!({"ok": false, "error": error.to_string()})
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?']).next().unwrap_or(rest).to_owned()
+}
+
+/// Join a gateway with an invitation code (`aegis1:…`). Blocking.
+pub fn enroll(dir: &str, code: &str) -> Value {
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let device = DeviceDir::new(dir);
+    let result = c.rt.block_on(async {
+        let invite = aegis_join::parse_invite(code)?;
+        aegis_join::enroll(&invite, &device).await
+    });
+    match result {
+        Ok(d) => ok(json!({"name": d.name, "server": host_of(&d.url)})),
+        Err(e) => fail(e),
+    }
+}
+
+/// The enrolled device, if any.
+pub fn device(dir: &str) -> Value {
+    let device = DeviceDir::new(dir);
+    match device.load() {
+        Ok(d) => ok(json!({
+            "enrolled": true,
+            "name": d.name,
+            "server": host_of(&d.url),
+            "certificate_expires_at": device.certificate_expires_at().ok(),
+        })),
+        Err(_) => ok(json!({"enrolled": false})),
+    }
+}
+
+/// Disconnect and remove the device's identity from this phone.
+pub fn forget(dir: &str) -> Value {
+    let _ = stop();
+    match DeviceDir::new(dir).forget() {
+        Ok(()) => ok(json!({})),
+        Err(e) => fail(e),
+    }
+}
+
+/// How the platform should set up the VPN interface.
+pub fn vpn_config() -> Value {
+    let v4: Vec<Value> = routes::ipv4()
+        .into_iter()
+        .map(|(ip, len)| json!({"address": ip.to_string(), "prefix": len}))
+        .collect();
+    let v6: Vec<Value> = routes::IPV6
+        .iter()
+        .map(|(ip, len)| json!({"address": ip, "prefix": len}))
+        .collect();
+    ok(json!({
+        "mtu": packet::MTU,
+        "address": "172.19.0.1",
+        "prefix": 30,
+        "address6": "fdfe:dcba:9876::1",
+        "prefix6": 126,
+        "dns": dns::SERVER.to_string(),
+        "routes": v4,
+        "routes6": v6,
+    }))
+}
+
+/// Connect, carrying the VPN interface `fd` (ownership passes to Rust; it
+/// is closed on disconnect). Returns at once; progress shows in [`status`].
+#[cfg(unix)]
+pub fn start(dir: &str, fd: i32) -> Value {
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    // Registering the descriptor needs the runtime's reactor.
+    let device = {
+        let _rt = c.rt.enter();
+        fd::TunDevice::new(fd)
+    };
+    match device {
+        Ok(device) => start_with(dir, device),
+        Err(e) => fail(format!("VPN interface: {e}")),
+    }
+}
+
+/// Connect with any packet device (the VPN interface, or a test double).
+pub fn start_with<D>(dir: &str, device: D) -> Value
+where
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let _ = stop();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let stats = Arc::new(packet::Stats::default());
+    *lock(&c.stats) = Arc::clone(&stats);
+    {
+        let mut s = lock(&c.snapshot);
+        *s = Snapshot {
+            state: State::Connecting,
+            ..Snapshot::default()
+        };
+    }
+    let task = c.rt.spawn(session(
+        DeviceDir::new(dir),
+        device,
+        Arc::clone(&c.snapshot),
+        stats,
+        stop_rx,
+    ));
+    *lock(&c.running) = Some(Running {
+        stop: stop_tx,
+        task,
+    });
+    ok(json!({}))
+}
+
+/// Disconnect (no-op when not connected). Blocks until the node stopped.
+pub fn stop() -> Value {
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let running = lock(&c.running).take();
+    if let Some(r) = running {
+        let _ = r.stop.send(true);
+        let _ =
+            c.rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), r.task).await });
+    }
+    let mut s = lock(&c.snapshot);
+    s.state = State::Disconnected;
+    s.connected_since = None;
+    ok(json!({}))
+}
+
+/// Connection state and counters.
+pub fn status() -> Value {
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let s = lock(&c.snapshot).clone();
+    let stats = Arc::clone(&lock(&c.stats));
+    ok(json!({
+        "state": s.state.as_str(),
+        "error": s.error,
+        "info": s.info,
+        "server": s.server,
+        "connected_since": s.connected_since,
+        "bytes_up": s.bytes_up,
+        "bytes_down": s.bytes_down,
+        "connections": stats.tcp_open.load(Ordering::Relaxed),
+        "connections_total": stats.tcp_total.load(Ordering::Relaxed),
+        "connections_failed": stats.tcp_failed.load(Ordering::Relaxed),
+        "dns_queries": stats.dns_queries.load(Ordering::Relaxed),
+        "dropped": stats.dropped.load(Ordering::Relaxed),
+    }))
+}
+
+fn update(snapshot: &Mutex<Snapshot>, f: impl FnOnce(&mut Snapshot)) {
+    f(&mut lock(snapshot));
+}
+
+/// One connection: renew if due, start the client node (following a
+/// changed server address), run the packet path, keep status current and
+/// renew in the background until stopped.
+async fn session<D>(
+    dir: DeviceDir,
+    device: D,
+    snapshot: Arc<Mutex<Snapshot>>,
+    stats: Arc<packet::Stats>,
+    mut stop: watch::Receiver<bool>,
+) where
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let fail_with = |e: String| {
+        update(&snapshot, |s| {
+            s.state = State::Disconnected;
+            s.error = Some(e);
+        })
+    };
+    if let Err(e) = aegis_join::renew_if_due(&dir, false).await {
+        let expired = dir
+            .certificate_expires_at()
+            .is_ok_and(|exp| exp <= now() as i64);
+        if expired {
+            return fail_with(format!(
+                "This device's certificate expired and could not be renewed ({e}). If it expired over 90 days ago or the device was removed, ask for a new invitation."
+            ));
+        }
+    }
+    let node = match start_node(&dir, &snapshot).await {
+        Ok(n) => n,
+        Err(e) => return fail_with(e),
+    };
+    let Some(socks) = node.bound_addr("socks") else {
+        node.shutdown(Duration::from_secs(1)).await;
+        return fail_with("the local proxy did not start".into());
+    };
+    let packets = tokio::spawn(packet::run(device, socks, stats, stop.clone()));
+    let mut tick = tokio::time::interval(TICK);
+    let mut ticks = 0u32;
+    let mut renewal_checked = Instant::now();
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = stop.wait_for(|s| *s) => break,
+        }
+        if packets.is_finished() {
+            update(&snapshot, |s| {
+                s.error = Some("The VPN interface closed.".into())
+            });
+            break;
+        }
+        ticks = ticks.wrapping_add(1);
+        let gauges = node.ctx.gauges();
+        let m = node.ctx.metrics.snapshot(gauges);
+        let probe = ticks % PROBE_EVERY == 1 || gauges.sessions_active == 0;
+        let verified = if probe {
+            Some(aegis_join::verify_tunnel(socks).await)
+        } else {
+            None
+        };
+        update(&snapshot, |s| {
+            s.bytes_up = m.transport_bytes_up;
+            s.bytes_down = m.transport_bytes_down;
+            match verified {
+                Some(true) => {
+                    if s.state != State::Connected {
+                        s.connected_since = Some(now());
+                    }
+                    s.state = State::Connected;
+                    s.error = None;
+                }
+                Some(false) => {
+                    s.state = State::Connecting;
+                    s.connected_since = None;
+                    s.error = Some("Cannot reach the server yet — retrying. Check the network, or ask the administrator whether this device was removed.".into());
+                }
+                None => {}
+            }
+        });
+        if renewal_checked.elapsed() >= RENEWAL_CHECK {
+            renewal_checked = Instant::now();
+            if let Ok(true) = aegis_join::renew_if_due(&dir, false).await {
+                let _ = node.ctx.reload_certificates();
+            }
+        }
+    }
+    packets.abort();
+    node.shutdown(Duration::from_secs(1)).await;
+    update(&snapshot, |s| {
+        s.state = State::Disconnected;
+        s.connected_since = None;
+    });
+}
+
+/// Start the client node on ephemeral local ports, first trying a changed
+/// server address the gateway reports (kept only if the pinned gateway
+/// answers there).
+async fn start_node(
+    dir: &DeviceDir,
+    snapshot: &Mutex<Snapshot>,
+) -> Result<aegis_node::NodeRuntime, String> {
+    let ports = Ports { socks: 0, http: 0 };
+    let start = |cfg| async {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.root.join(format!("state.db{suffix}")));
+        }
+        aegis_node::start(aegis_node::StartOptions {
+            config: cfg,
+            store_path: dir.store(),
+            failpoints: None,
+        })
+        .await
+    };
+    if let Ok(Some(endpoint)) = aegis_join::fetch_endpoint(dir).await {
+        if let Ok(cfg) = aegis_join::client_config_for(dir, ports, Some(&endpoint)) {
+            if let Ok(trial) = start(cfg).await {
+                let verified = match trial.bound_addr("socks") {
+                    Some(socks) => aegis_join::verify_tunnel(socks).await,
+                    None => false,
+                };
+                if verified {
+                    if let Ok(d) = aegis_join::adopt_endpoint(dir, &endpoint) {
+                        let host = host_of(&d.url);
+                        update(snapshot, |s| {
+                            s.info =
+                                Some(format!("The server's address changed; now using {host}."));
+                            s.server = Some(host);
+                        });
+                        return Ok(trial);
+                    }
+                }
+                trial.shutdown(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    let cfg = aegis_join::client_config(dir, ports).map_err(|e: JoinError| e.to_string())?;
+    let server = dir.load().ok().map(|d| host_of(&d.url));
+    update(snapshot, |s| s.server = server);
+    start(cfg).await.map_err(|e| match e {
+        aegis_node::StartError::Identity(_) => {
+            "This device's identity could not be loaded. Remove the server and join again.".into()
+        }
+        other => format!("Could not start: {other}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosts_and_vpn_config() {
+        assert_eq!(
+            host_of("wss://gw.example.test:8443/agp"),
+            "gw.example.test:8443"
+        );
+        assert_eq!(host_of("wss://gw.example.test/agp"), "gw.example.test");
+        let v = vpn_config();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["dns"], "198.18.0.1");
+        assert!(v["routes"].as_array().is_some_and(|r| r.len() > 5));
+    }
+
+    #[test]
+    fn device_reports_not_enrolled() {
+        let dir = std::env::temp_dir().join(format!("aegis-mobile-test-{}", std::process::id()));
+        let v = device(dir.to_str().expect("utf-8"));
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["enrolled"], false);
+        let s = status();
+        assert_eq!(s["state"], "disconnected");
+    }
+}

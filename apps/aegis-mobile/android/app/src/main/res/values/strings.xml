@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AegisNet</string>
+    <string name="vpn_channel">Connection</string>
+    <string name="vpn_connecting">Connecting…</string>
+    <string name="vpn_connected">Connected to %1$s</string>
+    <string name="vpn_not_allowed">Android didn\'t allow the VPN connection. Open the app and connect again.</string>
+    <string name="disconnect">Disconnect</string>
+</resources>
