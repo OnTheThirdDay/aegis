@@ -217,7 +217,19 @@ impl CloudflareIntegration {
         v["hostname"] = settings["hostname"].clone();
         v["plan_id"] = settings["plan_id"].clone();
         if let Some(h) = settings["hostname"].as_str() {
-            v["public_url"] = json!(format!("wss://{h}/agp"));
+            // The device port the administrator chose (one of Cloudflare's).
+            let port = app
+                .store
+                .read(|c| db::get_setting(c, "connection"))
+                .ok()
+                .flatten()
+                .filter(|c| c["mode"] == "cloudflare")
+                .and_then(|c| c["public_port"].as_u64())
+                .filter(|p| *p != 443);
+            v["public_url"] = json!(match port {
+                Some(p) => format!("wss://{h}:{p}/agp"),
+                None => format!("wss://{h}/agp"),
+            });
         }
         v["token_stored"] = json!(app.secrets.read(API_TOKEN_FILE).is_ok());
         let update = app
@@ -751,15 +763,20 @@ impl CloudflareIntegration {
 fn switch_connection(app: &Appliance, hostname: Option<&str>) {
     let Some(host) = hostname else { return };
     let _ = app.store.tx(|c| {
+        let mut port = 443;
         if let Some(current) = db::get_setting(c, "connection")? {
             if current["mode"].as_str().is_none_or(|m| m == "direct") {
                 db::put_setting(c, "direct_connection", &current)?;
+            }
+            // A retry or route update keeps the port the administrator chose.
+            if current["mode"] == "cloudflare" && current["public_host"] == host {
+                port = current["public_port"].as_u64().unwrap_or(443);
             }
         }
         db::put_setting(
             c,
             "connection",
-            &json!({"mode": "cloudflare", "public_host": host, "public_port": 443, "outer_trust": "public"}),
+            &json!({"mode": "cloudflare", "public_host": host, "public_port": port, "outer_trust": "public"}),
         )
     });
 }
