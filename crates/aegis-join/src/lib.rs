@@ -205,6 +205,7 @@ impl Device {
 }
 
 /// On-disk layout of one device profile.
+#[derive(Clone, Debug)]
 pub struct DeviceDir {
     pub root: PathBuf,
 }
@@ -259,6 +260,179 @@ impl DeviceDir {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(JoinError::Storage(e.kind().to_string())),
         }
+    }
+}
+
+/// Every server this device joined, one profile each, and which one the
+/// client connects to (one at a time). Layout under `root`:
+///
+/// * `servers/<id>/`: a [`DeviceDir`];
+/// * `servers/selected`: the selected id.
+///
+/// The id is derived from the gateway's device CA and the device name, so
+/// joining the same gateway under the same name twice is refused. A single
+/// profile kept directly in `root` by earlier versions is moved in on open.
+#[derive(Clone, Debug)]
+pub struct Servers {
+    root: PathBuf,
+}
+
+/// One joined server.
+#[derive(Clone, Debug)]
+pub struct Server {
+    pub id: String,
+    pub device: Device,
+    pub dir: DeviceDir,
+}
+
+impl Server {
+    /// The gateway's address as shown to the user (`host[:port]`).
+    pub fn host(&self) -> String {
+        let rest = self
+            .device
+            .url
+            .split_once("://")
+            .map_or(self.device.url.as_str(), |(_, r)| r);
+        rest.split(['/', '?']).next().unwrap_or(rest).to_owned()
+    }
+}
+
+fn server_id(device_ca_sha256: &str, name: &str) -> String {
+    sha256_hex(format!("{}/{name}", device_ca_sha256.to_ascii_lowercase()).as_bytes())[..16]
+        .to_owned()
+}
+
+fn valid_server_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+impl Servers {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, JoinError> {
+        let servers = Servers { root: root.into() };
+        servers.migrate()?;
+        Ok(servers)
+    }
+
+    fn base(&self) -> PathBuf {
+        self.root.join("servers")
+    }
+
+    fn selection(&self) -> PathBuf {
+        self.base().join("selected")
+    }
+
+    /// Move a profile from directly in `root` (one server per device) into
+    /// `servers/<id>/`, unchanged.
+    fn migrate(&self) -> Result<(), JoinError> {
+        let legacy = DeviceDir::new(&self.root);
+        let Ok(device) = legacy.load() else {
+            return Ok(());
+        };
+        let id = server_id(&device.device_ca_sha256, &device.name);
+        let target = DeviceDir::new(self.base().join(&id));
+        if target.device_file().exists() {
+            return Err(JoinError::Storage(format!(
+                "{} holds two copies of the same server",
+                self.root.display()
+            )));
+        }
+        private_dir(&self.base())?;
+        private_dir(&target.root)?;
+        let moved = |from: PathBuf, to: PathBuf| match std::fs::rename(&from, to) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(JoinError::Storage(format!(
+                "moving {}: {}",
+                from.display(),
+                e.kind()
+            ))),
+        };
+        moved(legacy.secrets(), target.secrets())?;
+        // The device file last: until it moves, the old layout is complete.
+        moved(legacy.device_file(), target.device_file())?;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(self.root.join(format!("state.db{suffix}")));
+        }
+        if self.selected().is_none() {
+            self.select(&id)?;
+        }
+        Ok(())
+    }
+
+    /// Joined servers, oldest first.
+    pub fn list(&self) -> Vec<Server> {
+        let Ok(entries) = std::fs::read_dir(self.base()) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Server> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| self.get(e.file_name().to_str()?))
+            .collect();
+        out.sort_by(|a, b| (a.device.enrolled_at, &a.id).cmp(&(b.device.enrolled_at, &b.id)));
+        out
+    }
+
+    pub fn get(&self, id: &str) -> Option<Server> {
+        if !valid_server_id(id) {
+            return None;
+        }
+        let dir = DeviceDir::new(self.base().join(id));
+        let device = dir.load().ok()?;
+        Some(Server {
+            id: id.to_owned(),
+            device,
+            dir,
+        })
+    }
+
+    /// The server to connect to: the one chosen last, else the oldest.
+    pub fn selected(&self) -> Option<Server> {
+        std::fs::read_to_string(self.selection())
+            .ok()
+            .and_then(|id| self.get(id.trim()))
+            .or_else(|| self.list().into_iter().next())
+    }
+
+    pub fn select(&self, id: &str) -> Result<Server, JoinError> {
+        let server = self.get(id).ok_or(JoinError::NotEnrolled)?;
+        private_dir(&self.base())?;
+        write_private(&self.selection(), id)?;
+        Ok(server)
+    }
+
+    /// Join another server with an invitation and select it.
+    pub async fn join(&self, invite: &Invite) -> Result<Server, JoinError> {
+        let id = server_id(&invite.device_ca_sha256, &invite.name);
+        if let Some(existing) = self.get(&id) {
+            return Err(JoinError::Storage(format!(
+                "this device already joined {} as \"{}\"; remove it first to join again",
+                existing.host(),
+                existing.device.name
+            )));
+        }
+        private_dir(&self.base())?;
+        let dir = DeviceDir::new(self.base().join(&id));
+        enroll(invite, &dir).await?;
+        self.select(&id)
+    }
+
+    /// Forget a server: its identity and files are deleted from this device.
+    pub fn remove(&self, id: &str) -> Result<(), JoinError> {
+        if !valid_server_id(id) {
+            return Err(JoinError::NotEnrolled);
+        }
+        let dir = DeviceDir::new(self.base().join(id));
+        dir.forget()?;
+        match std::fs::remove_dir_all(&dir.root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(JoinError::Storage(e.kind().to_string())),
+        }
+        let selected = std::fs::read_to_string(self.selection()).unwrap_or_default();
+        if selected.trim() == id {
+            let _ = std::fs::remove_file(self.selection());
+        }
+        Ok(())
     }
 }
 
@@ -662,5 +836,100 @@ mod tests {
         v["outer_server_name"] = json!("edge.aegis.internal");
         assert!(parse_invite(&code(&v)).is_err(), "pin without CA refused");
         assert!(parse_invite("hello").is_err());
+    }
+
+    /// A profile as `enroll` leaves it, without the network.
+    fn fake_profile(dir: &DeviceDir, ca: &str, name: &str, enrolled_at: i64) {
+        private_dir(&dir.identity()).expect("dirs");
+        write_private(&dir.identity().join("key.pem"), "key").expect("key");
+        let device = Device {
+            name: name.into(),
+            url: format!("wss://{name}.example.test/agp"),
+            enroll_url: format!("https://{name}.example.test/enroll"),
+            server_name: "gateway.aegis.internal".into(),
+            outer_server_name: None,
+            device_ca_sha256: ca.into(),
+            enrolled_at,
+        };
+        write_private(
+            &dir.device_file(),
+            &serde_json::to_string(&device).expect("json"),
+        )
+        .expect("device");
+    }
+
+    fn temp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("aegis-join-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn a_single_profile_moves_into_the_server_list() {
+        let root = temp("migrate");
+        fake_profile(&DeviceDir::new(&root), &"a".repeat(64), "laptop", 1);
+        std::fs::write(root.join("settings.json"), "{}").expect("settings");
+        std::fs::write(root.join("state.db"), "x").expect("state");
+        let servers = Servers::open(&root).expect("open");
+        let list = servers.list();
+        assert_eq!(list.len(), 1);
+        let s = &list[0];
+        assert_eq!(s.device.name, "laptop");
+        assert_eq!(s.host(), "laptop.example.test");
+        assert_eq!(
+            std::fs::read_to_string(s.dir.identity().join("key.pem")).expect("key"),
+            "key"
+        );
+        assert_eq!(servers.selected().expect("selected").id, s.id);
+        assert!(!root.join("device.json").exists() && !root.join("secrets").exists());
+        assert!(!root.join("state.db").exists());
+        assert!(root.join("settings.json").exists(), "other files stay");
+        // Opening again changes nothing.
+        assert_eq!(Servers::open(&root).expect("reopen").list().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn servers_are_listed_selected_and_removed() {
+        let root = temp("list");
+        let servers = Servers::open(&root).expect("open");
+        assert!(servers.list().is_empty() && servers.selected().is_none());
+        let (a, b) = (
+            server_id(&"a".repeat(64), "phone"),
+            server_id(&"b".repeat(64), "phone"),
+        );
+        assert_ne!(a, b, "same name on two gateways");
+        fake_profile(
+            &DeviceDir::new(servers.base().join(&b)),
+            &"b".repeat(64),
+            "phone",
+            20,
+        );
+        fake_profile(
+            &DeviceDir::new(servers.base().join(&a)),
+            &"a".repeat(64),
+            "phone",
+            10,
+        );
+        // An unfinished join and a stray name are not servers.
+        std::fs::create_dir_all(servers.base().join(server_id("c", "x"))).expect("partial");
+        std::fs::create_dir_all(servers.base().join("..evil")).expect("stray");
+        let ids: Vec<String> = servers.list().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, [a.clone(), b.clone()], "oldest first");
+        assert_eq!(
+            servers.selected().expect("default").id,
+            a,
+            "oldest by default"
+        );
+        servers.select(&b).expect("select");
+        assert_eq!(servers.selected().expect("chosen").id, b);
+        assert!(servers.select("../../etc").is_err());
+        assert!(servers.get("../x").is_none());
+        servers.remove(&b).expect("remove");
+        assert!(!servers.base().join(&b).exists());
+        assert_eq!(servers.selected().expect("fallback").id, a);
+        servers.remove(&a).expect("remove");
+        assert!(servers.selected().is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -98,7 +98,8 @@ class AegisVpnService : VpnService() {
         val s = JSONObject(Native.status())
         when (s.optString("state")) {
             "disconnected" -> {
-                lastError = s.optString("error").ifEmpty { null }
+                // optString turns a JSON null into "null".
+                lastError = if (s.isNull("error")) null else s.optString("error").ifEmpty { null }
                 finish()
                 return
             }

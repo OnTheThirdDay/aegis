@@ -1,10 +1,11 @@
-//! Background engine: owns the tokio runtime, the enrolled device profile
-//! and the running client node. The UI only sends [`Command`]s and reads
+//! Background engine: owns the tokio runtime, the joined servers (one
+//! device profile each) and the running client node, connected to the
+//! selected server. The UI only sends [`Command`]s and reads
 //! the shared [`Snapshot`].
 
 use crate::settings::Settings;
 use crate::sysproxy;
-use aegis_join::{DeviceDir, JoinError, Ports};
+use aegis_join::{DeviceDir, JoinError, Ports, Servers};
 use aegis_telemetry::report::{Report, Role};
 use aegis_telemetry::{DiagnosticSink, Severity};
 use std::net::SocketAddr;
@@ -23,15 +24,27 @@ const ENDPOINT_RETRY: Duration = Duration::from_secs(3600);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     NotEnrolled,
-    Enrolling,
     Disconnected,
     Connecting,
     Connected,
 }
 
+/// A joined server, as listed in the window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerEntry {
+    pub id: String,
+    pub server: String,
+    pub device_name: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub status: Status,
+    /// Every joined server, oldest first, and the one in use.
+    pub servers: Vec<ServerEntry>,
+    pub selected: Option<String>,
+    /// An invitation is being redeemed.
+    pub joining: bool,
     pub device_name: Option<String>,
     pub server: Option<String>,
     pub socks: Option<SocketAddr>,
@@ -52,6 +65,9 @@ impl Default for Snapshot {
     fn default() -> Self {
         Snapshot {
             status: Status::NotEnrolled,
+            servers: Vec::new(),
+            selected: None,
+            joining: false,
             device_name: None,
             server: None,
             socks: None,
@@ -70,10 +86,14 @@ impl Default for Snapshot {
 }
 
 pub enum Command {
+    /// Join another server with an invitation, then connect to it.
     Enroll(String),
+    /// Use this server; reconnects if connected to another.
+    Select(String),
     Connect,
     Disconnect,
-    Forget,
+    /// Remove a server from this device.
+    Forget(String),
     SaveSettings(Settings),
     /// Start an on-demand diagnostics recording for this many minutes.
     DiagStart(u64),
@@ -124,11 +144,13 @@ impl Engine {
         let state = Arc::new(Mutex::new(Snapshot::default()));
         let (tx, rx) = mpsc::unbounded_channel();
         let diag = Arc::new(DiagnosticSink::new());
+        let servers = Servers::open(&dir).map_err(|e| e.to_string())?;
         let worker = Worker {
-            data_dir: dir.clone(),
+            data_dir: dir,
             diag: Arc::clone(&diag),
             diag_was_recording: false,
-            device: DeviceDir::new(dir),
+            servers,
+            device: None,
             settings,
             state: Arc::clone(&state),
             node: None,
@@ -166,7 +188,9 @@ struct Worker {
     diag: Arc<DiagnosticSink>,
     /// Send the report automatically when a recording ends by itself.
     diag_was_recording: bool,
-    device: DeviceDir,
+    servers: Servers,
+    /// The selected server's profile.
+    device: Option<DeviceDir>,
     settings: Settings,
     state: Arc<Mutex<Snapshot>>,
     node: Option<aegis_node::NodeRuntime>,
@@ -183,22 +207,38 @@ impl Worker {
         (self.repaint)();
     }
 
-    fn load_device(&self) {
-        match self.device.load() {
-            Ok(d) => {
-                let exp = self.device.certificate_expires_at().ok();
+    /// Read the joined servers and the selection into the snapshot.
+    fn load_servers(&mut self) {
+        let entries: Vec<ServerEntry> = self
+            .servers
+            .list()
+            .iter()
+            .map(|s| ServerEntry {
+                id: s.id.clone(),
+                server: s.host(),
+                device_name: s.device.name.clone(),
+            })
+            .collect();
+        let selected = self.servers.selected();
+        self.device = selected.as_ref().map(|s| s.dir.clone());
+        match selected {
+            Some(sel) => {
+                let exp = sel.dir.certificate_expires_at().ok();
                 self.update(|s| {
-                    s.device_name = Some(d.name.clone());
-                    s.server = Some(host_of(&d.url));
+                    s.servers = entries;
+                    s.selected = Some(sel.id.clone());
+                    s.device_name = Some(sel.device.name.clone());
+                    s.server = Some(sel.host());
                     s.certificate_expires_at = exp;
-                    if s.status == Status::NotEnrolled || s.status == Status::Enrolling {
+                    if s.status == Status::NotEnrolled {
                         s.status = Status::Disconnected;
                     }
                 });
             }
-            Err(_) => self.update(|s| {
+            None => self.update(|s| {
                 *s = Snapshot {
                     error: s.error.take(),
+                    info: s.info.take(),
                     ..Snapshot::default()
                 };
             }),
@@ -212,8 +252,8 @@ impl Worker {
             let _ = sysproxy::restore(&saved);
             let _ = self.settings.save();
         }
-        self.load_device();
-        if self.settings.auto_connect && self.device.load().is_ok() {
+        self.load_servers();
+        if self.settings.auto_connect && self.device.is_some() {
             self.connect().await;
         }
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -225,16 +265,10 @@ impl Worker {
                     let Some(cmd) = cmd else { break };
                     match cmd {
                         Command::Enroll(code) => self.enroll(code).await,
+                        Command::Select(id) => self.select(id).await,
                         Command::Connect => self.connect().await,
                         Command::Disconnect => self.disconnect().await,
-                        Command::Forget => {
-                            self.disconnect().await;
-                            match self.device.forget() {
-                                Ok(()) => self.update(|s| s.info = Some("Server removed from this device.".into())),
-                                Err(e) => self.update(|s| s.error = Some(e.to_string())),
-                            }
-                            self.load_device();
-                        }
+                        Command::Forget(id) => self.forget(id).await,
                         Command::SaveSettings(next) => {
                             let reconnect = self.node.is_some()
                                 && (next.socks_port != self.settings.socks_port
@@ -294,42 +328,81 @@ impl Worker {
 
     async fn enroll(&mut self, code: String) {
         self.update(|s| {
-            s.status = Status::Enrolling;
+            s.joining = true;
             s.error = None;
             s.info = None;
         });
-        let result = async {
-            let invite = aegis_join::parse_invite(&code)?;
-            aegis_join::enroll(&invite, &self.device).await
-        }
-        .await;
+        let result = match aegis_join::parse_invite(&code) {
+            Ok(invite) => self.servers.join(&invite).await,
+            Err(e) => Err(e),
+        };
         match result {
-            Ok(d) => {
+            Ok(server) => {
+                // One connection at a time: leave the previous server.
+                self.disconnect().await;
+                self.endpoint_failed = None;
                 self.update(|s| {
-                    s.status = Status::Disconnected;
-                    s.info = Some(format!("Joined {} as \"{}\".", host_of(&d.url), d.name));
+                    s.joining = false;
+                    s.info = Some(format!(
+                        "Joined {} as \"{}\".",
+                        server.host(),
+                        server.device.name
+                    ));
                 });
-                self.load_device();
+                self.load_servers();
                 self.connect().await;
             }
             Err(e) => self.update(|s| {
-                s.status = Status::NotEnrolled;
+                s.joining = false;
                 s.error = Some(e.to_string());
             }),
         }
+    }
+
+    async fn select(&mut self, id: String) {
+        if self.servers.selected().is_some_and(|s| s.id == id) {
+            return;
+        }
+        let reconnect = self.node.is_some();
+        self.disconnect().await;
+        match self.servers.select(&id) {
+            Ok(_) => {
+                self.endpoint_failed = None;
+                self.update(|s| s.info = None);
+                self.load_servers();
+                if reconnect {
+                    self.connect().await;
+                }
+            }
+            Err(e) => self.update(|s| s.error = Some(e.to_string())),
+        }
+    }
+
+    async fn forget(&mut self, id: String) {
+        if self.servers.selected().is_some_and(|s| s.id == id) {
+            self.disconnect().await;
+        }
+        match self.servers.remove(&id) {
+            Ok(()) => self.update(|s| s.info = Some("Server removed from this device.".into())),
+            Err(e) => self.update(|s| s.error = Some(e.to_string())),
+        }
+        self.load_servers();
     }
 
     async fn connect(&mut self) {
         if self.node.is_some() {
             return;
         }
+        let Some(device) = self.device.clone() else {
+            return;
+        };
         self.update(|s| {
             s.status = Status::Connecting;
             s.error = None;
         });
         // Renew ahead of expiry; a failure is fine while the current
         // certificate is still valid.
-        match aegis_join::renew_if_due(&self.device, false).await {
+        match aegis_join::renew_if_due(&device, false).await {
             Ok(true) => self.update(|s| s.info = Some("Device certificate renewed.".into())),
             Ok(false) => {}
             Err(e) => {
@@ -338,8 +411,7 @@ impl Worker {
                     "client.renew.failed",
                     &[("error", &e.to_string())],
                 );
-                let expired = self
-                    .device
+                let expired = device
                     .certificate_expires_at()
                     .is_ok_and(|exp| exp <= now());
                 if expired {
@@ -358,11 +430,11 @@ impl Worker {
             http: self.settings.http_port,
         };
         self.diag.note(Severity::Info, "client.connect", &[]);
-        if let Some(node) = self.follow_endpoint(ports).await {
+        if let Some(node) = self.follow_endpoint(&device, ports).await {
             self.install(node).await;
             return;
         }
-        let cfg = match aegis_join::client_config(&self.device, ports) {
+        let cfg = match aegis_join::client_config(&device, ports) {
             Ok(c) => c,
             Err(e) => {
                 self.update(|s| {
@@ -372,7 +444,7 @@ impl Worker {
                 return;
             }
         };
-        let node = match self.start_node(cfg).await {
+        let node = match self.start_node(&device, cfg).await {
             Ok(n) => n,
             Err(e) => {
                 self.diag.note(
@@ -402,16 +474,17 @@ impl Worker {
 
     async fn start_node(
         &self,
+        device: &DeviceDir,
         config: aegis_config::NodeConfig,
     ) -> Result<aegis_node::NodeRuntime, aegis_node::StartError> {
         // The client keeps no durable state: start from the profile.
         for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(self.device.root.join(format!("state.db{suffix}")));
+            let _ = std::fs::remove_file(device.root.join(format!("state.db{suffix}")));
         }
         aegis_node::start_with_diagnostics(
             aegis_node::StartOptions {
                 config,
-                store_path: self.device.store(),
+                store_path: device.store(),
                 failpoints: None,
             },
             Arc::clone(&self.diag),
@@ -424,8 +497,12 @@ impl Worker {
     /// gateway's pinned identity answers there (the end-to-end check), so a
     /// tampered answer can't redirect the device; otherwise the stored
     /// address is used as before. Returns the running node on success.
-    async fn follow_endpoint(&mut self, ports: Ports) -> Option<aegis_node::NodeRuntime> {
-        let endpoint = match aegis_join::fetch_endpoint(&self.device).await {
+    async fn follow_endpoint(
+        &mut self,
+        device: &DeviceDir,
+        ports: Ports,
+    ) -> Option<aegis_node::NodeRuntime> {
+        let endpoint = match aegis_join::fetch_endpoint(device).await {
             Ok(Some(e)) => e,
             Ok(None) => return None,
             Err(e) => {
@@ -449,20 +526,21 @@ impl Worker {
             "client.endpoint.changed",
             &[("url", &endpoint.url)],
         );
-        let cfg = aegis_join::client_config_for(&self.device, ports, Some(&endpoint)).ok()?;
-        let node = self.start_node(cfg).await.ok()?;
+        let cfg = aegis_join::client_config_for(device, ports, Some(&endpoint)).ok()?;
+        let node = self.start_node(device, cfg).await.ok()?;
         let verified = match node.bound_addr("socks") {
             Some(socks) => verify(socks).await.is_ok(),
             None => false,
         };
         if verified {
-            if let Ok(device) = aegis_join::adopt_endpoint(&self.device, &endpoint) {
-                let host = host_of(&device.url);
+            if let Ok(adopted) = aegis_join::adopt_endpoint(device, &endpoint) {
+                let host = host_of(&adopted.url);
                 self.update(|s| {
                     s.server = Some(host.clone());
                     s.info = Some(format!("The server's address changed; now using {host}."));
                 });
                 self.endpoint_failed = None;
+                self.load_servers();
                 return Some(node);
             }
         }
@@ -513,7 +591,7 @@ impl Worker {
         if let Some(node) = self.node.take() {
             node.shutdown(Duration::from_secs(1)).await;
         }
-        let enrolled = self.device.load().is_ok();
+        let enrolled = self.device.is_some();
         self.update(|s| {
             s.status = if enrolled {
                 Status::Disconnected
@@ -531,7 +609,10 @@ impl Worker {
     /// Renew a due certificate while connected and switch the running node
     /// to it; established sessions keep going.
     async fn renew_connected(&mut self) {
-        match aegis_join::renew_if_due(&self.device, false).await {
+        let Some(device) = self.device.clone() else {
+            return;
+        };
+        match aegis_join::renew_if_due(&device, false).await {
             Ok(true) => {
                 if let Some(node) = &self.node {
                     if let Err(e) = node.ctx.reload_certificates() {
@@ -542,7 +623,7 @@ impl Worker {
                         );
                     }
                 }
-                let exp = self.device.certificate_expires_at().ok();
+                let exp = device.certificate_expires_at().ok();
                 self.update(|s| s.certificate_expires_at = exp);
                 self.diag.note(Severity::Info, "client.renew.ok", &[]);
             }
@@ -638,9 +719,10 @@ impl Worker {
             role: Role::Client,
             name: self
                 .device
-                .load()
+                .as_ref()
+                .and_then(|d| d.load().ok())
                 .map(|d| d.name)
-                .unwrap_or_else(|_| "unenrolled device".into()),
+                .unwrap_or_else(|| "unenrolled device".into()),
             version: env!("CARGO_PKG_VERSION").into(),
             recording,
         })
@@ -650,7 +732,7 @@ impl Worker {
         let Some(mut report) = self.report() else {
             return;
         };
-        if self.device.load().is_err() {
+        let Some(device) = self.device.clone() else {
             self.update(|s| {
                 s.diag_message = Some((
                     false,
@@ -658,14 +740,14 @@ impl Worker {
                 ))
             });
             return;
-        }
+        };
         self.update(|s| {
             s.diag_sending = true;
             s.diag_message = None;
         });
         // Leave headroom under the gateway's limit for base64 and JSON.
         let gz = report.to_gzip(900 * 1024);
-        let result = aegis_join::upload_diagnostics(&self.device, &gz).await;
+        let result = aegis_join::upload_diagnostics(&device, &gz).await;
         let message = match result {
             Ok(()) => (
                 true,

@@ -13,14 +13,18 @@ object Native {
         System.loadLibrary("aegis_mobile")
     }
 
-    /** Where the device identity and client state live (app-private). */
+    /** Where each joined server's identity and client state live (app-private). */
     fun dir(context: Context): String = File(context.filesDir, "aegis").absolutePath
 
+    /** Join another server and select it. */
     external fun enroll(dir: String, code: String): String
-    external fun device(dir: String): String
-    external fun forget(dir: String): String
+    /** `{"servers": [{id, name, server, certificate_expires_at}], "selected": id}` */
+    external fun servers(dir: String): String
+    /** The server the next connection uses. */
+    external fun select(dir: String, id: String): String
+    external fun forget(dir: String, id: String): String
     external fun vpnConfig(): String
-    /** Takes ownership of [fd] (a detached VPN interface descriptor). */
+    /** Connects to the selected server; takes ownership of [fd] (a detached VPN interface descriptor). */
     external fun start(dir: String, fd: Int): String
     external fun stop(): String
     external fun status(): String

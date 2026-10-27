@@ -23,7 +23,8 @@ class AegisApp extends StatelessWidget {
   }
 }
 
-/// Shows the join screen until the phone is enrolled, then the home screen.
+/// Shows the join screen until the phone joined a server, then the home
+/// screen for the selected one.
 class Root extends StatefulWidget {
   const Root({super.key});
 
@@ -33,7 +34,7 @@ class Root extends StatefulWidget {
 
 class _RootState extends State<Root> with WidgetsBindingObserver {
   final client = Client();
-  DeviceInfo? device;
+  Servers? servers;
   String? shared;
 
   @override
@@ -55,45 +56,50 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
   }
 
   Future<void> _load() async {
-    final d = await client.device();
+    final s = await client.servers();
     final text = await client.sharedText();
     if (!mounted) return;
     setState(() {
-      device = d;
+      servers = s;
       if (text != null && text.trim().isNotEmpty) shared = text;
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    final d = device;
-    if (d == null) {
+    final s = servers;
+    if (s == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-    if (!d.enrolled) {
+    if (s.isEmpty) {
       return JoinScreen(
         client: client,
         initial: shared,
-        onJoined: (d) => setState(() {
-          device = d;
+        onJoined: (_) {
           shared = null;
-        }),
+          _load();
+        },
       );
     }
     return HomeScreen(
       client: client,
-      device: d,
-      onForgotten: () => setState(() => device = DeviceInfo(enrolled: false)),
+      servers: s,
+      shared: shared,
+      onSharedTaken: () => shared = null,
+      onChanged: _load,
     );
   }
 }
 
 class JoinScreen extends StatefulWidget {
-  const JoinScreen({super.key, required this.client, required this.onJoined, this.initial});
+  const JoinScreen({super.key, required this.client, required this.onJoined, this.initial, this.another = false});
 
   final Client client;
   final String? initial;
-  final void Function(DeviceInfo) onJoined;
+  final void Function(ServerInfo) onJoined;
+
+  /// Joining an additional server (opened from the home screen).
+  final bool another;
 
   @override
   State<JoinScreen> createState() => _JoinScreenState();
@@ -121,8 +127,8 @@ class _JoinScreenState extends State<JoinScreen> {
       error = null;
     });
     try {
-      final d = await widget.client.enroll(code.text);
-      widget.onJoined(d);
+      final s = await widget.client.enroll(code.text);
+      widget.onJoined(s);
     } on ClientError catch (e) {
       setState(() => error = e.message);
     } finally {
@@ -134,13 +140,15 @@ class _JoinScreenState extends State<JoinScreen> {
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
     return Scaffold(
-      appBar: AppBar(title: const Text('AegisNet')),
+      appBar: AppBar(title: Text(widget.another ? 'Add a server' : 'AegisNet')),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
-            Text('Join a server', style: t.headlineSmall),
-            const SizedBox(height: 8),
+            if (!widget.another) ...[
+              Text('Join a server', style: t.headlineSmall),
+              const SizedBox(height: 8),
+            ],
             Text(
               'Paste the invitation your administrator sent you. It starts with aegis1: '
               'and works once. You can also share it to this app from a chat or mail app.',
@@ -191,11 +199,24 @@ class _JoinScreenState extends State<JoinScreen> {
 }
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key, required this.client, required this.device, required this.onForgotten});
+  const HomeScreen({
+    super.key,
+    required this.client,
+    required this.servers,
+    required this.onChanged,
+    required this.onSharedTaken,
+    this.shared,
+  });
 
   final Client client;
-  final DeviceInfo device;
-  final VoidCallback onForgotten;
+  final Servers servers;
+
+  /// Reload the server list.
+  final Future<void> Function() onChanged;
+
+  /// An invitation shared to the app: offered as another server.
+  final String? shared;
+  final VoidCallback onSharedTaken;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -212,6 +233,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _poll();
+    _takeShared();
+  }
+
+  @override
+  void didUpdateWidget(HomeScreen old) {
+    super.didUpdateWidget(old);
+    if (widget.shared != old.shared) _takeShared();
   }
 
   @override
@@ -230,6 +258,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _takeShared() {
+    final text = widget.shared;
+    if (text == null) return;
+    widget.onSharedTaken();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _add(initial: text);
+    });
+  }
+
   void _poll() {
     timer?.cancel();
     _refresh();
@@ -245,19 +282,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _toggle() async {
+  bool get _on => status.state != ConnectionState.disconnected;
+
+  /// Run [f] with the button disabled, showing its error.
+  Future<void> _busy(Future<void> Function() f) async {
     setState(() {
       busy = true;
       error = null;
     });
     try {
-      if (status.state == ConnectionState.disconnected) {
-        await widget.client.connect();
-      } else {
-        await widget.client.disconnect();
-      }
+      await f();
     } on ClientError catch (e) {
-      setState(() => error = e.message);
+      if (mounted) setState(() => error = e.message);
     } finally {
       await Future<void>.delayed(const Duration(milliseconds: 600));
       await _refresh();
@@ -265,13 +301,57 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _forget() async {
+  Future<void> _toggle() => _busy(() => _on ? widget.client.disconnect() : widget.client.connect());
+
+  /// Disconnect and wait until the VPN is down (it stops in the background).
+  Future<void> _disconnect() async {
+    await widget.client.disconnect();
+    for (var i = 0; i < 30; i++) {
+      final s = await widget.client.status();
+      if (s.state == ConnectionState.disconnected) return;
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+  }
+
+  /// Use another server; one is connected at a time, so a connection moves
+  /// over to it.
+  Future<void> _switchTo(ServerInfo s) => _busy(() async {
+        final reconnect = _on;
+        if (reconnect) await _disconnect();
+        await widget.client.select(s.id);
+        await widget.onChanged();
+        if (reconnect) await widget.client.connect();
+      });
+
+  Future<void> _add({String? initial}) async {
+    final joined = await Navigator.of(context).push<ServerInfo>(
+      MaterialPageRoute(
+        builder: (c) => JoinScreen(
+          client: widget.client,
+          initial: initial,
+          another: true,
+          onJoined: (s) => Navigator.of(c).pop(s),
+        ),
+      ),
+    );
+    if (joined == null) return;
+    // The new server is selected; move a running connection to it.
+    await _busy(() async {
+      final reconnect = _on;
+      if (reconnect) await _disconnect();
+      await widget.onChanged();
+      if (reconnect) await widget.client.connect();
+    });
+  }
+
+  Future<void> _forget(ServerInfo s) async {
     final yes = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
-        title: const Text('Remove this server?'),
+        title: Text('Remove ${s.server}?'),
         content: const Text(
-          'This phone disconnects and forgets its identity. To connect again you need a new invitation. '
+          'This phone forgets its identity for this server, and disconnects if it is in use. '
+          'To join it again you need a new invitation. '
           'Ask your administrator to also remove the device in the console.',
         ),
         actions: [
@@ -281,11 +361,50 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     );
     if (yes != true) return;
-    try {
-      await widget.client.forget();
-      widget.onForgotten();
-    } on ClientError catch (e) {
-      setState(() => error = e.message);
+    await _busy(() async {
+      await widget.client.forget(s.id);
+      await widget.onChanged();
+    });
+  }
+
+  Future<void> _pick() async {
+    final selected = widget.servers.selected;
+    final action = await showModalBottomSheet<(String, ServerInfo?)>(
+      context: context,
+      showDragHandle: true,
+      builder: (c) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            for (final s in widget.servers.list)
+              ListTile(
+                leading: Icon(s.id == selected?.id ? Icons.radio_button_checked : Icons.radio_button_unchecked),
+                title: Text(s.server),
+                subtitle: Text('as ${s.name}'),
+                trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline),
+                  tooltip: 'Remove',
+                  onPressed: () => Navigator.pop(c, ('remove', s)),
+                ),
+                onTap: () => Navigator.pop(c, ('use', s)),
+              ),
+            ListTile(
+              leading: const Icon(Icons.add),
+              title: const Text('Add a server'),
+              onTap: () => Navigator.pop(c, ('add', null)),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !mounted) return;
+    switch (action) {
+      case ('use', final ServerInfo s) when s.id != selected?.id:
+        await _switchTo(s);
+      case ('remove', final ServerInfo s):
+        await _forget(s);
+      case ('add', _):
+        await _add();
     }
   }
 
@@ -294,23 +413,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final scheme = Theme.of(context).colorScheme;
     final t = Theme.of(context).textTheme;
     final s = status;
+    final current = widget.servers.selected;
     final (label, color, icon) = switch (s.state) {
       ConnectionState.connected => ('Connected', scheme.primary, Icons.shield),
       ConnectionState.connecting => ('Connecting…', scheme.tertiary, Icons.shield_outlined),
       ConnectionState.disconnected => ('Not connected', scheme.outline, Icons.shield_outlined),
     };
-    final on = s.state != ConnectionState.disconnected;
-    final server = s.server ?? widget.device.server ?? '';
+    final on = _on;
+    final server = (on ? s.server : null) ?? current?.server ?? '';
     final message = error ?? s.error;
+    final several = widget.servers.list.length > 1;
     return Scaffold(
       appBar: AppBar(
         title: const Text('AegisNet'),
         actions: [
           PopupMenuButton<String>(
+            enabled: !busy,
             onSelected: (v) {
-              if (v == 'forget') _forget();
+              if (v == 'add') _add();
+              if (v == 'forget' && current != null) _forget(current);
             },
-            itemBuilder: (_) => const [PopupMenuItem(value: 'forget', child: Text('Remove this server'))],
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'add', child: Text('Add a server')),
+              PopupMenuItem(value: 'forget', child: Text('Remove this server')),
+            ],
           ),
         ],
       ),
@@ -353,11 +479,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Card(
               child: Column(
                 children: [
-                  ListTile(leading: const Icon(Icons.dns_outlined), title: const Text('Server'), subtitle: Text(server)),
+                  ListTile(
+                    leading: const Icon(Icons.dns_outlined),
+                    title: Text(several ? 'Server (${widget.servers.list.length} joined)' : 'Server'),
+                    subtitle: Text(server),
+                    trailing: const Icon(Icons.unfold_more),
+                    onTap: busy ? null : _pick,
+                  ),
                   ListTile(
                     leading: const Icon(Icons.smartphone),
                     title: const Text('This device'),
-                    subtitle: Text(widget.device.name ?? ''),
+                    subtitle: Text(current?.name ?? ''),
                   ),
                   if (on) ...[
                     ListTile(
@@ -377,7 +509,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             const SizedBox(height: 12),
             Text(
               'While connected, apps on this phone reach the internet through your server. '
-              'Local networks (Wi-Fi printers, your router) stay direct.',
+              'Local networks (Wi-Fi printers, your router) stay direct. '
+              'Tap the server to switch to another one or add one.',
               style: t.bodySmall,
             ),
           ],

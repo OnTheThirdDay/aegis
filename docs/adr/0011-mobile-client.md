@@ -35,6 +35,13 @@ Users want the gateway on their phones. A local proxy, as on desktop, is of litt
 - Foreground service type `systemExempted` (VPN apps); always-on VPN is supported.
 - Invitations can be pasted or shared to the app from another app.
 
+**Several servers (desktop and phone)**
+
+- A device can join several servers and connects to one at a time. Android runs a single VPN per app, and one proxy keeps desktop settings simple.
+- `aegis_join::Servers` keeps one profile per server under `servers/<id>/`, plus the selected id. The id hashes the gateway's device CA and the device name, so joining the same server under the same name twice is refused.
+- A profile from the single-server layout moves into the list unchanged the first time the app starts.
+- Switching servers while connected disconnects and connects to the new one. Removing the connected server disconnects first.
+
 **Distribution (owner choice: sideload)**
 
 - The release workflow builds `aegis-client-android-arm64.apk`. It ships in the GitHub release and in the image's downloads, offered under **Devices → Client apps** and on the user portal with the APK media type.

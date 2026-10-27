@@ -1,5 +1,6 @@
 //! AegisNet portable client: paste an invitation, connect, browse.
 //!
+//! * Several servers can be joined; one is connected at a time.
 //! * No installation and no administrator rights: data lives next to the
 //!   executable (or in the user's app-data folder).
 //! * The device key is generated here and never leaves this device.
@@ -34,6 +35,10 @@ struct App {
     edited: Settings,
     confirm_forget: bool,
     paste_error: Option<String>,
+    /// Open "Add a server" (an invitation arrived while already joined).
+    open_add: bool,
+    /// To clear the invitation once a join succeeds.
+    was_joining: bool,
     diag_minutes: u64,
 }
 
@@ -116,18 +121,21 @@ impl App {
             settings,
             confirm_forget: false,
             paste_error: None,
+            open_add: false,
+            was_joining: false,
             diag_minutes: 15,
         };
         if let Some(code) = initial_invite {
             app.invite = code;
+            app.open_add = true;
         }
         app
     }
 
     fn status_line(&self, ui: &mut egui::Ui, s: &engine::Snapshot) {
         let (text, color) = match s.status {
+            Status::NotEnrolled if s.joining => ("Joining...".to_owned(), AMBER),
             Status::NotEnrolled => ("Not set up".to_owned(), Color32::GRAY),
-            Status::Enrolling => ("Joining...".to_owned(), AMBER),
             Status::Disconnected => ("Disconnected".to_owned(), Color32::GRAY),
             Status::Connecting => ("Connecting...".to_owned(), AMBER),
             Status::Connected => (
@@ -147,8 +155,10 @@ impl App {
     }
 
     fn join_view(&mut self, ui: &mut egui::Ui, s: &engine::Snapshot) {
-        ui.add_space(8.0);
-        ui.label(RichText::new("Add a server").size(16.0).strong());
+        if s.servers.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("Add a server").size(16.0).strong());
+        }
         ui.label("Paste the invitation code you received (it starts with aegis1:), or drop a .aegis file on this window.");
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
@@ -212,7 +222,7 @@ impl App {
             }
             None => {}
         }
-        let busy = s.status == Status::Enrolling;
+        let busy = s.joining;
         let ready = matches!(parsed, Some(Ok(_))) && !busy;
         if ui
             .add_enabled(
@@ -242,7 +252,31 @@ impl App {
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
                 ui.label(RichText::new("Server").weak());
-                ui.label(s.server.as_deref().unwrap_or("—"));
+                if s.servers.len() > 1 {
+                    let label =
+                        |e: &engine::ServerEntry| format!("{} ({})", e.server, e.device_name);
+                    let current = s
+                        .servers
+                        .iter()
+                        .find(|e| Some(&e.id) == s.selected.as_ref())
+                        .map(label)
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_salt("server")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for e in &s.servers {
+                                let chosen = Some(&e.id) == s.selected.as_ref();
+                                if ui.selectable_label(chosen, label(e)).clicked() && !chosen {
+                                    self.confirm_forget = false;
+                                    self.engine.send(Command::Select(e.id.clone()));
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Connect to another joined server (one at a time)");
+                } else {
+                    ui.label(s.server.as_deref().unwrap_or("—"));
+                }
                 ui.end_row();
                 ui.label(RichText::new("This device").weak());
                 ui.label(s.device_name.as_deref().unwrap_or("—"));
@@ -300,6 +334,11 @@ impl App {
                 });
             });
         }
+        ui.add_space(8.0);
+        let open = std::mem::take(&mut self.open_add).then_some(true);
+        egui::CollapsingHeader::new("Add a server")
+            .open(open)
+            .show(ui, |ui| self.join_view(ui, s));
     }
 
     fn diagnostics_view(&mut self, ui: &mut egui::Ui, s: &engine::Snapshot, enrolled: bool) {
@@ -370,7 +409,7 @@ impl App {
             });
     }
 
-    fn settings_view(&mut self, ui: &mut egui::Ui, enrolled: bool) {
+    fn settings_view(&mut self, ui: &mut egui::Ui, s: &engine::Snapshot) {
         ui.add_space(8.0);
         egui::CollapsingHeader::new("Settings")
             .default_open(false)
@@ -400,13 +439,13 @@ impl App {
                         self.edited = self.settings.clone();
                     }
                 });
-                if enrolled {
+                if let (Some(id), Some(server)) = (&s.selected, &s.server) {
                     ui.separator();
                     if self.confirm_forget {
-                        ui.label(RichText::new("Remove this server from the device? You will need a new invitation to join again.").color(RED));
+                        ui.label(RichText::new(format!("Remove {server} from this device? You will need a new invitation to join it again.")).color(RED));
                         ui.horizontal(|ui| {
                             if ui.button("Remove").clicked() {
-                                self.engine.send(Command::Forget);
+                                self.engine.send(Command::Forget(id.clone()));
                                 self.confirm_forget = false;
                             }
                             if ui.button("Cancel").clicked() {
@@ -432,8 +471,14 @@ impl eframe::App for App {
         for f in dropped {
             if let Ok(text) = std::fs::read_to_string(f.path()) {
                 self.invite = text.trim().to_owned();
+                self.open_add = true;
             }
         }
+        if self.was_joining && !s.joining && s.error.is_none() {
+            self.invite.clear();
+            self.open_add = false;
+        }
+        self.was_joining = s.joining;
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             self.engine.shutdown();
         }
@@ -449,21 +494,20 @@ impl eframe::App for App {
             }
             ui.add_space(6.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let enrolled = !matches!(s.status, Status::NotEnrolled | Status::Enrolling);
+                let enrolled = !s.servers.is_empty();
                 if enrolled {
                     self.connected_view(ui, &s);
                 } else {
                     self.join_view(ui, &s);
                 }
                 self.diagnostics_view(ui, &s, enrolled);
-                self.settings_view(ui, enrolled);
+                self.settings_view(ui, &s);
             });
         });
         // Keep counters and the uptime fresh while connected.
-        if matches!(
-            s.status,
-            Status::Connected | Status::Connecting | Status::Enrolling
-        ) || self.engine.diag.is_recording()
+        if matches!(s.status, Status::Connected | Status::Connecting)
+            || s.joining
+            || self.engine.diag.is_recording()
         {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }

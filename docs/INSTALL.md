@@ -182,6 +182,11 @@ Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl conn
 
 The phone app carries TCP only for now: calls, games and other UDP apps don't work through it. Browsers fall back from QUIC to TCP by themselves.
 
+**Several servers:** a device can join more than one server, each with its own invitation, and connects to one at a time.
+- Desktop: open **Add a server** and join; the connection moves to the new server. Choose another one under **Server**. **Settings → Remove this server** removes the one shown.
+- Android: tap the server, then **Add a server**, pick another one, or remove one.
+- `aegisctl`: use one `--dir` per server.
+
 **Device certificates** last 30 days and renew by themselves, both when a device connects and while it stays connected. A device that was offline past its expiry still renews when it reconnects within 90 days, unless it was removed in the console. After that it needs a new invitation.
 
 **If the server's address changes later** (a new hostname, or a switch from a direct address to Cloudflare Tunnel), devices pick up the new address the next time they connect, as long as the old address still reaches the server at that moment. Keep the old address working until devices have connected once. A device adopts the new address only after it has verified, through its pinned connection, that the same gateway answers there. Devices that were offline for the whole changeover need a new invitation.

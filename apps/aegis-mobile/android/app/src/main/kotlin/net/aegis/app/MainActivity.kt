@@ -47,13 +47,12 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             val dir = Native.dir(this)
             when (call.method) {
-                "device" -> result.success(Native.device(dir))
+                "servers" -> result.success(Native.servers(dir))
+                "select" -> result.success(Native.select(dir, call.argument<String>("id") ?: ""))
                 "status" -> result.success(status())
                 "enroll" -> background(result) { Native.enroll(dir, call.argument<String>("code") ?: "") }
-                "forget" -> {
-                    stopService()
-                    background(result) { Native.forget(dir) }
-                }
+                // The core disconnects first when this is the connected server.
+                "forget" -> background(result) { Native.forget(dir, call.argument<String>("id") ?: "") }
                 "connect" -> connect(result)
                 "disconnect" -> {
                     stopService()
