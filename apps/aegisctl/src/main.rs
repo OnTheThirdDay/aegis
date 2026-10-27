@@ -53,6 +53,8 @@ local IPC (owner-only socket; --socket PATH, default /var/lib/aegisnet/aegisd.so
   activation reconcile OPERATION_ID
   activation supersede --pending OP --expected-runtime REV|null --epoch N --revision REV --digest HEX --reason TEXT
   diagnostic start [--minutes N<=60] | diagnostic status | diagnostic stop | diagnostic discard
+  cloudflared status | cloudflared update | cloudflared auto-update on|off
+                                            (the Cloudflare Tunnel connector)
 
 REST API (--api URL default http://127.0.0.1:9080, --token or $AEGIS_TOKEN):
   api METHOD PATH [--data JSON] [--if-match ETAG] [--idempotency-key KEY]
@@ -293,6 +295,47 @@ fn ipc(o: &Opts, req: Value) -> Result<Value, String> {
 #[cfg(not(unix))]
 fn ipc(_o: &Opts, _req: Value) -> Result<Value, String> {
     Err("local IPC is only available on Unix in this build".into())
+}
+
+/// The Cloudflare Tunnel connector through the console API over local IPC.
+fn cmd_cloudflared(o: &Opts) -> Result<bool, String> {
+    let action = |name: &str, body: Value| json!({"cmd": "api", "method": "POST", "path": format!("/api/v1/integrations/cloudflare/{name}"), "body": body});
+    let req = match (
+        o.positional.get(1).map(String::as_str),
+        o.positional.get(2).map(String::as_str),
+    ) {
+        (Some("status"), None) => {
+            json!({"cmd": "api", "method": "GET", "path": "/api/v1/integrations"})
+        }
+        (Some("update"), None) => action("update-connector", json!({})),
+        (Some("auto-update"), Some(state @ ("on" | "off"))) => {
+            action("connector-auto-update", json!({"enabled": state == "on"}))
+        }
+        _ => return Err("usage: cloudflared status | update | auto-update on|off".into()),
+    };
+    let resp = ipc(o, req)?;
+    if resp["ok"] != true {
+        print(resp.get("error").unwrap_or(&resp));
+        return Ok(false);
+    }
+    let result = &resp["result"];
+    let body = &result["body"];
+    if o.positional.get(1).map(String::as_str) == Some("status") {
+        let cf = body
+            .get("integrations")
+            .and_then(Value::as_array)
+            .and_then(|list| list.iter().find(|i| i["id"] == "cloudflare"))
+            .unwrap_or(&Value::Null);
+        print(&json!({
+            "state": cf["state"],
+            "available": cf["available"],
+            "unavailable_reason": cf["unavailable_reason"],
+            "connector": cf["connector"],
+        }));
+    } else {
+        print(body);
+    }
+    Ok(result["status"].as_u64().is_some_and(|s| s < 300))
 }
 
 fn ipc_print(o: &Opts, req: Value) -> Result<bool, String> {
@@ -827,6 +870,7 @@ fn run(args: &[String]) -> Result<bool, String> {
         "validate" => cmd_validate(&o),
         "pki" => cmd_pki(&o).map(|_| true),
         "health" => ipc_print(&o, json!({"cmd": "health"})),
+        "cloudflared" => cmd_cloudflared(&o),
         "metrics" => ipc_print(&o, json!({"cmd": "metrics"})),
         "bootstrap-token" => ipc_print(&o, json!({"cmd": "bootstrap_token"})),
         "token" => {

@@ -738,6 +738,40 @@ function directCard(conn, managed) {
   ]);
 }
 
+/** Connector updates: the last check, automatic updates, "Update now".
+ * @param {any} conn */
+function connectorUpdates(conn) {
+  const u = conn.update || {};
+  const when = u.checked_at ? new Date(u.checked_at * 1000).toLocaleString() : null;
+  const last = u.error ? el("p", { class: "err-text" }, ["Last update check" + (when ? " (" + when + ")" : "") + " failed: " + u.error])
+    : u.updated ? el("p", { class: "muted" }, ["Updated to cloudflared " + u.version + (when ? " on " + when : "") + "."])
+    : when ? el("p", { class: "muted" }, ["Up to date (latest is " + (u.latest || u.version) + ", checked " + when + ")."])
+    : null;
+  const auto = /** @type {HTMLInputElement} */ (el("input", { type: "checkbox" }));
+  auto.checked = conn.auto_update !== false;
+  auto.addEventListener("change", async () => {
+    try {
+      await api("POST", "/integrations/cloudflare/connector-auto-update", { body: { enabled: auto.checked } });
+      notice(auto.checked ? "Automatic connector updates are on." : "Automatic connector updates are off.");
+    } catch (e) {
+      auto.checked = !auto.checked;
+      notice(String(e), true);
+    }
+  });
+  const now = button(conn.updating ? "Updating…" : "Update now", "ghost");
+  /** @type {HTMLButtonElement} */ (now).disabled = !!conn.updating;
+  busy(now, async () => {
+    const r = await api("POST", "/integrations/cloudflare/update-connector", { body: {} });
+    notice(r.updated ? "Connector updated to cloudflared " + r.version + "." : "The connector is up to date (cloudflared " + r.version + ").");
+    await renderConnectivity();
+  });
+  return el("div", {}, [
+    last,
+    el("label", { class: "check" }, [auto, " Keep the connector up to date (checks weekly and when the gateway starts; the tunnel reconnects within seconds)"]),
+    el("div", { class: "row" }, [now]),
+  ]);
+}
+
 /** @param {any} cf */
 function cloudflareCard(cf) {
   const body = el("div");
@@ -766,6 +800,7 @@ function cloudflareCard(cf) {
     const keepDns = /** @type {HTMLInputElement} */ (el("input", { type: "checkbox" }));
     const restart = button("Restart connector", "ghost");
     busy(restart, async () => { await api("POST", "/integrations/cloudflare/restart", { body: {} }); notice("Connector restarted."); await renderConnectivity(); });
+    if (cf.state === "active" && cf.connector) body.append(connectorUpdates(cf.connector));
     const outdated = cf.state === "active" && cf.portal_routes === false;
     const retry = button(outdated ? "Update routes for the user portal" : cf.state === "active" ? "Test again" : "Retry setup", "ghost");
     retry.hidden = cf.state === "active" && !cf.warning && !outdated;

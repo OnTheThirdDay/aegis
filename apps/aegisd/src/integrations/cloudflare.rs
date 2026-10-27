@@ -12,7 +12,7 @@
 //! file read by `cloudflared --token-file`.
 
 use super::connector::{self, Connector};
-use super::{probe, ActionResult};
+use super::{connector_update, probe, ActionResult};
 use crate::appliance;
 use crate::services::Appliance;
 use aegis_provision::cloudflare::Cloudflare;
@@ -31,6 +31,15 @@ pub const ID: &str = "cloudflare";
 const PLAN_ACTOR: &str = "appliance";
 const TOKEN_FILE: &str = "cloudflared-token";
 pub const API_TOKEN_FILE: &str = "cloudflare-api-token";
+/// Setting: install new cloudflared releases automatically (default on).
+const AUTO_UPDATE: &str = "cloudflared_auto_update";
+/// Setting: outcome of the last update check, for the console.
+const UPDATE_STATUS: &str = "cloudflared_update";
+/// Automatic checks run this often, and after every start of the gateway.
+const UPDATE_EVERY: Duration = Duration::from_secs(7 * 86_400);
+/// A connector that was connected must reconnect this fast after an
+/// update, or the previous build is restored.
+const UPDATE_READY: Duration = Duration::from_secs(90);
 
 #[derive(Default, Clone)]
 struct Live {
@@ -38,11 +47,19 @@ struct Live {
     step: Option<String>,
 }
 
+#[derive(Default)]
+struct Updates {
+    busy: bool,
+    checked: Option<std::time::Instant>,
+}
+
 pub struct CloudflareIntegration {
     app: Weak<Appliance>,
     pub connector: Arc<Connector>,
     live: Mutex<Live>,
-    unavailable: Option<String>,
+    updates: Mutex<Updates>,
+    /// The newest verified connector build, or why there is none.
+    installed: Mutex<Result<String, String>>,
 }
 
 fn err(status: u16, code: impl Into<String>) -> (u16, String) {
@@ -90,14 +107,32 @@ pub fn explain(code: &str) -> String {
 
 impl CloudflareIntegration {
     pub fn new(app: Weak<Appliance>, dir: &std::path::Path) -> Self {
-        let binary = connector::default_binary();
-        let unavailable = connector::verify_binary(&binary).err();
+        let store = connector::Store::new(dir);
+        let installed = store.best().map(|b| b.build.version);
         CloudflareIntegration {
             app,
-            connector: Arc::new(Connector::new(binary, dir.join("secrets").join(TOKEN_FILE))),
+            connector: Arc::new(Connector::new(store, dir.join("secrets").join(TOKEN_FILE))),
             live: Mutex::new(Live::default()),
-            unavailable,
+            updates: Mutex::new(Updates::default()),
+            installed: Mutex::new(installed),
         }
+    }
+
+    fn installed(&self) -> Result<String, String> {
+        self.installed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Re-read which build is installed (after an update).
+    fn refresh_installed(&self) {
+        let best = self.connector.store().best().map(|b| b.build.version);
+        *self.installed.lock().unwrap_or_else(|e| e.into_inner()) = best;
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        self.installed().err()
     }
 
     fn app(&self) -> Result<Arc<Appliance>, (u16, String)> {
@@ -149,8 +184,8 @@ impl CloudflareIntegration {
             "id": ID,
             "name": "Cloudflare Tunnel",
             "description": "Reach this gateway from anywhere through your Cloudflare domain — AegisNet creates the tunnel, DNS record and connector. No port forwarding needed.",
-            "available": self.unavailable.is_none(),
-            "unavailable_reason": self.unavailable,
+            "available": self.unavailable().is_none(),
+            "unavailable_reason": self.unavailable(),
         });
         let Some(app) = self.app.upgrade() else {
             return base;
@@ -185,12 +220,156 @@ impl CloudflareIntegration {
             v["public_url"] = json!(format!("wss://{h}/agp"));
         }
         v["token_stored"] = json!(app.secrets.read(API_TOKEN_FILE).is_ok());
+        let update = app
+            .store
+            .read(|c| db::get_setting(c, UPDATE_STATUS))
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null);
         v["connector"] = json!({
             "running": self.connector.running(),
             "ready": self.connector.last_ready(),
-            "version": connector::CLOUDFLARED_VERSION,
+            // What runs, else what would run.
+            "version": self.connector.current().map(|b| b.version).or_else(|| self.installed().ok()),
+            "auto_update": Self::auto_update(&app),
+            "updating": self.updates.lock().unwrap_or_else(|e| e.into_inner()).busy,
+            "update": update,
         });
         v
+    }
+
+    fn auto_update(app: &Appliance) -> bool {
+        app.store
+            .read(|c| db::get_setting(c, AUTO_UPDATE))
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    fn tunnel_active(app: &Appliance) -> bool {
+        Self::record(app).is_some_and(|r| r.enabled && r.status["state"] == "active")
+    }
+
+    /// Turn automatic connector updates on or off.
+    pub fn set_auto_update(&self, actor: &str, body: &Value) -> ActionResult {
+        let app = self.app()?;
+        let enabled = body["enabled"]
+            .as_bool()
+            .ok_or_else(|| err(400, "enabled must be true or false"))?;
+        app.store
+            .tx(|c| {
+                db::put_setting(c, AUTO_UPDATE, &json!(enabled))?;
+                db::append_audit(
+                    c,
+                    db::AuditInsert {
+                        actor_id: Some(actor),
+                        action: "integration.cloudflare.connector_auto_update",
+                        target_type: "integration",
+                        target_id: Some(ID),
+                        decision: "allowed",
+                        revision_digest: None,
+                        metadata: json!({"enabled": enabled}),
+                    },
+                )
+                .map(|_| ())
+            })
+            .map_err(|_| err(503, "storage_unavailable"))?;
+        Ok(json!({"auto_update": enabled}))
+    }
+
+    /// Weekly, and after every start of the gateway: install a newer
+    /// cloudflared while the tunnel is in use and updates are on.
+    pub async fn update_if_due(&self) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        if !Self::auto_update(&app) || !Self::tunnel_active(&app) {
+            return;
+        }
+        let checked = self
+            .updates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .checked;
+        if checked.is_some_and(|t| t.elapsed() < UPDATE_EVERY) {
+            return;
+        }
+        let _ = self.update_connector("system").await;
+    }
+
+    /// Check for a newer cloudflared now and install it (the console's
+    /// "Update now", `aegisctl cloudflared update`).
+    pub async fn update_connector(&self, actor: &str) -> ActionResult {
+        let app = self.app()?;
+        {
+            let mut u = self.updates.lock().unwrap_or_else(|e| e.into_inner());
+            if u.busy {
+                return Err(err(409, "An update is already running"));
+            }
+            u.busy = true;
+            u.checked = Some(std::time::Instant::now());
+        }
+        let result = self.install_latest().await;
+        self.updates.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut record = match &result {
+            Ok(v) => v.clone(),
+            Err(e) => json!({"error": e}),
+        };
+        record["checked_at"] = json!(now);
+        let installed = result.as_ref().is_ok_and(|v| v["updated"] == true);
+        let _ = app.store.tx(|c| {
+            db::put_setting(c, UPDATE_STATUS, &record)?;
+            if installed || result.is_err() {
+                db::append_audit(
+                    c,
+                    db::AuditInsert {
+                        actor_id: Some(actor),
+                        action: "integration.cloudflare.connector_update",
+                        target_type: "integration",
+                        target_id: Some(ID),
+                        decision: if installed { "allowed" } else { "failed" },
+                        revision_digest: None,
+                        metadata: record.clone(),
+                    },
+                )?;
+            }
+            Ok(())
+        });
+        result.map_err(|e| err(502, e))
+    }
+
+    async fn install_latest(&self) -> Result<Value, String> {
+        let release = connector_update::latest().await?;
+        let store = self.connector.store().clone();
+        let previous = store.best().ok().map(|b| b.build.version);
+        let latest = release.build.version.clone();
+        if previous
+            .as_deref()
+            .is_some_and(|p| !connector::newer(&latest, p))
+        {
+            return Ok(json!({"updated": false, "version": previous, "latest": latest}));
+        }
+        connector_update::install(&store, &release).await?;
+        self.refresh_installed();
+        if self.connector.enabled() {
+            let was_ready = self.connector.last_ready();
+            self.connector.start().await?;
+            if was_ready && !self.connector.wait_ready(UPDATE_READY).await {
+                // Restore what ran before: the bundled build, or nothing
+                // newer than it.
+                let _ = std::fs::remove_file(store.update_manifest());
+                let _ = std::fs::remove_file(store.update_binary(&latest));
+                self.refresh_installed();
+                self.connector.start().await?;
+                return Err(format!(
+                    "cloudflared {latest} did not connect to Cloudflare; the previous build is running again"
+                ));
+            }
+        }
+        connector_update::prune(&store, &latest);
+        Ok(json!({"updated": true, "version": latest, "previous": previous}))
     }
 
     /// Restart the connector after a reboot when the tunnel is active.
@@ -198,8 +377,7 @@ impl CloudflareIntegration {
         let Some(app) = self.app.upgrade() else {
             return;
         };
-        let active = Self::record(&app).is_some_and(|r| r.enabled && r.status["state"] == "active");
-        if active && self.unavailable.is_none() {
+        if Self::tunnel_active(&app) && self.unavailable().is_none() {
             let c = Arc::clone(&self.connector);
             tokio::spawn(async move {
                 let _ = c.start().await;
@@ -239,7 +417,7 @@ impl CloudflareIntegration {
     }
 
     pub async fn plan(&self, actor: &str, body: Value) -> ActionResult {
-        if let Some(reason) = &self.unavailable {
+        if let Some(reason) = &self.unavailable() {
             return Err(err(409, reason.clone()));
         }
         let app = self.app()?;
@@ -342,7 +520,10 @@ impl CloudflareIntegration {
                 else { format!("Create a Cloudflare Tunnel named aegis-{}", plan.desired.deployment_id) },
                 format!("Route https://{hostname}/agp, /enroll and /renew to this gateway only (the console is never published)"),
                 format!("Create a proxied DNS record {hostname} → <tunnel>.cfargotunnel.com, labelled as AegisNet-owned"),
-                format!("Run the bundled connector (cloudflared {}) inside this server", connector::CLOUDFLARED_VERSION),
+                match self.connector.store().best() {
+                    Ok(b) => format!("Run the Cloudflare connector (cloudflared {}) inside this server, kept up to date", b.build.version),
+                    Err(_) => "Run the Cloudflare connector (cloudflared) inside this server, kept up to date".to_owned(),
+                },
                 "Verify end to end: a test device connects through Cloudflare with mutual TLS and loads the verification sites".to_owned(),
                 "Point new device invitations at the Cloudflare address".to_owned(),
             ],
@@ -356,7 +537,7 @@ impl CloudflareIntegration {
 
     /// Start applying a plan in the background; progress via status().
     pub async fn apply(self: &Arc<Self>, actor: &str, body: Value) -> ActionResult {
-        if let Some(reason) = &self.unavailable {
+        if let Some(reason) = &self.unavailable() {
             return Err(err(409, reason.clone()));
         }
         let app = self.app()?;
