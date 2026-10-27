@@ -3,7 +3,8 @@
 # or locally from `deploy/build-bundle.sh` output.
 #
 # Build context:
-#   bin/<amd64|arm64>/aegisd  aegisctl  cloudflared
+#   bin/<amd64|arm64>/aegisd  aegisctl  cloudflared  cloudflared.json
+#                             (from deploy/cloudflared-latest.sh)
 #   clients/                  (client app builds offered in the console)
 #   install.sh                (the installer, stamped with this image's tag;
 #                              servers fetch it from the image, see INSTALL.md)
@@ -16,9 +17,6 @@
 # Pin the base image to a reviewed digest before release use.
 FROM debian:bookworm-slim
 ARG TARGETARCH
-# cloudflared 2026.10.0 release checksums (re-verified at runtime by aegisd).
-ARG CLOUDFLARED_SHA256_amd64=d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db
-ARG CLOUDFLARED_SHA256_arm64=e6422b9d4f72d3194bc5a38676f13667c06666523217b842a877d72a80b5ac08
 RUN groupadd --system --gid 10001 aegisnet \
     && useradd --system --uid 10001 --gid 10001 --home-dir /var/lib/aegisnet --shell /usr/sbin/nologin aegisnet \
     && apt-get update && apt-get upgrade -y --no-install-recommends \
@@ -27,14 +25,15 @@ RUN groupadd --system --gid 10001 aegisnet \
     && install -d -o 10001 -g 10001 -m 0700 /var/lib/aegisnet \
     && install -d -m 0755 /usr/share/aegisnet/clients
 COPY bin/${TARGETARCH}/aegisd bin/${TARGETARCH}/aegisctl bin/${TARGETARCH}/cloudflared /usr/local/bin/
+# The bundled connector's version and SHA-256; aegisd checks the binary
+# against it before every start (and may run a newer verified download).
+COPY bin/${TARGETARCH}/cloudflared.json /usr/share/aegisnet/cloudflared.json
 RUN set -e; \
-    case "$TARGETARCH" in \
-      amd64) sum="$CLOUDFLARED_SHA256_amd64" ;; \
-      arm64) sum="$CLOUDFLARED_SHA256_arm64" ;; \
-      *) echo "unsupported architecture $TARGETARCH" >&2; exit 1 ;; \
-    esac; \
+    sum=$(sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p' /usr/share/aegisnet/cloudflared.json); \
+    [ -n "$sum" ] || { echo "cloudflared.json has no sha256" >&2; exit 1; }; \
     echo "$sum  /usr/local/bin/cloudflared" | sha256sum -c -; \
-    chmod 0755 /usr/local/bin/aegisd /usr/local/bin/aegisctl /usr/local/bin/cloudflared
+    chmod 0755 /usr/local/bin/aegisd /usr/local/bin/aegisctl /usr/local/bin/cloudflared; \
+    chmod 0644 /usr/share/aegisnet/cloudflared.json
 COPY clients/ /usr/share/aegisnet/clients/
 COPY install.sh /usr/share/aegisnet/install.sh
 ENV AEGIS_DATA_DIR=/var/lib/aegisnet

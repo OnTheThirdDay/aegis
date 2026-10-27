@@ -215,7 +215,7 @@ The installer reads the current settings from the running gateway (ports, addres
 What the upgrade keeps and changes:
 
 - **Kept:** all data, including the admin password, users, devices, certificates and the Cloudflare tunnel. They live in the Docker volume `aegis-data`. The console certificate stays the same, so the browser does not warn again.
-- **Changed:** only the program. Devices reconnect automatically within seconds.
+- **Changed:** only the program, including the Cloudflare connector: each image carries the cloudflared release that was current when it was built, and an upgrade turns automatic connector updates on (see below). Devices reconnect automatically within seconds.
 
 The settings live in the gateway's container. After `--uninstall` they are gone; data is kept, but a reinstall starts from the defaults again unless you pass the options.
 
@@ -225,6 +225,26 @@ The settings live in the gateway's container. After `--uninstall` they are gone;
 
 - **A specific version:** `sudo sh install.sh --version vX.Y.Z`.
 - **The pre-release test build:** `sudo sh install.sh --image ghcr.io/onthethirdday/aegis:staging`. Use this only on test servers. The image is not remembered: the next plain upgrade goes back to the release.
+
+### Cloudflare connector updates
+
+With Cloudflare Tunnel, the gateway runs Cloudflare's connector, `cloudflared`, and keeps it up to date by itself. Once a week, and each time the gateway starts, it checks cloudflared's latest release on GitHub.
+
+- **Checks before switching:** a newer release is downloaded into the data volume and checked against the SHA-256 that Cloudflare publishes with it. It must also run and report its version. Only then does the connector restart on it; the tunnel is back within seconds and devices reconnect by themselves.
+- **Rollback:** if the new build doesn't connect to Cloudflare within 90 seconds, the previous one runs again, and the console shows why.
+- **Status:** **Connectivity → Cloudflare Tunnel** shows the running version and the last check. There you can also turn automatic updates off (they are on by default) or press **Update now**.
+
+To update by hand on the server:
+
+```sh
+docker exec aegis aegisctl cloudflared update        # check now and install a newer release
+docker exec aegis aegisctl cloudflared status        # running version, last check, automatic updates
+docker exec aegis aegisctl cloudflared auto-update off   # or on
+```
+
+Use your `--name` instead of `aegis` if you installed with one. Upgrading the gateway (above) also brings the connector that was current when the image was built.
+
+A cloudflared you run yourself, outside AegisNet (for example on another machine), isn't managed by the gateway. Update it the way you installed it: your package manager (`apt`/`dnf`, Cloudflare's repository at pkg.cloudflare.com), `brew upgrade cloudflared` on macOS, or a newer `cloudflare/cloudflared` image tag for Docker. Then restart its service.
 
 ## Optional: keep the device root key offline
 
