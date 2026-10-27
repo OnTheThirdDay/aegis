@@ -1,0 +1,34 @@
+[package]
+name = "aegis-mobile"
+description = "Mobile client core: enrollment, the client node and the VPN packet path (Android VpnService; later the iOS packet tunnel)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# cdylib: loaded by the Android app (JNI); rlib: host tests.
+crate-type = ["cdylib", "rlib"]
+
+# The workspace forbids unsafe code; this crate needs it at the platform
+# boundary only (the VPN file descriptor, JNI), where it is allowed per item.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+
+[dependencies]
+aegis-join = { workspace = true }
+aegis-node = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+# Userspace TCP/IP stack over the VPN interface's packets.
+ipstack = "1.0.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }
