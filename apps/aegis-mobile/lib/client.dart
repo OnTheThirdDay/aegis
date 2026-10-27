@@ -10,21 +10,46 @@ class ClientError implements Exception {
   String toString() => message;
 }
 
-/// The enrolled device, if any.
-class DeviceInfo {
-  DeviceInfo({required this.enrolled, this.name, this.server, this.expiresAt});
+/// A joined server: its address and this phone's name there.
+class ServerInfo {
+  ServerInfo({required this.id, required this.name, required this.server, this.expiresAt});
 
-  factory DeviceInfo.fromJson(Map<String, dynamic> j) => DeviceInfo(
-        enrolled: j['enrolled'] == true,
-        name: j['name'] as String?,
-        server: j['server'] as String?,
+  factory ServerInfo.fromJson(Map<String, dynamic> j) => ServerInfo(
+        id: j['id'] as String,
+        name: j['name'] as String,
+        server: j['server'] as String,
         expiresAt: _time(j['certificate_expires_at']),
       );
 
-  final bool enrolled;
-  final String? name;
-  final String? server;
+  final String id;
+  final String name;
+  final String server;
   final DateTime? expiresAt;
+}
+
+/// Every joined server, oldest first, and the one connections use.
+class Servers {
+  Servers({required this.list, this.selectedId});
+
+  factory Servers.fromJson(Map<String, dynamic> j) => Servers(
+        list: [
+          for (final s in (j['servers'] as List<dynamic>? ?? const []))
+            ServerInfo.fromJson(s as Map<String, dynamic>),
+        ],
+        selectedId: j['selected'] as String?,
+      );
+
+  final List<ServerInfo> list;
+  final String? selectedId;
+
+  bool get isEmpty => list.isEmpty;
+
+  ServerInfo? get selected {
+    for (final s in list) {
+      if (s.id == selectedId) return s;
+    }
+    return list.isEmpty ? null : list.first;
+  }
 }
 
 enum ConnectionState { disconnected, connecting, connected }
@@ -35,6 +60,7 @@ class Status {
     this.state = ConnectionState.disconnected,
     this.error,
     this.info,
+    this.serverId,
     this.server,
     this.since,
     this.bytesUp = 0,
@@ -50,6 +76,7 @@ class Status {
         },
         error: j['error'] as String?,
         info: j['info'] as String?,
+        serverId: j['server_id'] as String?,
         server: j['server'] as String?,
         since: _time(j['connected_since']),
         bytesUp: (j['bytes_up'] as num?)?.toInt() ?? 0,
@@ -60,6 +87,9 @@ class Status {
   final ConnectionState state;
   final String? error;
   final String? info;
+
+  /// The server of the current (or last) connection.
+  final String? serverId;
   final String? server;
   final DateTime? since;
   final int bytesUp;
@@ -84,16 +114,20 @@ class Client {
     return j;
   }
 
-  Future<DeviceInfo> device() async => DeviceInfo.fromJson(await _call('device'));
+  Future<Servers> servers() async => Servers.fromJson(await _call('servers'));
 
-  Future<DeviceInfo> enroll(String code) async {
-    await _call('enroll', {'code': code.trim()});
-    return device();
-  }
+  /// Joins another server and selects it.
+  Future<ServerInfo> enroll(String code) async =>
+      ServerInfo.fromJson(await _call('enroll', {'code': code.trim()}));
 
-  Future<void> forget() => _call('forget');
+  /// The server the next connection uses.
+  Future<void> select(String id) => _call('select', {'id': id});
 
-  /// Asks Android for VPN permission the first time.
+  /// Removes a server, disconnecting first if it is the connected one.
+  Future<void> forget(String id) => _call('forget', {'id': id});
+
+  /// Connects to the selected server; asks Android for VPN permission the
+  /// first time.
   Future<void> connect() => _call('connect');
 
   Future<void> disconnect() => _call('disconnect');

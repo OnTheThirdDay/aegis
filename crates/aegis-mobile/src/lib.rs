@@ -1,8 +1,10 @@
 //! Mobile client core.
 //!
-//! The app (Flutter UI, platform VPN service) calls a small JSON API:
-//! enroll with an invitation, show the device, connect with a VPN interface
-//! descriptor, disconnect, and poll status. Underneath it is the desktop
+//! The app (Flutter UI, platform VPN service) calls a small JSON API: join
+//! servers with invitations, list and select them, connect to the selected
+//! one with a VPN interface descriptor, disconnect, and poll status. Every
+//! call takes the app's data folder; each server's profile lives under it
+//! (`aegis_join::Servers`). Underneath it is the desktop
 //! client's stack: `aegis-join` for enrollment and renewal, the client node
 //! (local SOCKS proxy, AGP tunnel to the gateway), plus the VPN packet path
 //! that feeds captured connections into that proxy.
@@ -24,7 +26,7 @@ mod socks;
 #[cfg(target_os = "android")]
 mod android;
 
-use aegis_join::{DeviceDir, JoinError, Ports};
+use aegis_join::{DeviceDir, JoinError, Ports, Servers};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -47,6 +49,8 @@ struct Snapshot {
     state: State,
     error: Option<String>,
     info: Option<String>,
+    /// The server of the current (or last) connection: id and address.
+    server_id: Option<String>,
     server: Option<String>,
     connected_since: Option<u64>,
     bytes_up: u64,
@@ -72,6 +76,7 @@ impl State {
 }
 
 struct Running {
+    server_id: String,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -129,41 +134,64 @@ fn host_of(url: &str) -> String {
     rest.split(['/', '?']).next().unwrap_or(rest).to_owned()
 }
 
-/// Join a gateway with an invitation code (`aegis1:…`). Blocking.
+fn server_json(s: &aegis_join::Server) -> Value {
+    json!({
+        "id": s.id,
+        "name": s.device.name,
+        "server": s.host(),
+        "certificate_expires_at": s.dir.certificate_expires_at().ok(),
+    })
+}
+
+/// Join another server with an invitation code (`aegis1:…`) and select it.
+/// Blocking.
 pub fn enroll(dir: &str, code: &str) -> Value {
     let c = match client() {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
-    let device = DeviceDir::new(dir);
     let result = c.rt.block_on(async {
         let invite = aegis_join::parse_invite(code)?;
-        aegis_join::enroll(&invite, &device).await
+        Servers::open(dir)?.join(&invite).await
     });
     match result {
-        Ok(d) => ok(json!({"name": d.name, "server": host_of(&d.url)})),
+        Ok(s) => ok(server_json(&s)),
         Err(e) => fail(e),
     }
 }
 
-/// The enrolled device, if any.
-pub fn device(dir: &str) -> Value {
-    let device = DeviceDir::new(dir);
-    match device.load() {
-        Ok(d) => ok(json!({
-            "enrolled": true,
-            "name": d.name,
-            "server": host_of(&d.url),
-            "certificate_expires_at": device.certificate_expires_at().ok(),
-        })),
-        Err(_) => ok(json!({"enrolled": false})),
+/// The joined servers, oldest first, and the selected one's id.
+pub fn servers(dir: &str) -> Value {
+    match Servers::open(dir) {
+        Ok(servers) => {
+            let list: Vec<Value> = servers.list().iter().map(server_json).collect();
+            ok(json!({
+                "servers": list,
+                "selected": servers.selected().map(|s| s.id),
+            }))
+        }
+        Err(e) => fail(e),
     }
 }
 
-/// Disconnect and remove the device's identity from this phone.
-pub fn forget(dir: &str) -> Value {
-    let _ = stop();
-    match DeviceDir::new(dir).forget() {
+/// Make `id` the server the next connection uses.
+pub fn select(dir: &str, id: &str) -> Value {
+    match Servers::open(dir).and_then(|s| s.select(id)) {
+        Ok(s) => ok(server_json(&s)),
+        Err(e) => fail(e),
+    }
+}
+
+/// Remove a server and its identity from this phone, disconnecting first
+/// if it is the one connected.
+pub fn forget(dir: &str, id: &str) -> Value {
+    let connected = client()
+        .ok()
+        .is_some_and(|c| lock(&c.running).as_ref().is_some_and(|r| r.server_id == id));
+    if connected {
+        let _ = stop();
+    }
+    match Servers::open(dir).and_then(|s| s.remove(id)) {
         Ok(()) => ok(json!({})),
         Err(e) => fail(e),
     }
@@ -210,13 +238,19 @@ pub fn start(dir: &str, fd: i32) -> Value {
     }
 }
 
-/// Connect with any packet device (the VPN interface, or a test double).
+/// Connect to the selected server with any packet device (the VPN
+/// interface, or a test double).
 pub fn start_with<D>(dir: &str, device: D) -> Value
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let c = match client() {
         Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let server = match Servers::open(dir).map(|s| s.selected()) {
+        Ok(Some(s)) => s,
+        Ok(None) => return fail("Join a server first."),
         Err(e) => return fail(e),
     };
     let _ = stop();
@@ -227,17 +261,20 @@ where
         let mut s = lock(&c.snapshot);
         *s = Snapshot {
             state: State::Connecting,
+            server_id: Some(server.id.clone()),
+            server: Some(server.host()),
             ..Snapshot::default()
         };
     }
     let task = c.rt.spawn(session(
-        DeviceDir::new(dir),
+        server.dir,
         device,
         Arc::clone(&c.snapshot),
         stats,
         stop_rx,
     ));
     *lock(&c.running) = Some(Running {
+        server_id: server.id,
         stop: stop_tx,
         task,
     });
@@ -274,6 +311,7 @@ pub fn status() -> Value {
         "state": s.state.as_str(),
         "error": s.error,
         "info": s.info,
+        "server_id": s.server_id,
         "server": s.server,
         "connected_since": s.connected_since,
         "bytes_up": s.bytes_up,
@@ -454,12 +492,17 @@ mod tests {
     }
 
     #[test]
-    fn device_reports_not_enrolled() {
+    fn no_servers_until_one_is_joined() {
         let dir = std::env::temp_dir().join(format!("aegis-mobile-test-{}", std::process::id()));
-        let v = device(dir.to_str().expect("utf-8"));
+        let dir = dir.to_str().expect("utf-8");
+        let v = servers(dir);
         assert_eq!(v["ok"], true);
-        assert_eq!(v["enrolled"], false);
+        assert_eq!(v["servers"], json!([]));
+        assert_eq!(v["selected"], Value::Null);
+        assert_eq!(select(dir, "0123456789abcdef")["ok"], false);
+        assert_eq!(start_with(dir, tokio::io::duplex(64).0)["ok"], false);
         let s = status();
         assert_eq!(s["state"], "disconnected");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
