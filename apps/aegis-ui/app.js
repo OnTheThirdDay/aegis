@@ -595,10 +595,25 @@ async function renderUsers() {
     const toggle = button(pr.enabled ? "Turn the portal off" : "Turn the portal on", pr.enabled ? "ghost small" : "small");
     toggle.hidden = !can("system:configure");
     busy(toggle, async () => { await api("PUT", "/system/portal", { body: { enabled: !pr.enabled } }); await renderUsers(); });
+    const port = /** @type {HTMLInputElement} */ (el("input", { type: "number", min: "1", max: "65535", placeholder: "same as devices", value: pr.public_port ? String(pr.public_port) : "" }));
+    const savePort = button("Save port", "ghost small");
+    busy(savePort, async () => {
+      const value = port.value.trim();
+      await api("PUT", "/system/portal", { body: { public_port: value ? Number(value) : null } });
+      notice(value ? "Portal address now uses port " + value + "." : "Portal address uses the device port again.");
+      await renderUsers();
+    });
+    const portRow = el("div", {}, [
+      field("Public port in the portal address (optional)", port, "Only the address users see changes: the portal is still served by the device listener. Use this when port forwarding or your firewall maps another port to it, or with Cloudflare Tunnel to use one of Cloudflare's other HTTPS ports (2053, 2083, 2087, 2096, 8443). Leave empty for the device port (443 with Cloudflare)."),
+      el("div", { class: "row" }, [savePort]),
+    ]);
+    portRow.hidden = !can("system:configure");
     v.append(card("User portal", [
       el("p", { class: "muted" }, ["Users sign in here to add and remove their own devices and download the app, without access to this console. It is served on the same public address as devices (through Cloudflare Tunnel when set up). Administrators can sign in there too, with two-factor authentication (Account), and then get this whole console without SSH."]),
       el("p", {}, [pill(pr.enabled ? "on" : "off"), " ", link]),
+      pr.warning ? el("p", { class: "warn-text" }, [pr.warning]) : null,
       el("div", { class: "row" }, [copyUrl, toggle]),
+      portRow,
     ]));
   } catch { /* not an appliance */ }
   v.append(card("Add a user", [
@@ -703,11 +718,11 @@ async function renderConnectivity() {
   if (info.tunnel_only) {
     // No public device port: direct connections and HTTP-validated
     // certificates can't work, so only the tunnel is offered.
-    v.append(cloudflareCard(cf));
+    v.append(cloudflareCard(cf, conn));
     v.append(card("Direct connections are off", [el("p", { class: "muted" }, ["This gateway was installed with --tunnel-only: nothing on the server is reachable from the internet, and devices connect through Cloudflare Tunnel. To accept direct connections, reinstall with --direct."])]));
   } else {
     v.append(directCard(conn, managed));
-    v.append(cloudflareCard(cf));
+    v.append(cloudflareCard(cf, conn));
     v.append(acmeCard(acme, conn));
   }
   if (["applying", "removing", "issuing", "planning", "verifying"].includes(cf.state) || ["issuing", "removing"].includes(acme.state)) {
@@ -738,8 +753,26 @@ function directCard(conn, managed) {
   ]);
 }
 
-/** @param {any} cf */
-function cloudflareCard(cf) {
+/** The port devices use through the tunnel: one of Cloudflare's HTTPS ports.
+ * @param {any} conn */
+function tunnelPort(conn) {
+  const port = /** @type {HTMLSelectElement} */ (el("select", {}, [443, 2053, 2083, 2087, 2096, 8443].map((p) =>
+    el("option", { value: String(p) }, [String(p) + (p === 443 ? " (standard HTTPS)" : "")]))));
+  port.value = String(conn.public_port || 443);
+  const save = button("Use this port", "ghost small");
+  busy(save, async () => {
+    await api("PUT", "/system/connection", { body: { public_port: Number(port.value) } });
+    notice("New invitations use port " + port.value + ". Joined devices switch to it the next time they connect.");
+    await renderConnectivity();
+  });
+  return el("div", {}, [
+    field("Device port", port, "Cloudflare accepts HTTPS on these ports and passes all of them through the tunnel; pick another if a network blocks 443. Joined devices move over by themselves; the old port keeps working."),
+    el("div", { class: "row" }, [save]),
+  ]);
+}
+
+/** @param {any} cf @param {any} conn */
+function cloudflareCard(cf, conn) {
   const body = el("div");
   const head = el("div", { class: "row spread" }, [el("span", {}, ["Status: ", pill(cf.state || "inactive")]), cf.public_url ? el("span", { class: "mono" }, [cf.public_url]) : null]);
   const c = card("Option 2 — Cloudflare Tunnel (access from anywhere, no port forwarding)", [
@@ -766,6 +799,7 @@ function cloudflareCard(cf) {
     const keepDns = /** @type {HTMLInputElement} */ (el("input", { type: "checkbox" }));
     const restart = button("Restart connector", "ghost");
     busy(restart, async () => { await api("POST", "/integrations/cloudflare/restart", { body: {} }); notice("Connector restarted."); await renderConnectivity(); });
+    if (cf.state === "active" && conn.mode === "cloudflare" && can("system:configure")) body.append(tunnelPort(conn));
     const outdated = cf.state === "active" && cf.portal_routes === false;
     const retry = button(outdated ? "Update routes for the user portal" : cf.state === "active" ? "Test again" : "Retry setup", "ghost");
     retry.hidden = cf.state === "active" && !cf.warning && !outdated;

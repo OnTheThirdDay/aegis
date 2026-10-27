@@ -10,6 +10,10 @@ Recommended public installs (`--tunnel-only`) keep the console on the server's l
 
 The self-service part of the console is served on the gateway's public edge at `/portal/`, the same address devices use (`/agp`, `/enroll`, `/renew`). With Cloudflare Tunnel it is reached through the tunnel, so nothing new is opened on the server.
 
+The administrator may set the public port in the portal's address (owner direction, 2026-10-27). The portal stays on the device listener; only the address changes. This fits port forwarding, and Cloudflare's other HTTPS ports (2053, 2083, 2087, 2096, 8443). With Cloudflare, a port outside that list is refused.
+
+The device port with Cloudflare Tunnel can also be any of those ports, not just 443; the hostname stays the integration's. Enrolled devices adopt the new address through endpoint following, which verifies the gateway's pinned identity there first. The portal address follows the device port unless set separately. A retried setup keeps the chosen port.
+
 **Restrictions**
 
 - **Allowlist.** Only these routes exist on the portal; everything else answers 404, whatever the session:

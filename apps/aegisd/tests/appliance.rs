@@ -370,6 +370,34 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
             .call(reqwest::Method::PUT, "/system/portal", Some(json!({"enabled": true})))
             .await;
         assert_eq!(s, 200);
+        // A public port of the administrator's choice (port forwarding).
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/portal", Some(json!({"public_port": 9443})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert!(v["url"].as_str().is_some_and(|u| u.ends_with(":9443/portal/")), "{v}");
+        assert_eq!((v["enabled"].clone(), v["public_port"].clone()), (json!(true), json!(9443)), "{v}");
+        let host = reqwest::Url::parse(&portal.base).expect("url").host_str().expect("host").to_owned();
+        let page = portal
+            .http
+            .get(format!("{}/", portal.base))
+            .header("host", format!("{host}:9443"))
+            .send()
+            .await
+            .expect("forwarded port");
+        assert_eq!(page.status().as_u16(), 200, "the forwarded port's Host is accepted");
+        for bad in [json!(0), json!(70000), json!("9443"), json!({})] {
+            let (s, _) = c
+                .call(reqwest::Method::PUT, "/system/portal", Some(json!({"public_port": bad})))
+                .await;
+            assert_eq!(s, 400, "{bad}");
+        }
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/portal", Some(json!({"public_port": null})))
+            .await;
+        assert_eq!(s, 200);
+        assert!(!v["url"].as_str().is_some_and(|u| u.contains(":9443")), "cleared: {v}");
+        assert_eq!(v["enabled"], true, "the other field stays");
 
         // Administrators with 2FA get the whole console on the portal.
         let (s, v) = c.call(reqwest::Method::POST, "/auth/2fa/setup", None).await;
@@ -635,6 +663,66 @@ async fn legacy_session_limits_are_upgraded_once_and_operator_values_kept() {
         let running = launch_with_core(&data, custom).await;
         assert_eq!(running.node.ctx.startup.core.max_streams_per_session, 64);
         assert_eq!(running.node.ctx.startup.core.session_window_bytes, 4 * 1024 * 1024);
+        running.shutdown().await;
+    })
+    .await
+    .expect("bounded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloudflare_device_port_is_one_of_cloudflares() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let data = tmp.path().join("cf");
+        let running = launch_with_core(&data, "").await;
+        // As the Cloudflare integration leaves it once the tunnel is active.
+        let store = aegis_storage::Store::open(data.join("state.db")).expect("store");
+        store
+            .tx(|c| {
+                aegis_storage::put_setting(
+                    c,
+                    "connection",
+                    &json!({"mode": "cloudflare", "public_host": "gw.example.com", "public_port": 443, "outer_trust": "public"}),
+                )
+            })
+            .expect("connection");
+        let password = std::fs::read_to_string(data.join(appliance::INITIAL_PASSWORD_FILE))
+            .expect("initial password")
+            .trim()
+            .to_owned();
+        let web_ca = std::fs::read_to_string(data.join("secrets/web-ca.pem")).expect("web ca");
+        let mut c = Console::new(running.console.expect("console"), &web_ca);
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": password})))
+            .await;
+        assert_eq!(s, 200);
+        let (s, v) = c
+            .call(
+                reqwest::Method::POST,
+                "/auth/password",
+                Some(json!({"current_password": password, "new_password": "a much better passphrase"})),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/connection", Some(json!({"public_port": 9443})))
+            .await;
+        assert_eq!(s, 400, "not a Cloudflare port: {v}");
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/connection", Some(json!({"public_host": "evil.example", "public_port": 8443})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["connection"]["public_host"], "gw.example.com", "the tunnel's hostname stays");
+        assert_eq!(v["connection"]["public_port"], 8443);
+        // Invitations and the portal use it.
+        let (s, v) = c.call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "phone"}))).await;
+        assert_eq!(s, 201, "{v}");
+        let invite = aegis_join::parse_invite(v["code"].as_str().expect("code")).expect("invite");
+        assert_eq!(invite.url, "wss://gw.example.com:8443/agp");
+        assert_eq!(invite.enroll_url, "https://gw.example.com:8443/enroll");
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["portal"]["url"], "https://gw.example.com:8443/portal/", "{v}");
         running.shutdown().await;
     })
     .await

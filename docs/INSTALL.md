@@ -161,6 +161,12 @@ An administrator signed in this way gets the whole console, except exporting the
 
 4. **Users** (optional): add people with the role **User**. They get a one-time password and sign in at the **user portal**, shown at the top of the Users page: `https://<device address>/portal/`, for example `https://aegis.example.com/portal/` with Cloudflare Tunnel. There they choose their own password, invite and remove their own devices, and download the client app; they never need the console. The portal is on the same public address as devices, so it works with `--tunnel-only` too. Administrators can't sign in there, and the portal can be switched off on the Users page.
    - A tunnel set up with an earlier version needs its routes updated once for the portal: **Connectivity → Cloudflare Tunnel**, paste the token, press **Update routes for the user portal**.
+   - **Another port in the portal address:** Users page → **Public port in the portal address**. The portal is still served by the device listener, so this changes only the address users see. Use it when:
+     - port forwarding or a firewall maps another public port to the device port;
+     - with Cloudflare Tunnel, you want one of Cloudflare's other HTTPS ports: 2053, 2083, 2087, 2096 or 8443. Cloudflare passes them through the same tunnel.
+
+     Leave it empty to use the device port.
+   - **Devices on another Cloudflare port:** **Connectivity → Cloudflare Tunnel → Device port** lets devices use 2053, 2083, 2087, 2096 or 8443 instead of 443, for networks that block 443 to your domain. New invitations use that port. Joined devices switch to it the next time they connect, after checking that the gateway answers there. The old port keeps working, and the portal follows the device port unless you set its own.
 5. **Devices → Invite a device**: enter a device name and press **Create invitation**. Send the code (or the downloaded `.aegis` file) to the device's owner.
 
 ## 5. Connect a device

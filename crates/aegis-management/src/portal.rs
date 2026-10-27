@@ -99,26 +99,66 @@ fn percent_decode(path: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Whether the portal is switched on (default: on).
-pub fn enabled(ctx: &ManagementContext) -> bool {
+/// The HTTPS ports Cloudflare's proxy listens on; a tunnel hostname answers
+/// on each of them.
+pub const CLOUDFLARE_HTTPS_PORTS: [u16; 6] = [443, 2053, 2083, 2087, 2096, 8443];
+
+/// The `portal` setting: `{"enabled": bool, "public_port": port|null}`.
+pub(crate) fn setting(ctx: &ManagementContext) -> serde_json::Value {
     ctx.coord
         .store()
         .read(|c| db::get_setting(c, "portal"))
         .ok()
         .flatten()
-        .and_then(|v| v["enabled"].as_bool())
-        .unwrap_or(true)
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Whether the portal is switched on (default: on).
+pub fn enabled(ctx: &ManagementContext) -> bool {
+    setting(ctx)["enabled"].as_bool().unwrap_or(true)
+}
+
+/// The port users type when the administrator set one: the portal is
+/// still served by the device listener, reached through port forwarding
+/// or one of Cloudflare's other HTTPS ports.
+pub fn public_port(ctx: &ManagementContext) -> Option<u16> {
+    setting(ctx)["public_port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
 }
 
 /// The portal's address for users, once devices have a public address.
 pub fn url(ctx: &ManagementContext) -> Option<String> {
     let conn = connection(ctx).ok()?;
-    let host = conn.public_host?;
-    Some(match conn.public_port {
-        Some(port) if port != 443 && conn.mode.as_deref() != Some("cloudflare") => {
-            format!("https://{host}:{port}/portal/")
-        }
+    Some(portal_url(
+        &conn.public_host?,
+        public_port(ctx).or(conn.public_port),
+    ))
+}
+
+fn portal_url(host: &str, port: Option<u16>) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    match port {
+        Some(port) if port != 443 => format!("https://{host}:{port}/portal/"),
         _ => format!("https://{host}/portal/"),
+    }
+}
+
+/// Why `port` can't reach the portal with the current connection, if so.
+pub(crate) fn port_problem(ctx: &ManagementContext, port: u16) -> Option<String> {
+    let cloudflare = connection(ctx)
+        .ok()
+        .is_some_and(|c| c.mode.as_deref() == Some("cloudflare"));
+    (cloudflare && !CLOUDFLARE_HTTPS_PORTS.contains(&port)).then(|| {
+        format!(
+            "Through Cloudflare Tunnel the portal answers only on Cloudflare's HTTPS ports: {}",
+            CLOUDFLARE_HTTPS_PORTS.map(|p| p.to_string()).join(", ")
+        )
     })
 }
 
@@ -248,15 +288,39 @@ impl Server {
 
 /// `GET/PUT /api/v1/system/portal` (console): show or switch the portal.
 pub(crate) fn status_json(ctx: &ManagementContext) -> serde_json::Value {
+    let port = public_port(ctx);
     serde_json::json!({
         "enabled": enabled(ctx),
         "url": url(ctx),
+        "public_port": port,
+        // A port set before switching to Cloudflare Tunnel may not work there.
+        "warning": port.and_then(|p| port_problem(ctx, p)),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_addresses_carry_the_port_users_type() {
+        assert_eq!(
+            portal_url("gw.example.com", None),
+            "https://gw.example.com/portal/"
+        );
+        assert_eq!(
+            portal_url("gw.example.com", Some(443)),
+            "https://gw.example.com/portal/"
+        );
+        assert_eq!(
+            portal_url("gw.example.com", Some(8443)),
+            "https://gw.example.com:8443/portal/"
+        );
+        assert_eq!(
+            portal_url("2001:db8::1", Some(9443)),
+            "https://[2001:db8::1]:9443/portal/"
+        );
+    }
 
     #[test]
     fn root_key_export_is_local_only_however_spelled() {
