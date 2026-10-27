@@ -12,17 +12,19 @@
 #   printed, so a hang says where it was.
 set -uo pipefail
 
-apt=(sudo DEBIAN_FRONTEND=noninteractive apt-get
+apt=(apt-get
   -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
   -o DPkg::Lock::Timeout=180)
 sudo rm -f /var/lib/man-db/auto-update
 
-# run SECONDS COMMAND...
+# run SECONDS APT-COMMAND... (as root; killed if it overruns)
+# timeout runs inside sudo: sudo doesn't relay a signal sent from its own
+# process group, so `timeout sudo apt-get` never stops a stalled download.
 run() {
   local limit=$1
   shift
   echo "::group::$(date -u +%T) $*"
-  timeout "${APT_STEP_TIMEOUT:-$limit}" "$@"
+  sudo DEBIAN_FRONTEND=noninteractive     timeout --kill-after=15 "${APT_STEP_TIMEOUT:-$limit}" "$@"
   local rc=$?
   echo "$(date -u +%T) exit $rc"
   echo "::endgroup::"
@@ -42,6 +44,8 @@ for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
     -e 's#mirror+file:/etc/apt/apt-mirrors.txt#http://archive.ubuntu.com/ubuntu/#g' \
     -e 's#http://azure.archive.ubuntu.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
 done
+# Finish anything a killed install left half-unpacked.
+sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a
 if install 300 "$@"; then
   exit 0
 fi
