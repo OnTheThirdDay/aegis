@@ -4,6 +4,7 @@
 pub mod acme;
 pub mod cloudflare;
 pub mod connector;
+pub mod connector_update;
 pub mod probe;
 
 use crate::services::Appliance;
@@ -57,9 +58,12 @@ impl Integrations {
         }
     }
 
-    /// Periodic work: certificate renewal.
+    /// Periodic work: certificate renewal, connector updates.
     pub async fn maintain(&self) {
         self.acme.renew_if_due().await;
+        if let Some(cf) = self.cloudflare() {
+            cf.update_if_due().await;
+        }
     }
 
     pub fn status(&self) -> Value {
@@ -93,6 +97,8 @@ impl Integrations {
                         "apply" => cf.apply(&actor, body).await,
                         "disable" => cf.disable(&actor, body).await,
                         "restart" => cf.restart().await,
+                        "update-connector" => cf.update_connector(&actor).await,
+                        "connector-auto-update" => cf.set_auto_update(&actor, &body),
                         _ => Err((404, format!("unknown action {a}"))),
                     }
                 }
