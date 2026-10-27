@@ -160,14 +160,15 @@ fn main() -> ExitCode {
                 if args.check {
                     return fatal("E_CONFIG_UNREADABLE");
                 }
-                if let Err(code) = appliance::init(dir, &appliance::InitOptions::from_env()) {
+                let opts = appliance::InitOptions::from_env();
+                if let Err(code) = appliance::init(dir, &opts) {
                     return fatal(&code);
                 }
                 // Secret-free notice; the password stays in a 0600 file.
                 eprintln!(
                     "aegisd: initialized {}; console https://<this-host>:{}; read the one-time admin password with `aegisctl initial-password`",
                     dir.display(),
-                    appliance::CONSOLE_PORT
+                    opts.console_port.unwrap_or(appliance::CONSOLE_PORT)
                 );
             }
             path

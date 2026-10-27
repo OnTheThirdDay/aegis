@@ -237,6 +237,13 @@ fn violations(graph: &Graph) -> Vec<String> {
     out
 }
 
+/// Crates that must cross a platform boundary (ADR-0011): `deny` instead of
+/// `forbid`, so every unsafe item is allowed explicitly where it is.
+const UNSAFE_BOUNDARY: &[(&str, &str)] = &[(
+    "crates/aegis-mobile",
+    "JNI exports (#[no_mangle]) and the VPN interface's file descriptor",
+)];
+
 fn unsafe_policy() -> Vec<String> {
     let mut out = Vec::new();
     let roots = ["crates", "apps", "xtask"];
@@ -253,8 +260,16 @@ fn unsafe_policy() -> Vec<String> {
             for file in ["src/lib.rs", "src/main.rs"] {
                 let p = dir.join(file);
                 if let Ok(text) = std::fs::read_to_string(&p) {
-                    if !text.contains("#![forbid(unsafe_code)]") {
-                        out.push(format!("{}: missing #![forbid(unsafe_code)]", p.display()));
+                    let boundary = UNSAFE_BOUNDARY
+                        .iter()
+                        .any(|(d, _)| dir == std::path::Path::new(d));
+                    let required = if boundary {
+                        "#![deny(unsafe_code)]"
+                    } else {
+                        "#![forbid(unsafe_code)]"
+                    };
+                    if !text.contains(required) {
+                        out.push(format!("{}: missing {required}", p.display()));
                     }
                 }
             }

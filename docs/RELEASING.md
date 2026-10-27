@@ -79,6 +79,19 @@ macOS is compiled only for releases, so a macOS-only build problem shows up when
 
   Without it the built-in token is used. Then turn on Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests", and approve CI on bot pull requests by hand. Note the expiry date somewhere.
 - **Image package:** after the first publish, go to Packages → `aegis` → Package settings → change visibility to **Public**. Servers can then pull it, and the installer inside it, without `docker login`. This works while the repository itself is private. If the package stays private, run `docker login ghcr.io` on each server.
+- **Android signing key:** phones install an update only over an APK signed with the same key, so create the key once and keep a backup outside GitHub. If it's lost, every phone must uninstall and join again.
+
+  ```sh
+  openssl rand -base64 24 | tr -d '\r\n' > password.txt
+  openssl req -x509 -newkey rsa:4096 -sha256 -days 10950 -nodes \
+    -keyout key.pem -out cert.pem -subj "/CN=AegisNet"
+  openssl pkcs12 -export -inkey key.pem -in cert.pem -name aegis \
+    -out aegis-android.p12 -passout file:password.txt
+  rm key.pem
+  base64 -w0 aegis-android.p12   # paste the output into AEGIS_ANDROID_KEYSTORE_B64
+  ```
+
+  Add these repository secrets: `AEGIS_ANDROID_KEYSTORE_B64`, `AEGIS_ANDROID_KEY_ALIAS` (`aegis`), and the contents of `password.txt` as both `AEGIS_ANDROID_KEYSTORE_PASSWORD` and `AEGIS_ANDROID_KEY_PASSWORD` (a PKCS#12 file has one password). Without them, builds still succeed but warn: each APK is signed with a throwaway key and won't install over the previous one.
 - **Local hook:** run `git config core.hooksPath .githooks` once per clone. It blocks direct pushes to `main` and `staging`; `--no-verify` overrides it deliberately.
 - **Branch protection:** rulesets need a paid plan for private repositories. Until then, the main gate in release.yml, `branch-policy` and the hook enforce the flow. With rulesets available:
   - **`main`:** block force pushes and deletion; require a pull request with merge commits only; require the `branch-policy` check.

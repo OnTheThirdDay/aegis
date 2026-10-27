@@ -50,6 +50,8 @@ The Integrations page lists the built-in integrations.
 
 `aegisctl join/connect` is the same client for headless machines.
 
+**Android app:** a VPN rather than a proxy, so every app's TCP traffic goes through the gateway; names are resolved there. It's installed from the console's downloads ([ADR-0011](docs/adr/0011-mobile-client.md)). iOS will follow on the same Rust core and Flutter UI.
+
 Design and limits: [ADR-0007](docs/adr/0007-appliance-console-and-portable-client.md). Evidence: [SPEC-12 acceptance](docs/SPEC12_ACCEPTANCE.md).
 
 ## What works
@@ -116,7 +118,8 @@ crates/
   aegis-management       REST API, auth/RBAC/CSRF, IPC handlers
   aegis-provision        provisioning saga, Cloudflare API adapter, Compose host path
   aegis-join             device-side invitation import, enrollment, renewal
-apps/  aegisd (incl. appliance + integrations) · aegisctl · aegis-client (GUI) · aegis-ui (console assets)
+  aegis-mobile           mobile client core: JNI/C API, VPN packet path, fake-IP DNS
+apps/  aegisd (incl. appliance + integrations) · aegisctl · aegis-client (GUI) · aegis-mobile (Flutter app) · aegis-ui (console assets)
 xtask/ architecture/unsafe policy checks
 fuzz/  cargo-fuzz targets (AGP, config, HTTP head, destinations)
 deploy/ install.sh (release installer), build-bundle.sh (offline builds), Dockerfiles (rootless), example configs

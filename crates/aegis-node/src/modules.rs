@@ -6,14 +6,22 @@ use aegis_contracts::capability::{
 };
 use aegis_platform::Registry;
 
-const DESKTOP: &[OsFamily] = &[OsFamily::Linux, OsFamily::Windows, OsFamily::Macos];
+/// Portable modules: plain Rust over TCP/TLS, also used by the mobile
+/// client core (crates/aegis-mobile).
+const PORTABLE: &[OsFamily] = &[
+    OsFamily::Linux,
+    OsFamily::Windows,
+    OsFamily::Macos,
+    OsFamily::Android,
+    OsFamily::Ios,
+];
 
 pub const SESSION: ModuleDescriptor = ModuleDescriptor {
     module_id: ModuleIds::SESSION,
     module_version: env!("CARGO_PKG_VERSION"),
     api_version: 1,
     roles: &[Role::Client, Role::Gateway],
-    operating_systems: DESKTOP,
+    operating_systems: PORTABLE,
     provides: &[
         Capability::ConnectionMultiplexing,
         Capability::ByteStream,
@@ -38,7 +46,7 @@ pub const MTLS: ModuleDescriptor = ModuleDescriptor {
     module_version: env!("CARGO_PKG_VERSION"),
     api_version: 1,
     roles: &[Role::Client, Role::Gateway],
-    operating_systems: DESKTOP,
+    operating_systems: PORTABLE,
     provides: &[Capability::InnerMutualTls],
     requires: &[Capability::ByteStream],
     budget: ResourceBudget {
@@ -57,7 +65,7 @@ pub const TUNNEL: ModuleDescriptor = ModuleDescriptor {
     module_version: env!("CARGO_PKG_VERSION"),
     api_version: 1,
     roles: &[Role::Client],
-    operating_systems: DESKTOP,
+    operating_systems: PORTABLE,
     provides: &[Capability::ByteStream, Capability::HalfClose],
     requires: &[
         Capability::ConnectionMultiplexing,
