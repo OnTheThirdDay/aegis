@@ -186,6 +186,8 @@ An administrator signed in this way gets the whole console, except exporting the
 2. Tick **System VPN: send every app's traffic through AegisNet while connected**, press **Save**.
 3. While connected, the window shows *System VPN is on*. Disconnecting or quitting the app turns it off.
 
+**Kill switch** (optional, under the System VPN setting): nothing gets out around the VPN. Disconnecting or quitting the app turns it off as usual; if the app or the VPN stops unexpectedly, the internet stays blocked (your local network and your server still work) until you connect again or press **Unblock internet** in the app. Restarting the computer always clears it.
+
 After updating the app, Settings may offer **Update VPN helper** (another administrator prompt). **Remove VPN helper** uninstalls it. Names are resolved by your server, so names that only exist on your local network (like `router.lan`) don't resolve while the VPN is on; addresses on your local network still work.
 
 Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl connect --dir DIR`.

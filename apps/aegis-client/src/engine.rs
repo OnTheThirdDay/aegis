@@ -115,6 +115,8 @@ pub enum Command {
     SaveSettings(Settings),
     /// Install or update the system VPN's helper (administrator prompt).
     InstallVpnHelper,
+    /// Release a kill switch that blocks traffic after the VPN stopped.
+    Unblock,
     RemoveVpnHelper,
     /// Start an on-demand diagnostics recording for this many minutes.
     DiagStart(u64),
@@ -299,7 +301,8 @@ impl Worker {
                                 && (next.socks_port != self.settings.socks_port
                                     || next.http_port != self.settings.http_port
                                     || next.system_proxy != self.settings.system_proxy
-                                    || next.system_vpn != self.settings.system_vpn);
+                                    || next.system_vpn != self.settings.system_vpn
+                                    || next.kill_switch != self.settings.kill_switch);
                             self.settings = Settings { proxy_saved: self.settings.proxy_saved.clone(), ..next };
                             if let Err(e) = self.settings.save() {
                                 self.update(|s| s.error = Some(format!("Could not save settings: {e}")));
@@ -310,6 +313,12 @@ impl Worker {
                             }
                         }
                         Command::InstallVpnHelper => self.install_helper().await,
+                        Command::Unblock => {
+                            if let Err(e) = aegis_vpn::client::release().await {
+                                self.update(|s| s.error = Some(e));
+                            }
+                            self.check_helper().await;
+                        }
                         Command::RemoveVpnHelper => self.remove_helper().await,
                         Command::DiagStart(minutes) => self.diag_start(minutes),
                         Command::DiagStop(send) => {
@@ -624,13 +633,16 @@ impl Worker {
             .and_then(|d| d.load().ok())
             .map(|d| bypass_hosts(&d))
             .unwrap_or_default();
-        match Session::start(socks_port, bypass).await {
+        match Session::start(socks_port, bypass, self.settings.kill_switch).await {
             Ok(session) => {
                 self.vpn = Some(session);
                 self.diag.note(Severity::Info, "client.vpn.started", &[]);
                 self.update(|s| {
                     s.vpn_active = true;
                     s.vpn_counters = Counters::default();
+                    if let HelperState::Ready { blocked, .. } = &mut s.vpn_helper {
+                        *blocked = false;
+                    }
                 });
             }
             Err(e) => {
@@ -772,6 +784,7 @@ impl Worker {
                 Ok((false, _)) | Err(_) => {
                     self.vpn = None;
                     self.diag.note(Severity::Warn, "client.vpn.lost", &[]);
+                    self.check_helper().await;
                     self.update(|s| {
                         s.vpn_active = false;
                         s.error = Some(

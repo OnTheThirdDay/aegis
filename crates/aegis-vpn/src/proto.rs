@@ -24,12 +24,19 @@ pub enum Request {
     /// Capture this computer's traffic into the client node's local SOCKS
     /// proxy at `127.0.0.1:socks_port`. `bypass`: the gateway's host names
     /// or IPv4 addresses, which must stay reachable outside the VPN.
+    /// `kill_switch`: block traffic outside the VPN, and keep blocking if
+    /// the VPN ends without a `Stop`.
     Start {
         socks_port: u16,
         bypass: Vec<String>,
+        #[serde(default)]
+        kill_switch: bool,
     },
     Status,
+    /// Stop the VPN deliberately (releases the kill switch).
     Stop,
+    /// Release a kill switch left blocking after the VPN ended.
+    Release,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +62,9 @@ pub struct Reply {
     /// Whether this connection's VPN is up (status).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running: Option<bool>,
+    /// The kill switch blocks traffic while no VPN runs (hello).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counters: Option<Counters>,
 }
@@ -124,6 +134,7 @@ mod tests {
         let start = Request::Start {
             socks_port: 1080,
             bypass: vec!["gw.example.com".into()],
+            kill_switch: true,
         };
         write(&mut w, &start).await.expect("write");
         write(&mut w, &Request::Stop).await.expect("write");
