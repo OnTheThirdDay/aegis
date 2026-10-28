@@ -89,6 +89,11 @@ const RULES: &[(&str, &str, &str)] = &[
         "the transport carries bytes and datagrams; the node wires sessions",
     ),
     (
+        "aegis-updater",
+        "aegis-",
+        "the updater (root-equivalent through Docker) carries no other first-party code",
+    ),
+    (
         "aegis-inbound-socks",
         "aegis-management",
         "inbounds cannot depend on management",

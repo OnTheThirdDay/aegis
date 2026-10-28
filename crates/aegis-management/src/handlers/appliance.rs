@@ -410,6 +410,109 @@ pub async fn put_quic(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) ->
     ))
 }
 
+/// The updater counts as present while its heartbeat is this fresh.
+const UPDATER_STALE_SECS: u64 = 120;
+
+/// Version and upgrades as the console shows them: this gateway's version,
+/// what the updater container last found, and the automatic setting.
+fn updates_json(ctx: &crate::ManagementContext) -> Value {
+    let Some(data) = ctx.data_dir() else {
+        return json!({"running": env!("CARGO_PKG_VERSION"), "updater": false});
+    };
+    let status = aegis_updater::files::status(&data).unwrap_or(Value::Null);
+    let fresh = status["heartbeat"]
+        .as_u64()
+        .is_some_and(|t| db::now_unix().max(0) as u64 <= t + UPDATER_STALE_SECS);
+    json!({
+        "running": env!("CARGO_PKG_VERSION"),
+        "updater": fresh,
+        "source": status["source"],
+        "available": status["available"],
+        "checked_at": status["checked_at"],
+        "state": status["state"],
+        "message": status["message"],
+        "finished_at": status["finished_at"],
+        "auto": aegis_updater::files::auto(&data),
+    })
+}
+
+/// `GET /api/v1/system/updates`.
+pub async fn updates(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::GET)?;
+    p.require(Permission::SystemConfigure)?;
+    Ok(json(StatusCode::OK, &updates_json(&ctx), &[]))
+}
+
+/// `POST /api/v1/system/updates`: `{"action": "check"}`, `{"action":
+/// "upgrade", "version": "X.Y.Z"}` (or no version: the newest available),
+/// or `{"auto": bool}`. Requests go to the updater container through the
+/// data volume; the gateway itself never touches Docker.
+pub async fn post_updates(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+    use aegis_updater::files::{self, Request};
+    let p = ctx.authenticate(&headers, &Method::POST)?;
+    p.require(Permission::SystemConfigure)?;
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let data = ctx
+        .data_dir()
+        .ok_or_else(|| ApiError::conflict("not_an_appliance"))?;
+    let (action, metadata) = if let Some(on) = v.get("auto") {
+        let on = on.as_bool().ok_or_else(|| {
+            ApiError::bad_request("invalid_body").detail("auto must be true or false")
+        })?;
+        files::set_auto(&data, on).map_err(|_| ApiError::unavailable())?;
+        ("system.auto_upgrade", json!({ "auto": on }))
+    } else {
+        if updates_json(&ctx)["updater"] != json!(true) {
+            return Err(ApiError::conflict("updater_missing").detail(
+                "the updater isn't running on this server: upgrade once with the newest install.sh, which sets it up",
+            ));
+        }
+        let request = match v["action"].as_str() {
+            Some("check") => Request::Check,
+            Some("upgrade") => match &v["version"] {
+                Value::Null => Request::Upgrade(None),
+                Value::String(s) => Request::Upgrade(Some(
+                    aegis_updater::version::Version::parse(s).ok_or_else(|| {
+                        ApiError::bad_request("invalid_version")
+                            .detail("version must look like 1.2.3")
+                    })?,
+                )),
+                _ => return Err(ApiError::bad_request("invalid_version")),
+            },
+            _ => {
+                return Err(ApiError::bad_request("invalid_body")
+                    .detail("set action (check or upgrade) or auto"))
+            }
+        };
+        files::write_request(&data, &request).map_err(|_| ApiError::unavailable())?;
+        let action = match request {
+            Request::Check => "system.update_check",
+            Request::Upgrade(_) => "system.upgrade_requested",
+        };
+        (action, json!({ "version": v["version"] }))
+    };
+    let (c, actor) = (ctx.clone(), p.id.clone());
+    blocking(move || {
+        c.coord.store().tx(|tx| {
+            db::append_audit(
+                tx,
+                AuditInsert {
+                    actor_id: Some(&actor),
+                    action,
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata,
+                },
+            )
+        })?;
+        Ok(())
+    })
+    .await?;
+    Ok(json(StatusCode::ACCEPTED, &updates_json(&ctx), &[]))
+}
+
 /// Device CA custody: take the root key offline, renew the issuer with it,
 /// or put it back (owner only). Exporting the key needs the password again.
 pub async fn device_ca(

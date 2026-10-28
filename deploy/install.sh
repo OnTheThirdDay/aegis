@@ -28,6 +28,9 @@
 #   --quic             also publish UDP on the device port number, for direct
 #                      QUIC (turn it on in the console under Connectivity)
 #   --no-quic          undo --quic on an upgrade
+#   --updates SOURCE   upgrades from the console: registry (default: newest
+#                      release from ghcr.io), local (only images copied to this
+#                      server, e.g. by another server), or off (no updater)
 #   --console-port N   host port of the HTTPS console        (default 8443)
 #   --port N           host port devices connect to           (default 443)
 #   --http-port N      host port for Let's Encrypt HTTP-01    (default 80; 0 = none)
@@ -57,6 +60,7 @@ ADDRESSES=""
 LOCAL_CONSOLE=""
 TUNNEL_ONLY=""
 QUIC=""
+UPDATES=""
 FRESH=0
 UNINSTALL=0
 PURGE=0
@@ -79,6 +83,7 @@ while [ $# -gt 0 ]; do
     --direct) TUNNEL_ONLY=0; shift ;;
     --quic) QUIC=1; shift ;;
     --no-quic) QUIC=0; shift ;;
+    --updates) UPDATES=${2:?}; shift 2 ;;
     --fresh) FRESH=1; shift ;;
     --name) NAME=${2:?}; shift 2 ;;
     --version) VERSION=${2:?}; shift 2 ;;
@@ -127,7 +132,33 @@ recall_docker() {
     ADDRESSES=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
       | sed -n 's/^AEGIS_PUBLIC_ADDRESSES=//p' | head -n 1)
   fi
+  if [ -z "$UPDATES" ]; then
+    UPDATES=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+      | sed -n 's/^AEGIS_UPDATES=//p' | head -n 1)
+  fi
   RECALLED=1
+}
+
+# The updater: a second container from the same image that upgrades the
+# gateway when asked from the console. It holds the Docker socket (which is
+# root-equivalent on this machine) and so has no network listener; it only
+# reads requests from, and reports to, files in the data volume. It runs as
+# root to use the socket, with no capabilities except reading and writing
+# the gateway's files (DAC_OVERRIDE) and giving its own back to it (CHOWN).
+start_updater() {
+  docker rm -f "$NAME-updater" "$NAME-updater-next" >/dev/null 2>&1 || true
+  [ "$UPDATES" = off ] && return 0
+  sock=/var/run/docker.sock
+  [ -S "$sock" ] || { say "No Docker socket at $sock: upgrades from the console are off."; return 0; }
+  if ! docker run -d --name "$NAME-updater" --restart unless-stopped \
+      --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add CHOWN \
+      --security-opt no-new-privileges --pids-limit 64 --memory 64m \
+      --no-healthcheck --network none --user 0:0 \
+      -v "$sock:/var/run/docker.sock" -v "$NAME-data:/var/lib/aegisnet" \
+      --entrypoint /usr/local/bin/aegisctl "$IMAGE" \
+      updater --container "$NAME" --repository "ghcr.io/$LOWER_REPO" --source "$UPDATES" >/dev/null 2>&1; then
+    say "Could not start the updater; upgrades from the console are off (the gateway runs normally)."
+  fi
 }
 
 instance_exists() {
@@ -173,6 +204,8 @@ pick_port() {
 if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then recall_docker; fi
 [ -n "$TUNNEL_ONLY" ] || TUNNEL_ONLY=0
 [ -n "$QUIC" ] || QUIC=0
+[ -n "$UPDATES" ] || UPDATES=registry
+case "$UPDATES" in registry|local|off) ;; *) die "--updates must be registry, local or off" ;; esac
 if [ "$TUNNEL_ONLY" = 1 ]; then
   # Nothing public: the console needs ssh -L, and HTTP-01 can't reach us.
   [ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=1
@@ -304,7 +337,7 @@ docker_install() {
   command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it (Linux: curl -fsSL https://get.docker.com | sudo sh)"
   docker info >/dev/null 2>&1 || die "Docker is not running (or this user may not use it: try sudo)"
   if [ "$UNINSTALL" = 1 ]; then
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    docker rm -f "$NAME" "$NAME-updater" "$NAME-updater-next" >/dev/null 2>&1 || true
     if [ "$PURGE" = 1 ]; then docker volume rm "$NAME-data" >/dev/null 2>&1 || true; say "Removed $NAME and its data."
     else say "Removed $NAME (data kept in Docker volume $NAME-data)."; fi
     return
@@ -351,7 +384,7 @@ docker_install() {
       --pids-limit 256 --memory 512m --tmpfs /tmp:rw,noexec,nosuid,size=16m \
       -v "$NAME-data:/var/lib/aegisnet" \
       -e AEGIS_PUBLIC_ADDRESSES="$addrs" -e AEGIS_PUBLIC_PORT="$EDGE_PORT" \
-      -e AEGIS_TUNNEL_ONLY="$TUNNEL_ONLY" \
+      -e AEGIS_TUNNEL_ONLY="$TUNNEL_ONLY" -e AEGIS_UPDATES="$UPDATES" \
       -p "$console_bind:$CONSOLE_PORT:8443" -p "$edge_bind:$EDGE_PORT:8444" $1 \
       "$IMAGE" >/dev/null 2>"$err"
   }
@@ -372,6 +405,7 @@ docker_install() {
   rm -f "$err"
   say "Waiting for the gateway to start…"
   wait_healthy docker exec "$NAME" aegisctl health || { docker logs --tail 20 "$NAME" >&2 || true; die "the gateway did not become healthy"; }
+  start_updater
   password=$(docker exec "$NAME" aegisctl initial-password 2>/dev/null || true)
   fingerprint=$(docker exec "$NAME" aegisctl console-fingerprint 2>/dev/null || echo unknown)
   print_summary "$password" "$fingerprint" "$addrs"

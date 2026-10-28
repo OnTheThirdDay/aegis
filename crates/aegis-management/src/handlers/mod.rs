@@ -54,6 +54,10 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
         .route("/api/v1/system/portal", put(appliance::put_portal))
         .route("/api/v1/system/quic", put(appliance::put_quic))
         .route(
+            "/api/v1/system/updates",
+            get(appliance::updates).post(appliance::post_updates),
+        )
+        .route(
             "/api/v1/system/device-ca/{action}",
             post(appliance::device_ca),
         )

@@ -823,6 +823,47 @@ fn cmd_bootstrap_owner(o: &Opts) -> Result<bool, String> {
     Ok(r.status == 201)
 }
 
+/// `aegisctl updater --container NAME --repository ghcr.io/OWNER/NAME
+/// [--data DIR] [--socket PATH] [--source registry|local] [--interval-hours N]`:
+/// the updater container's process (see `aegis-updater`). Runs until stopped.
+#[cfg(unix)]
+fn cmd_updater(o: &Opts) -> Result<bool, String> {
+    let repository = o.req("repository")?.to_ascii_lowercase();
+    let valid_repo = repository.split('/').count() == 3
+        && repository
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/'));
+    if !valid_repo {
+        return Err("--repository must look like ghcr.io/owner/name".into());
+    }
+    let source = match o.get("source").unwrap_or("registry") {
+        "registry" => aegis_updater::Source::Registry,
+        "local" => aegis_updater::Source::Local,
+        _ => return Err("--source must be registry or local".into()),
+    };
+    let hours: u64 = o
+        .get("interval-hours")
+        .unwrap_or("6")
+        .parse()
+        .ok()
+        .filter(|h| (1..=168).contains(h))
+        .ok_or("--interval-hours must be 1-168")?;
+    aegis_updater::run(aegis_updater::Options {
+        container: o.req("container")?.to_owned(),
+        repository,
+        data: o.get("data").unwrap_or("/var/lib/aegisnet").into(),
+        socket: o.get("socket").unwrap_or("/var/run/docker.sock").into(),
+        source,
+        interval: Duration::from_secs(hours * 3600),
+    })?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn cmd_updater(_o: &Opts) -> Result<bool, String> {
+    Err("the updater runs only in its Linux container".into())
+}
+
 fn run(args: &[String]) -> Result<bool, String> {
     let o = Opts::parse(args);
     if o.positional.is_empty() && o.get("version").is_some() {
@@ -831,6 +872,7 @@ fn run(args: &[String]) -> Result<bool, String> {
     }
     let cmd = o.positional.first().map(String::as_str).unwrap_or("");
     match cmd {
+        "updater" => cmd_updater(&o),
         "setup" | "provider" | "provision" | "local" | "config" | "certificate" => {
             provision::run(&o)
         }
