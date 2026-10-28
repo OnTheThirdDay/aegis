@@ -14,7 +14,9 @@
 //!   requests are refused.
 //! * Sign-in has its own rate limiter, so traffic on the portal can never
 //!   lock an administrator out of the console.
-//! * Bounded concurrency; idle connections close after a short timeout.
+//! * Bounded concurrency. A connection must send its request head within
+//!   20 s and its body within 30 s, and closes once nothing moves either way
+//!   for 30 s, so stalled clients can't hold the slots.
 
 use crate::handlers::devices::connection;
 use crate::http_util::{finish, ApiError};
@@ -37,6 +39,9 @@ pub(crate) struct PortalRequest;
 pub const MAX_CONNECTIONS: usize = 64;
 /// A connection whose request head hasn't arrived closes after this long.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
+/// A connection on which no byte moved in either direction for this long
+/// closes (a stalled body, or a client that stopped reading the response).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The routes a portal user needs, nothing else.
 fn allowed(method: &Method, path: &str) -> bool {
@@ -281,8 +286,112 @@ impl Server {
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(HEADER_TIMEOUT)
             .keep_alive(false)
-            .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+            .serve_connection(
+                hyper_util::rt::TokioIo::new(Idle::new(io, IDLE_TIMEOUT)),
+                service,
+            )
             .await;
+    }
+}
+
+/// A stream that fails with `TimedOut` once a read or write has waited
+/// `limit` since the last byte moved in either direction.
+struct Idle<I> {
+    io: I,
+    limit: Duration,
+    last: tokio::time::Instant,
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<I> Idle<I> {
+    fn new(io: I, limit: Duration) -> Self {
+        let last = tokio::time::Instant::now();
+        Idle {
+            io,
+            limit,
+            last,
+            timer: Box::pin(tokio::time::sleep_until(last + limit)),
+        }
+    }
+
+    fn progressed(&mut self) {
+        self.last = tokio::time::Instant::now();
+    }
+
+    /// Called while an operation is pending: an error once idle too long,
+    /// otherwise the timer is armed to wake the task at the deadline.
+    fn expired(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        let deadline = self.last + self.limit;
+        if self.timer.deadline() != deadline {
+            self.timer.as_mut().reset(deadline);
+        }
+        std::future::Future::poll(self.timer.as_mut(), cx).is_ready()
+    }
+}
+
+fn idle_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "connection idle")
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for Idle<I> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut this.io).poll_read(cx, buf) {
+            Poll::Ready(r) => {
+                if buf.filled().len() > before {
+                    this.progressed();
+                }
+                Poll::Ready(r)
+            }
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(idle_error())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for Idle<I> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.io).poll_write(cx, buf) {
+            Poll::Ready(r) => {
+                if matches!(r, Ok(n) if n > 0) {
+                    this.progressed();
+                }
+                Poll::Ready(r)
+            }
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(idle_error())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Pending if this.expired(cx) => Poll::Ready(Err(idle_error())),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
     }
 }
 
@@ -301,6 +410,22 @@ pub(crate) fn status_json(ctx: &ManagementContext) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_connection_times_out_but_a_moving_one_does_not() {
+        use tokio::io::AsyncReadExt;
+        let (a, mut b) = tokio::io::duplex(64);
+        let mut idle = Idle::new(a, Duration::from_secs(30));
+        let mut buf = [0u8; 8];
+        // Bytes every 20 s keep it alive.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            b.write_all(b"x").await.expect("write");
+            assert_eq!(idle.read(&mut buf).await.expect("read"), 1);
+        }
+        let err = idle.read(&mut buf).await.expect_err("stalled");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
 
     #[test]
     fn portal_addresses_carry_the_port_users_type() {

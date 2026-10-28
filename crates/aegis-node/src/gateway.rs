@@ -302,7 +302,7 @@ pub async fn serve(ctx: Arc<NodeContext>, inbound: InboundConfig, listener: TcpL
         let ctx = Arc::clone(&ctx);
         let ws_cfg = ws_cfg.clone();
         let inbound = Arc::clone(&inbound);
-        tokio::spawn(async move {
+        Arc::clone(&ctx).spawn_connection(async move {
             let _ = tcp.set_nodelay(true);
             handle_connection(ctx, inbound, ws_cfg, tcp, permit).await;
         });
@@ -447,7 +447,8 @@ async fn handle_connection(
                     let ctx = Arc::clone(&ctx);
                     let peer = Arc::clone(&peer);
                     let inbound_id = Arc::clone(&inbound_id);
-                    tokio::spawn(async move { handle_open(ctx, peer, inbound_id, open).await });
+                    Arc::clone(&ctx)
+                        .spawn_connection(async move { handle_open(ctx, peer, inbound_id, open).await });
                 }
                 None => break,
             },

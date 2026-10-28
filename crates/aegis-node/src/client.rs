@@ -569,7 +569,7 @@ pub async fn serve_socks(
         let ctx = Arc::clone(&ctx);
         let cfg = Arc::clone(&cfg);
         let id = Arc::clone(&id);
-        tokio::spawn(async move {
+        Arc::clone(&ctx).spawn_connection(async move {
             let _ = tcp.set_nodelay(true);
             let dest = match aegis_inbound_socks::handshake(&mut tcp, &cfg).await {
                 Ok(Command::Connect(dest)) => dest,
@@ -709,7 +709,7 @@ fn start_flow(
     }
     let (tx, rx) = tokio::sync::mpsc::channel(FLOW_QUEUE);
     flows.insert(dest.clone(), tx.clone());
-    tokio::spawn(udp_flow(
+    ctx.spawn_connection(udp_flow(
         Arc::clone(ctx),
         Arc::clone(inbound),
         Arc::clone(relay),
@@ -806,7 +806,7 @@ pub async fn serve_http(
         let ctx = Arc::clone(&ctx);
         let cfg = Arc::clone(&cfg);
         let id = Arc::clone(&id);
-        tokio::spawn(async move {
+        Arc::clone(&ctx).spawn_connection(async move {
             let _ = tcp.set_nodelay(true);
             let Ok((request, leftover)) = aegis_inbound_http::read_any(&mut tcp, &cfg).await else {
                 return;

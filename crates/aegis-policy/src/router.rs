@@ -108,7 +108,6 @@ pub struct DecisionInput<'a> {
 struct CompiledRule {
     spec: RuleSpec,
     class: RuleClass,
-    specificity: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -148,26 +147,69 @@ fn normalize_suffix(s: &str) -> Option<String> {
     normalize_domain(trimmed).ok()
 }
 
-fn specificity(m: &Matcher) -> (RuleClass, u32) {
-    if !m.domains.is_empty() {
-        (RuleClass::Domain, 4_000)
-    } else if !m.domain_suffixes.is_empty() {
-        let longest = m.domain_suffixes.iter().map(|s| s.len()).max().unwrap_or(0) as u32;
-        (RuleClass::Domain, 3_000 + longest)
+fn rule_class(m: &Matcher) -> RuleClass {
+    if m.has_name_criteria() {
+        RuleClass::Domain
     } else if !m.cidrs.is_empty() {
-        let longest = m
-            .cidrs
+        RuleClass::Cidr
+    } else if !m.nodes.is_empty() {
+        RuleClass::Identity
+    } else if !m.ports.is_empty() || !m.inbounds.is_empty() {
+        RuleClass::Other
+    } else {
+        RuleClass::Privacy
+    }
+}
+
+const EXACT_DOMAIN: u32 = 4_000;
+
+/// Specificity of a matching domain suffix (longer is more specific).
+fn suffix_specificity(suffix: &str) -> u32 {
+    3_000 + suffix.len() as u32
+}
+
+/// How specific `m`'s match on `input` is, judged by the element that
+/// matched: the exact name, else the longest suffix that matches, else the
+/// longest CIDR containing the address. Judging by a rule's longest element
+/// instead would let a broad entry (`com`, `0.0.0.0/0`) ride on a narrow one
+/// listed beside it and outrank a more specific rule. Only called for rules
+/// that match.
+fn match_specificity(m: &Matcher, input: &DecisionInput<'_>, resolved: Option<IpAddr>) -> u32 {
+    if m.has_name_criteria() {
+        let Host::Domain(d) = &input.destination.host else {
+            return 0;
+        };
+        if m.domains.iter().any(|x| x == d) {
+            return EXACT_DOMAIN;
+        }
+        return m
+            .domain_suffixes
             .iter()
-            .map(|n| u32::from(n.prefix_len()))
+            .filter(|s| d == *s || d.ends_with(&format!(".{s}")))
+            .map(|s| suffix_specificity(s))
             .max()
             .unwrap_or(0);
-        (RuleClass::Cidr, 2_000 + longest)
-    } else if !m.nodes.is_empty() {
-        (RuleClass::Identity, 1_500)
+    }
+    if !m.cidrs.is_empty() {
+        let ip = match &input.destination.host {
+            Host::Ip(ip) => Some(*ip),
+            Host::Domain(_) => resolved,
+        };
+        let longest = ip.and_then(|ip| {
+            m.cidrs
+                .iter()
+                .filter(|n| n.contains(&ip))
+                .map(|n| u32::from(n.prefix_len()))
+                .max()
+        });
+        return 2_000 + longest.unwrap_or(0);
+    }
+    if !m.nodes.is_empty() {
+        1_500
     } else if !m.ports.is_empty() || !m.inbounds.is_empty() {
-        (RuleClass::Other, 1_000)
+        1_000
     } else {
-        (RuleClass::Privacy, 100)
+        100
     }
 }
 
@@ -275,16 +317,12 @@ impl Router {
             } else {
                 canon.insert(key, (id.clone(), r.action, r.outbound.clone()));
             }
-            let (class, spec) = if r.action == RouteAction::Deny {
-                (RuleClass::ExplicitDeny, specificity(&r.matcher).1)
+            let class = if r.action == RouteAction::Deny {
+                RuleClass::ExplicitDeny
             } else {
-                specificity(&r.matcher)
+                rule_class(&r.matcher)
             };
-            compiled.push(CompiledRule {
-                spec: r,
-                class,
-                specificity: spec,
-            });
+            compiled.push(CompiledRule { spec: r, class });
         }
         // Equal specificity + equal priority + shared exact domain with
         // different outcome has no defined precedence: reject.
@@ -295,14 +333,14 @@ impl Router {
             .iter()
             .filter(|c| c.spec.action != RouteAction::Deny)
         {
-            for d in c
-                .spec
-                .matcher
+            let m = &c.spec.matcher;
+            let names = m
                 .domains
                 .iter()
-                .chain(c.spec.matcher.domain_suffixes.iter())
-            {
-                let k = (d.as_str(), c.specificity, c.spec.priority);
+                .map(|d| (d, EXACT_DOMAIN))
+                .chain(m.domain_suffixes.iter().map(|s| (s, suffix_specificity(s))));
+            for (d, specificity) in names {
+                let k = (d.as_str(), specificity, c.spec.priority);
                 if let Some((other, action, outbound)) = by_domain.get(&k) {
                     if *action != c.spec.action || **outbound != c.spec.outbound {
                         errors.push(err(
@@ -441,11 +479,9 @@ impl Router {
             .into_iter()
             .map(|i| &self.rules[i])
             .filter(|r| Self::matches(&r.spec.matcher, input, None))
-            .min_by(|a, b| {
-                b.specificity
-                    .cmp(&a.specificity)
-                    .then(a.spec.priority.cmp(&b.spec.priority))
-            })
+            .map(|r| (match_specificity(&r.spec.matcher, input, None), r))
+            .min_by(|(sa, a), (sb, b)| sb.cmp(sa).then(a.spec.priority.cmp(&b.spec.priority)))
+            .map(|(_, r)| r)
     }
 
     fn default_decision(&self) -> RouteDecision {
@@ -652,6 +688,79 @@ mod tests {
         assert_eq!(r.decide(&input(&d)).rule_id.as_deref(), Some("public"));
         let d = dest("1.1.1.1:443");
         assert_eq!(r.decide(&input(&d)).action, RouteAction::Proxy);
+    }
+
+    #[test]
+    fn a_broad_entry_does_not_borrow_a_narrow_entrys_rank() {
+        // A direct rule listing a broad suffix beside a long, unrelated one
+        // must not outrank a proxy rule for the destination's own domain.
+        let mut direct = rule(
+            "direct-mixed",
+            RouteAction::Direct,
+            Matcher {
+                domain_suffixes: vec!["com".into(), "a-very-long-unrelated-suffix.org".into()],
+                ..Default::default()
+            },
+        );
+        direct.outbound = Some("alt".into());
+        let proxy = rule(
+            "proxy-example",
+            RouteAction::Proxy,
+            Matcher {
+                domain_suffixes: vec!["example.com".into()],
+                ..Default::default()
+            },
+        );
+        let r = compile(vec![direct.clone(), proxy.clone()], RouteAction::Deny);
+        let d = dest("www.example.com:443");
+        let dec = r.decide(&input(&d));
+        assert_eq!(dec.rule_id.as_deref(), Some("proxy-example"));
+        assert_eq!(dec.action, RouteAction::Proxy);
+        // An exact name listed beside a suffix ranks only for that name.
+        let mut direct = rule(
+            "direct-exact-and-suffix",
+            RouteAction::Direct,
+            Matcher {
+                domains: vec!["other.net".into()],
+                domain_suffixes: vec!["com".into()],
+                ..Default::default()
+            },
+        );
+        direct.outbound = Some("alt".into());
+        let r = compile(vec![direct, proxy], RouteAction::Deny);
+        assert_eq!(
+            r.decide(&input(&d)).rule_id.as_deref(),
+            Some("proxy-example")
+        );
+        // CIDRs: a /8 listed beside an unrelated /32 ranks as a /8.
+        let mut direct = rule(
+            "direct-cidrs",
+            RouteAction::Direct,
+            Matcher {
+                cidrs: vec![
+                    "8.0.0.0/8".parse().expect("net"),
+                    "9.9.9.9/32".parse().expect("net"),
+                ],
+                ..Default::default()
+            },
+        );
+        direct.outbound = Some("alt".into());
+        let proxy = rule(
+            "proxy-net",
+            RouteAction::Proxy,
+            Matcher {
+                cidrs: vec!["8.8.8.0/24".parse().expect("net")],
+                ..Default::default()
+            },
+        );
+        let r = compile(vec![direct, proxy], RouteAction::Deny);
+        let d = dest("8.8.8.8:443");
+        assert_eq!(r.decide(&input(&d)).rule_id.as_deref(), Some("proxy-net"));
+        let d = dest("9.9.9.9:443");
+        assert_eq!(
+            r.decide(&input(&d)).rule_id.as_deref(),
+            Some("direct-cidrs")
+        );
     }
 
     #[test]

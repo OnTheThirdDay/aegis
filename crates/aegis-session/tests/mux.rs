@@ -1266,3 +1266,58 @@ async fn hundreds_of_idle_streams_fit_and_busy_ones_grow() {
     let _ = server;
     drop(idle);
 }
+
+/// A real client against a raw gateway.
+async fn raw_gateway() -> (Session, Raw) {
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let mut raw = Raw {
+        io: b,
+        dec: Decoder::new(65_536),
+        buf: BytesMut::new(),
+    };
+    let client = tokio::spawn(async move {
+        client_handshake(a, cfg("client-1"), Budget::root(64 << 20), obs()).await
+    });
+    let hello_frame = raw.recv().await.expect("hello");
+    assert_eq!(hello_frame.frame_type, FrameType::Hello);
+    raw.send(Frame::new(
+        FrameType::HelloAck,
+        0,
+        hello("gw-1").encode().expect("ack"),
+    ))
+    .await;
+    (client.await.expect("join").expect("client"), raw)
+}
+
+#[tokio::test]
+async fn an_open_cancelled_after_its_ack_releases_the_stream() {
+    let (client, mut raw) = raw_gateway().await;
+    let mut open = Box::pin(client.open(dest(), Duration::from_secs(5)));
+    // Poll once: the OPEN is registered and sent.
+    tokio::select! {
+        biased;
+        _ = &mut open => panic!("opened without an ACK"),
+        _ = tokio::task::yield_now() => {}
+    }
+    let o = raw.recv_significant().await.expect("open");
+    assert_eq!(o.frame_type, FrameType::Open);
+    raw.send(Frame::new(
+        FrameType::OpenAck,
+        o.stream_id,
+        OpenAck::Success.encode(),
+    ))
+    .await;
+    // The ACK is delivered to the waiting opener, which never looks again.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(open);
+    let reset = raw.recv_significant().await.expect("reset");
+    assert_eq!(reset.frame_type, FrameType::Reset);
+    raw.send(reset.with_flags(FLAG_RESET_ACK)).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while client.stream_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stream slot is released");
+}

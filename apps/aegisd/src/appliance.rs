@@ -179,15 +179,16 @@ fn put(store: &SecretStore, name: &str, value: &str) -> Result<(), String> {
         .map_err(|_| err("E_SECRET_WRITE"))
 }
 
-fn bundle(cert: &str, key: &str) -> String {
-    json!({"certificate": format!("secret://{cert}"), "private_key": format!("secret://{key}")})
-        .to_string()
-}
+/// Held across every read-modify-write of a certificate manifest, so two
+/// updaters (a renewal and the ACME integration) can't lose each other's
+/// fields.
+pub static MANIFEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Publish a certificate/key pair crash-safely: write generation-named
 /// files, then atomically replace the manifest that references them, then
 /// remove the previous generation. An interruption leaves the old, still
-/// consistent pair active.
+/// consistent pair active. Other manifest fields (the edge's ACME SNI
+/// alternates) are kept.
 pub fn publish_pair(
     secrets: &SecretStore,
     manifest: &str,
@@ -198,13 +199,20 @@ pub fn publish_pair(
     let generation = &aegis_storage::sha256_hex(cert.as_bytes())[..16];
     let cert_file = format!("{prefix}-{generation}.pem");
     let key_file = format!("{prefix}-{generation}.key");
+    let _lock = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let previous: Option<serde_json::Value> = secrets
         .read(manifest)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
     put(secrets, &cert_file, cert)?;
     put(secrets, &key_file, key)?;
-    put(secrets, manifest, &bundle(&cert_file, &key_file))?;
+    let mut next = previous
+        .clone()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    next["certificate"] = json!(format!("secret://{cert_file}"));
+    next["private_key"] = json!(format!("secret://{key_file}"));
+    put(secrets, manifest, &next.to_string())?;
     if let Some(prev) = previous {
         for field in ["certificate", "private_key"] {
             if let Some(name) = prev[field]
@@ -639,6 +647,32 @@ mod tests {
         assert_eq!(
             init(&root, &opts).expect_err("populated"),
             "E_DATA_DIR_NOT_EMPTY"
+        );
+    }
+
+    #[test]
+    fn republishing_the_edge_pair_keeps_the_acme_alternates() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let secrets = SecretStore::open(dir.path().join("secrets")).expect("secrets");
+        publish_pair(&secrets, "edge-tls.json", "edge", "CERT-1", "KEY-1").expect("first");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&secrets.read("edge-tls.json").expect("read")).expect("json");
+        let alternates = json!([{
+            "server_names": ["gw.example.com"],
+            "certificate": "secret://acme-1.pem",
+            "private_key": "secret://acme-1.key",
+        }]);
+        manifest["alternates"] = alternates.clone();
+        secrets
+            .put("edge-tls.json", &manifest.to_string(), true)
+            .expect("put");
+        publish_pair(&secrets, "edge-tls.json", "edge", "CERT-2", "KEY-2").expect("renew");
+        let after: serde_json::Value =
+            serde_json::from_str(&secrets.read("edge-tls.json").expect("read")).expect("json");
+        assert_eq!(after["alternates"], alternates);
+        assert_eq!(
+            manifest_certificate(&secrets, "edge-tls.json").as_deref(),
+            Some("CERT-2")
         );
     }
 

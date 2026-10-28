@@ -41,6 +41,6 @@ argon2 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros", "io-util"] }
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros", "io-util", "test-util"] }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }

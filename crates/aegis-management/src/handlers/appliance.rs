@@ -467,10 +467,9 @@ pub async fn downloads(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult 
             let digest = match cached {
                 Some(d) => d,
                 None => {
-                    let Ok(bytes) = std::fs::read(entry.path()) else {
+                    let Ok(d) = file_sha256(&entry.path()) else {
                         continue;
                     };
-                    let d = db::sha256_hex(&bytes);
                     c.download_digests
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -509,11 +508,20 @@ pub async fn download_file(
     if !meta.is_file() || meta.len() > MAX_DOWNLOAD_BYTES {
         return Err(ApiError::not_found());
     }
-    let bytes = tokio::fs::read(&path)
+    let file = tokio::fs::File::open(&path)
         .await
         .map_err(|_| ApiError::not_found())?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::not_found())?
+        .len();
+    if len > MAX_DOWNLOAD_BYTES {
+        return Err(ApiError::not_found());
+    }
     let disposition = format!("attachment; filename=\"{name}\"");
-    let mut resp = axum::response::Response::new(axum::body::Body::from(bytes));
+    // Streamed from disk: a download holds one chunk, not the whole file.
+    let mut resp = axum::response::Response::new(axum::body::Body::new(FileBody::new(file, len)));
     let h = resp.headers_mut();
     // Phones offer to install an APK only with its own media type.
     let content_type = if name.ends_with(".apk") {
@@ -531,9 +539,120 @@ pub async fn download_file(
     Ok(resp)
 }
 
+/// SHA-256 of a file, read in chunks.
+fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; FILE_CHUNK];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hex::encode(hasher.finalize()));
+        }
+        hasher.update(&buf[..n]);
+    }
+}
+
+const FILE_CHUNK: usize = 64 * 1024;
+
+/// A response body read from a file of known length, one chunk at a time.
+struct FileBody {
+    file: tokio::fs::File,
+    remaining: u64,
+    buf: Box<[u8]>,
+}
+
+impl FileBody {
+    fn new(file: tokio::fs::File, len: u64) -> Self {
+        FileBody {
+            file,
+            remaining: len,
+            buf: vec![0u8; FILE_CHUNK].into_boxed_slice(),
+        }
+    }
+}
+
+impl hyper::body::Body for FileBody {
+    type Data = axum::body::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        use tokio::io::AsyncRead;
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+        let want = this
+            .buf
+            .len()
+            .min(usize::try_from(this.remaining).unwrap_or(usize::MAX));
+        let mut rb = tokio::io::ReadBuf::new(&mut this.buf[..want]);
+        match std::pin::Pin::new(&mut this.file).poll_read(cx, &mut rb) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    // The file shrank under us: end with an error, not a
+                    // short body that looks complete.
+                    return Poll::Ready(Some(Err(std::io::ErrorKind::UnexpectedEof.into())));
+                }
+                this.remaining -= n as u64;
+                let data = axum::body::Bytes::copy_from_slice(rb.filled());
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(data))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.remaining)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn downloads_stream_in_chunks_and_hash_incrementally() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("aegis-client-linux-x86_64");
+        let data: Vec<u8> = (0..(3 * FILE_CHUNK + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&path, &data).expect("write");
+        assert_eq!(file_sha256(&path).expect("hash"), db::sha256_hex(&data));
+        let file = tokio::fs::File::open(&path).await.expect("open");
+        let mut body = FileBody::new(file, data.len() as u64);
+        assert_eq!(
+            hyper::body::Body::size_hint(&body).exact(),
+            Some(data.len() as u64)
+        );
+        let mut got = Vec::new();
+        let mut frames = 0;
+        while let Some(frame) = std::future::poll_fn(|cx| {
+            hyper::body::Body::poll_frame(std::pin::Pin::new(&mut body), cx)
+        })
+        .await
+        {
+            let chunk = frame.expect("frame").into_data().expect("data");
+            assert!(chunk.len() <= FILE_CHUNK);
+            got.extend_from_slice(&chunk);
+            frames += 1;
+        }
+        assert_eq!(got, data);
+        assert_eq!(frames, 4);
+    }
 
     #[test]
     fn download_labels() {
