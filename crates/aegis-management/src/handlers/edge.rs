@@ -92,7 +92,7 @@ pub(crate) async fn redeem(
         }
         if store
             .read(|c| db::get_node_by_name(c, &b.node_name))?
-            .is_some()
+            .is_some_and(|n| n.status != "revoked")
         {
             return Err(ApiError::conflict("node_name_exists"));
         }
@@ -125,7 +125,11 @@ pub(crate) async fn redeem(
         let node_id = db::new_id();
         store.tx(|c| {
             // Repeat the name check in the transaction: concurrent redeemers
-            // cannot replace one another's device binding.
+            // cannot replace one another's device binding. A revoked
+            // device's record gives up its name.
+            if !db::release_revoked_name(c, &b.node_name)? {
+                return Err(db::StoreError::Conflict("node name exists".into()));
+            }
             db::insert_node(
                 c,
                 &db::NodeRow {

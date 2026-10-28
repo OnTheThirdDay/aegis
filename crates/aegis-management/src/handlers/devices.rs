@@ -273,7 +273,8 @@ pub async fn invite(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> A
     let name = b.name.clone();
     blocking(move || {
         c.coord.store().tx(|c| {
-            if db::get_node_by_name(c, &name)?.is_some() {
+            // A revoked device's name can be used again.
+            if !db::release_revoked_name(c, &name)? {
                 return Err(db::StoreError::Conflict("node name exists".into()));
             }
             let pending: i64 = c.query_row(

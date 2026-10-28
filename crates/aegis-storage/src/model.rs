@@ -625,6 +625,35 @@ pub fn get_node_by_name(c: &Connection, name: &str) -> Result<Option<NodeRow>> {
     .optional()?)
 }
 
+/// Free `name` for a new device when the device holding it was revoked:
+/// that record is renamed `<name>.revoked-<id>` (still listed, with its
+/// revoked certificates and history). Returns whether the name is free now
+/// (false: a device that isn't revoked uses it).
+pub fn release_revoked_name(c: &Connection, name: &str) -> Result<bool> {
+    let Some(node) = get_node_by_name(c, name)? else {
+        return Ok(true);
+    };
+    if node.status != "revoked" {
+        return Ok(false);
+    }
+    let suffix = format!(
+        ".revoked-{}",
+        node.id
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(8)
+            .collect::<String>()
+    );
+    // Node names are at most 64 characters.
+    let keep = name.len().min(64 - suffix.len());
+    let renamed = format!("{}{suffix}", &name[..keep]);
+    c.execute(
+        "UPDATE nodes SET name = ?2 WHERE id = ?1",
+        (&node.id, &renamed),
+    )?;
+    Ok(true)
+}
+
 pub fn list_nodes(
     c: &Connection,
     after: Option<(i64, String)>,
@@ -1234,6 +1263,45 @@ pub fn list_audit(c: &Connection, before_seq: Option<i64>, limit: u32) -> Result
 mod tests {
     use super::*;
     use crate::Store;
+
+    #[test]
+    fn a_revoked_devices_name_can_be_used_again() {
+        let s = Store::open_in_memory().expect("store");
+        let node = |id: &str, name: &str| NodeRow {
+            id: id.into(),
+            name: name.into(),
+            role: "client".into(),
+            cert_fingerprint: None,
+            cert_serial: None,
+            status: "active".into(),
+            generation: 1,
+            not_after: None,
+            created_at: 0,
+        };
+        s.tx(|c| {
+            assert!(release_revoked_name(c, "phone")?, "unused name");
+            insert_node(c, &node("n-1", "phone"))?;
+            assert!(
+                !release_revoked_name(c, "phone")?,
+                "an active device keeps it"
+            );
+            set_node_status(c, "n-1", "revoked", 1)?;
+            assert!(release_revoked_name(c, "phone")?);
+            assert!(get_node_by_name(c, "phone")?.is_none());
+            let old = get_node(c, "n-1")?;
+            assert_eq!(old.name, "phone.revoked-n1");
+            assert_eq!(old.status, "revoked");
+            insert_node(c, &node("n-2", "phone"))?;
+            // A name at the length limit still fits with the suffix.
+            let long = "x".repeat(64);
+            insert_node(c, &node("n-3", &long))?;
+            set_node_status(c, "n-3", "revoked", 1)?;
+            assert!(release_revoked_name(c, &long)?);
+            assert!(get_node(c, "n-3")?.name.len() <= 64);
+            Ok(())
+        })
+        .expect("tx");
+    }
 
     #[test]
     fn audit_is_append_only() {
