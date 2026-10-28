@@ -310,7 +310,10 @@ print_summary() { # password fingerprint addresses
   say "  its own. Check its SHA-256 fingerprint matches:"
   say "      $2"
   say ""
-  if [ "$TUNNEL_ONLY" = 1 ]; then
+  if [ "$TUNNEL_ONLY" = 1 ] && [ "$QUIC" = 1 ]; then
+    say "  TCP stays on this machine: devices connect through Cloudflare Tunnel (set it"
+    say "  up in the console under Connectivity), and use direct QUIC where UDP gets through."
+  elif [ "$TUNNEL_ONLY" = 1 ]; then
     say "  Nothing on this server is reachable from the internet. Devices connect through"
     say "  Cloudflare Tunnel: set it up in the console under Connectivity."
   else
@@ -319,8 +322,10 @@ print_summary() { # password fingerprint addresses
     say "  install with --tunnel-only to keep this port off the network)."
   fi
   if [ "$QUIC" = 1 ]; then
-    say "  Direct QUIC: UDP port $EDGE_PORT is published. Forward it on your router if"
-    say "  needed, then turn QUIC on in the console under Connectivity."
+    say "  Direct QUIC: UDP port $EDGE_PORT is open to the internet. Allow it in this"
+    say "  server's firewall (and the cloud provider's security group, or forward it on"
+    say "  your router at home), then turn QUIC on in the console under Connectivity."
+    say "  Devices fall back to the tunnel where UDP is blocked."
   fi
   say ""
 }

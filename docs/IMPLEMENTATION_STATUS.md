@@ -1,10 +1,11 @@
 # Implementation status and test traceability
 
-Evidence base: developer runs on WSL2 Ubuntu 22.04 x86_64, Rust 1.97.1, 2026-10-25.
+Evidence base: developer runs on WSL2 Ubuntu 22.04 x86_64, Rust 1.97.1, 2026-10-28.
 
-- `cargo test --workspace`: 153 tests, all passing. The concurrency-sensitive suites (session, node, core, management) also passed 15 consecutive loops with no failures.
-- `cargo clippy --workspace --all-targets -D warnings`: clean.
-- `xtask arch-check`: clean, including its self-test.
+- `cargo test --workspace`: 316 tests, all passing. The concurrency-sensitive suites (session, node, core, management) passed 15 consecutive loops with no failures on 2026-10-25.
+- `cargo clippy --workspace --all-targets -D warnings`: clean; the desktop VPN helper also for the Windows and macOS targets.
+- `cargo check --workspace --target x86_64-pc-windows-gnu`: clean.
+- `xtask arch-check`: clean, including its self-test. `cargo deny check`: no errors.
 - A binary smoke test also passed (two `aegisd` processes plus `aegisctl` and `curl`).
 
 These are **development results, not release-gate evidence** (07 §14). None of the following has been done:
@@ -28,7 +29,7 @@ Status legend:
 |---|---|---|
 | S-001 spike | BLOCKED | No Pi or Cloudflare access. The production path was exercised locally instead (`aegis-node/tests/e2e.rs`). |
 | A-001 workspace | PASS (dev) | `Cargo.toml`, `rust-toolchain.toml` pinned to 1.97.1, `Cargo.lock`. Feature flags are not yet split per role. |
-| A-002 architecture rules | PASS (dev) | `xtask arch-check`: 32 rules plus the `forbid(unsafe_code)` policy, and a self-test that injects a forbidden edge. |
+| A-002 architecture rules | PASS (dev) | `xtask arch-check`: 37 rules plus the `forbid(unsafe_code)` policy (platform-boundary crates `aegis-mobile` and `aegis-vpn` deny it and allow it item by item), and a self-test that injects a forbidden edge. |
 | A-003 dependency intake | PARTIAL | `docs/DEPENDENCIES.md`, `deny.toml`. The review sign-off is pending, and no approval-metadata gate exists. |
 | A-004 packaging | PARTIAL | `deploy/Dockerfile` (rootless, uid 10001), `deploy/systemd/aegisd.service`. Not built or run; base image digests are not pinned. |
 | A-005 CI | PARTIAL | `.github/workflows/ci.yml`. It has not been run; action SHAs are not pinned; lab and protected environments are not provisioned. |
@@ -49,13 +50,14 @@ Status legend:
 | D-003 gateway egress | PASS (dev) | `aegis-policy::address`, `aegis-outbound-direct`. Per-user/network rate quotas are not implemented. |
 | D-004 DNS | PASS (dev) for M1 | `aegis-dns`: explicit resolvers, no fallback, IPv6 policy. Split DNS (M3/M4) is NOT IMPL. |
 | D-005 route engine | PASS (dev) | `aegis-policy::router`. |
-| D-006 – D-010 System-VPN native | NOT IMPL / BLOCKED | See the TC-V rows. Policy compilation (part of D-009) is implemented. A plain desktop system VPN (global mode, no per-app rules or kill switch) exists outside the managed profile section: [ADR-0015](adr/0015-desktop-system-vpn.md), dev tests only, not run on real machines. |
+| D-006 – D-010 System-VPN native | NOT IMPL / BLOCKED | See the TC-V rows. Policy compilation (part of D-009) is implemented. A plain desktop system VPN (global mode, Windows DNS leak protection, optional kill switch; no per-app rules) exists outside the managed profile section: [ADR-0015](adr/0015-desktop-system-vpn.md), dev tests against a fake system only, not run on real machines. |
 | E-001 SQLite store | PASS (dev) | `aegis-storage`. Encrypted backups are NOT IMPL. |
 | E-002 auth/bootstrap | PASS (dev) | `aegis-management::auth`. MFA/passkeys (P1) are NOT IMPL. |
 | E-003 REST API | PARTIAL | All OpenAPI paths are implemented. There is no generated client and no automated OpenAPI schema-fixture validation. |
 | E-004 web console | PARTIAL | `apps/aegis-ui`: status, validate/diff/activate, enroll/revoke and audit. No browser automation; English only. |
 | E-005 enrollment | PASS (dev) for M1 | CSR enrollment with one-use invitations. Managed CA rotation is NOT IMPL. |
-| E-006 native shells | NOT IMPL | |
+| E-006 native shells | PARTIAL | Portable desktop client (`apps/aegis-client`, Windows, macOS DMG, Linux) with an optional system VPN helper (ADR-0015); Android app (Flutter UI on the Rust core, ADR-0011). iOS is NOT IMPL (needs an Apple Developer ID for the packet tunnel). |
+| Console upgrades | PASS (dev) | `aegis-updater` and `aegisctl updater` ([ADR-0014](adr/0014-console-upgrades.md)): recreate with the same settings, health-checked, rollback, self-update; tested against a fake Docker engine and end to end through the console API (`aegisd/tests/appliance.rs`). Not run against a real Docker daemon. |
 | F-001 / F-002 telemetry | PARTIAL | Noop default, local counters, coarse OTLP/JSON export. Not tested against a stock Collector. |
 | F-003 SemConv gate | PARTIAL | The catalog mirror is checked against the spec YAML; the allowlist is enforced pre-serialization. |
 | F-004 diagnostics | PARTIAL | Explain API and local diagnostic ring. Support-bundle export is NOT IMPL. |
@@ -139,7 +141,7 @@ Status legend:
 
 | ID | Status | Evidence |
 |---|---|---|
-| TC-V01, TC-V05 – TC-V12 | BLOCKED | No native capture, app identity, helper or kill switch exists. |
+| TC-V01, TC-V05 – TC-V12 | BLOCKED | The managed modes have no native enforcement: no app identity or per-app capture. The plain desktop VPN's capture, privileged helper and kill switch (ADR-0015) are tested against a fake system only. |
 | TC-V02 – TC-V04 | PARTIAL | Synthetic policy logic only (`aegis-traffic-policy` tests). Native evidence is BLOCKED. |
 | TC-V13 | PASS (dev) | `api.rs::tc_v13_vpn_surface_is_read_only_and_honest`. |
 | TC-V14 | PARTIAL | `coarse_export` contains only the 4 metrics. No 100k-flow capture test (there is no capture). |
