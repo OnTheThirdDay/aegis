@@ -39,6 +39,9 @@
 #   --uninstall        remove the container (keeps data unless --purge)
 #   --purge            with --uninstall: also delete all gateway data
 set -eu
+# Keep the code ASCII (comments may not be): macOS runs this with bash 3.2,
+# which under sudo (C locale) reads a byte of a non-ASCII character after
+# "$NAME" as part of the variable name ("NAME?: unbound variable").
 
 # Stamped when the image is built: the image this copy installs by default.
 # Unstamped copies (from the source tree) use :latest.
@@ -285,7 +288,7 @@ docker_install() {
   if [ -n "$FROM" ]; then
     [ -f "$FROM/Dockerfile" ] || die "--from: $FROM/Dockerfile missing"
     IMAGE=${IMAGE:-aegisnet/gateway:local}
-    say "Building $IMAGE from $FROM…"
+    say "Building $IMAGE from $FROM..."
     docker build -q --build-arg TARGETARCH="$(host_arch)" -t "$IMAGE" "$FROM" >/dev/null
   else
     if [ -z "$IMAGE" ]; then
@@ -297,7 +300,7 @@ docker_install() {
         IMAGE="ghcr.io/$LOWER_REPO:latest"
       fi
     fi
-    say "Pulling $IMAGE…"
+    say "Pulling $IMAGE..."
     docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
   fi
   docker volume create "$NAME-data" >/dev/null
@@ -329,7 +332,7 @@ docker_install() {
     fi
   fi
   rm -f "$err"
-  say "Waiting for the gateway to start…"
+  say "Waiting for the gateway to start..."
   wait_healthy docker exec "$NAME" aegisctl health || { docker logs --tail 20 "$NAME" >&2 || true; die "the gateway did not become healthy"; }
   password=$(docker exec "$NAME" aegisctl initial-password 2>/dev/null || true)
   fingerprint=$(docker exec "$NAME" aegisctl console-fingerprint 2>/dev/null || echo unknown)
