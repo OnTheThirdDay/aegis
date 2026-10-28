@@ -229,6 +229,16 @@ The settings live in the gateway's container. After `--uninstall` they are gone;
 - **A specific version:** `sudo sh install.sh --version vX.Y.Z`.
 - **The pre-release test build:** `sudo sh install.sh --image ghcr.io/onthethirdday/aegis:staging`. Use this only on test servers. The image is not remembered: the next plain upgrade goes back to the release.
 
+**Servers with slow or no access to ghcr.io** (for example in mainland China): copy the image from a server that has it, keeping its version tag, then run the installer from that image. A release version already on the machine is used without contacting the registry:
+
+```sh
+# on a server that has it (VERSION as in the release, e.g. 0.7.0)
+docker save ghcr.io/onthethirdday/aegis:VERSION | gzip -1 | ssh root@other-server 'docker load'
+# on the other server
+docker run --rm --pull never --entrypoint cat   ghcr.io/onthethirdday/aegis:VERSION /usr/share/aegisnet/install.sh > install.sh
+sudo sh install.sh
+```
+
 ### Cloudflare connector updates
 
 With Cloudflare Tunnel, the gateway runs Cloudflare's connector, `cloudflared`, and keeps it up to date by itself. Once a week, and each time the gateway starts, it checks cloudflared's latest release on GitHub.
