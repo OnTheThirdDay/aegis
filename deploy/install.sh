@@ -25,6 +25,12 @@
 #   --tunnel-only      nothing public: console and device port on this machine
 #                      only, no HTTP-01 port; devices use Cloudflare Tunnel
 #   --direct           undo --tunnel-only on an upgrade
+#   --quic             also publish UDP on the device port number, for direct
+#                      QUIC (turn it on in the console under Connectivity)
+#   --no-quic          undo --quic on an upgrade
+#   --updates SOURCE   upgrades from the console: registry (default: newest
+#                      release from ghcr.io), local (only images copied to this
+#                      server, e.g. by another server), or off (no updater)
 #   --console-port N   host port of the HTTPS console        (default 8443)
 #   --port N           host port devices connect to           (default 443)
 #   --http-port N      host port for Let's Encrypt HTTP-01    (default 80; 0 = none)
@@ -39,6 +45,9 @@
 #   --uninstall        remove the container (keeps data unless --purge)
 #   --purge            with --uninstall: also delete all gateway data
 set -eu
+# Keep the code ASCII (comments may not be): macOS runs this with bash 3.2,
+# which under sudo (C locale) reads a byte of a non-ASCII character after
+# "$NAME" as part of the variable name ("NAME?: unbound variable").
 
 # Stamped when the image is built: the image this copy installs by default.
 # Unstamped copies (from the source tree) use :latest.
@@ -53,6 +62,8 @@ HTTP_PORT=""
 ADDRESSES=""
 LOCAL_CONSOLE=""
 TUNNEL_ONLY=""
+QUIC=""
+UPDATES=""
 FRESH=0
 UNINSTALL=0
 PURGE=0
@@ -73,6 +84,9 @@ while [ $# -gt 0 ]; do
     --public-console) LOCAL_CONSOLE=0; shift ;;
     --tunnel-only) TUNNEL_ONLY=1; shift ;;
     --direct) TUNNEL_ONLY=0; shift ;;
+    --quic) QUIC=1; shift ;;
+    --no-quic) QUIC=0; shift ;;
+    --updates) UPDATES=${2:?}; shift 2 ;;
     --fresh) FRESH=1; shift ;;
     --name) NAME=${2:?}; shift 2 ;;
     --version) VERSION=${2:?}; shift 2 ;;
@@ -113,6 +127,7 @@ recall_docker() {
           if [ "$host_ip" = 127.0.0.1 ]; then TUNNEL_ONLY=1; else TUNNEL_ONLY=0; fi
         fi ;;
       8080/tcp) http_seen=1; if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$host_port; fi ;;
+      8444/udp) if [ -z "$QUIC" ]; then QUIC=1; fi ;;
     esac
   done
   if [ -z "$HTTP_PORT" ] && [ "$http_seen" = 0 ]; then HTTP_PORT=0; fi
@@ -120,7 +135,33 @@ recall_docker() {
     ADDRESSES=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
       | sed -n 's/^AEGIS_PUBLIC_ADDRESSES=//p' | head -n 1)
   fi
+  if [ -z "$UPDATES" ]; then
+    UPDATES=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+      | sed -n 's/^AEGIS_UPDATES=//p' | head -n 1)
+  fi
   RECALLED=1
+}
+
+# The updater: a second container from the same image that upgrades the
+# gateway when asked from the console. It holds the Docker socket (which is
+# root-equivalent on this machine) and so has no network listener; it only
+# reads requests from, and reports to, files in the data volume. It runs as
+# root to use the socket, with no capabilities except reading and writing
+# the gateway's files (DAC_OVERRIDE) and giving its own back to it (CHOWN).
+start_updater() {
+  docker rm -f "$NAME-updater" "$NAME-updater-next" >/dev/null 2>&1 || true
+  [ "$UPDATES" = off ] && return 0
+  sock=/var/run/docker.sock
+  [ -S "$sock" ] || { say "No Docker socket at $sock: upgrades from the console are off."; return 0; }
+  if ! docker run -d --name "$NAME-updater" --restart unless-stopped \
+      --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add CHOWN \
+      --security-opt no-new-privileges --pids-limit 64 --memory 64m \
+      --no-healthcheck --network none --user 0:0 \
+      -v "$sock:/var/run/docker.sock" -v "$NAME-data:/var/lib/aegisnet" \
+      --entrypoint /usr/local/bin/aegisctl "$IMAGE" \
+      updater --container "$NAME" --repository "ghcr.io/$LOWER_REPO" --source "$UPDATES" >/dev/null 2>&1; then
+    say "Could not start the updater; upgrades from the console are off (the gateway runs normally)."
+  fi
 }
 
 instance_exists() {
@@ -141,6 +182,20 @@ port_busy() {
   fi
 }
 
+# Whether image reference $1 ends in a release version tag (:1.2.3).
+is_release_tag() {
+  tag=${1##*:}
+  case "$1" in *:*) ;; *) return 1 ;; esac
+  case "$tag" in
+    *[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+  case "$tag" in
+    *.*.*.*) return 1 ;;
+    *.*.*) return 0 ;;
+  esac
+  return 1
+}
+
 # First free port of the candidates (the first one when none is free).
 pick_port() {
   for candidate in "$@"; do
@@ -151,6 +206,9 @@ pick_port() {
 
 if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then recall_docker; fi
 [ -n "$TUNNEL_ONLY" ] || TUNNEL_ONLY=0
+[ -n "$QUIC" ] || QUIC=0
+[ -n "$UPDATES" ] || UPDATES=registry
+case "$UPDATES" in registry|local|off) ;; *) die "--updates must be registry, local or off" ;; esac
 if [ "$TUNNEL_ONLY" = 1 ]; then
   # Nothing public: the console needs ssh -L, and HTTP-01 can't reach us.
   [ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=1
@@ -178,6 +236,7 @@ describe_settings() {
   console_where="reachable from the network"; [ "$LOCAL_CONSOLE" = 1 ] && console_where="this machine only"
   devices_where="all addresses"; [ "$TUNNEL_ONLY" = 1 ] && devices_where="this machine only; devices use Cloudflare Tunnel"
   say "  console port $CONSOLE_PORT ($console_where); device port $EDGE_PORT ($devices_where); HTTP validation port $HTTP_PORT (0 = none)"
+  if [ "$QUIC" = 1 ]; then say "  direct QUIC: UDP port $EDGE_PORT (published)"; fi
   if [ -n "$ADDRESSES" ]; then say "  addresses $ADDRESSES"; fi
 }
 if [ "$UNINSTALL" = 0 ]; then
@@ -259,6 +318,10 @@ print_summary() { # password fingerprint addresses
     say "  port in your firewall, or set up Cloudflare Tunnel in the console (no open ports;"
     say "  install with --tunnel-only to keep this port off the network)."
   fi
+  if [ "$QUIC" = 1 ]; then
+    say "  Direct QUIC: UDP port $EDGE_PORT is published. Forward it on your router if"
+    say "  needed, then turn QUIC on in the console under Connectivity."
+  fi
   say ""
 }
 
@@ -277,7 +340,7 @@ docker_install() {
   command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it (Linux: curl -fsSL https://get.docker.com | sudo sh)"
   docker info >/dev/null 2>&1 || die "Docker is not running (or this user may not use it: try sudo)"
   if [ "$UNINSTALL" = 1 ]; then
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    docker rm -f "$NAME" "$NAME-updater" "$NAME-updater-next" >/dev/null 2>&1 || true
     if [ "$PURGE" = 1 ]; then docker volume rm "$NAME-data" >/dev/null 2>&1 || true; say "Removed $NAME and its data."
     else say "Removed $NAME (data kept in Docker volume $NAME-data)."; fi
     return
@@ -285,7 +348,7 @@ docker_install() {
   if [ -n "$FROM" ]; then
     [ -f "$FROM/Dockerfile" ] || die "--from: $FROM/Dockerfile missing"
     IMAGE=${IMAGE:-aegisnet/gateway:local}
-    say "Building $IMAGE from $FROM…"
+    say "Building $IMAGE from $FROM..."
     docker build -q --build-arg TARGETARCH="$(host_arch)" -t "$IMAGE" "$FROM" >/dev/null
   else
     if [ -z "$IMAGE" ]; then
@@ -297,8 +360,20 @@ docker_install() {
         IMAGE="ghcr.io/$LOWER_REPO:latest"
       fi
     fi
-    say "Pulling $IMAGE…"
-    docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
+    # A release tag (X.Y.Z) never changes, so one already on this machine
+    # (pulled before, or copied here from another server) is used without
+    # asking the registry. Moving tags (latest, staging) are pulled; if the
+    # registry can't be reached, a copy already here is used.
+    if is_release_tag "$IMAGE" && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+      say "Using $IMAGE (already on this machine)."
+    else
+      say "Pulling $IMAGE..."
+      if ! docker pull -q "$IMAGE" >/dev/null; then
+        docker image inspect "$IMAGE" >/dev/null 2>&1 \
+          || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
+        say "Could not reach the registry; using the copy of $IMAGE already on this machine."
+      fi
+    fi
   fi
   docker volume create "$NAME-data" >/dev/null
   docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -313,24 +388,28 @@ docker_install() {
       --pids-limit 256 --memory 512m --tmpfs /tmp:rw,noexec,nosuid,size=16m \
       -v "$NAME-data:/var/lib/aegisnet" \
       -e AEGIS_PUBLIC_ADDRESSES="$addrs" -e AEGIS_PUBLIC_PORT="$EDGE_PORT" \
-      -e AEGIS_TUNNEL_ONLY="$TUNNEL_ONLY" \
+      -e AEGIS_TUNNEL_ONLY="$TUNNEL_ONLY" -e AEGIS_UPDATES="$UPDATES" \
       -p "$console_bind:$CONSOLE_PORT:8443" -p "$edge_bind:$EDGE_PORT:8444" $1 \
       "$IMAGE" >/dev/null 2>"$err"
   }
-  extra=""; [ "$HTTP_PORT" != 0 ] && extra="-p $HTTP_PORT:8080"
+  # Direct QUIC is reached on UDP even when TCP stays local (--tunnel-only):
+  # Cloudflare can't carry it.
+  quic_publish=""; [ "$QUIC" = 1 ] && quic_publish="-p 0.0.0.0:$EDGE_PORT:8444/udp"
+  extra="$quic_publish"; [ "$HTTP_PORT" != 0 ] && extra="$extra -p $HTTP_PORT:8080"
   if ! run "$extra"; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     if [ -n "$extra" ] && grep -qiE 'port is already allocated|address already in use' "$err"; then
       say "Port $HTTP_PORT is in use; continuing without Let's Encrypt HTTP validation (DNS validation still works)."
-      run "" || { cat "$err" >&2; rm -f "$err"; die "could not start the container"; }
+      run "$quic_publish" || { cat "$err" >&2; rm -f "$err"; die "could not start the container"; }
     else
       cat "$err" >&2; rm -f "$err"
       die "could not start the container (port $CONSOLE_PORT or $EDGE_PORT in use? try --console-port / --port)"
     fi
   fi
   rm -f "$err"
-  say "Waiting for the gateway to start…"
+  say "Waiting for the gateway to start..."
   wait_healthy docker exec "$NAME" aegisctl health || { docker logs --tail 20 "$NAME" >&2 || true; die "the gateway did not become healthy"; }
+  start_updater
   password=$(docker exec "$NAME" aegisctl initial-password 2>/dev/null || true)
   fingerprint=$(docker exec "$NAME" aegisctl console-fingerprint 2>/dev/null || echo unknown)
   print_summary "$password" "$fingerprint" "$addrs"

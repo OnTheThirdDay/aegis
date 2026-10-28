@@ -87,6 +87,7 @@ pub fn registry(os: OsFamily) -> Registry {
     let mut r = Registry::new(os);
     for d in [
         aegis_transport_ws::DESCRIPTOR,
+        aegis_transport_quic::DESCRIPTOR,
         aegis_inbound_socks::DESCRIPTOR,
         aegis_inbound_http::DESCRIPTOR,
         aegis_outbound_direct::DESCRIPTOR,

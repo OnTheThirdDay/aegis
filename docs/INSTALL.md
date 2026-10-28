@@ -35,6 +35,7 @@ On macOS, install Docker Desktop and make sure it's running. Enable *Start Docke
 | 8443 | the HTTPS web console | 8453, 8463, 9443 | `--console-port N` |
 | 443 | devices connecting directly | 8444, 8454, 9444 | `--port N` |
 | 80 | Let's Encrypt HTTP validation (only during issuance) | not used | `--http-port N` (`0` = don't use) |
+| UDP, same number as the device port | direct QUIC (optional, faster for games and calls) | — | published only with `--quic` |
 
 ## 2. Install
 
@@ -201,6 +202,10 @@ On a computer, apps that support SOCKS5 UDP (for example some games and messenge
 
 ## 6. Upgrade
 
+**From the console** (after one upgrade with an installer that has it): the Overview page shows the running version and newer releases, with **Upgrade** and an optional **Upgrade automatically**. A small second container, `aegis-updater`, does the work: it recreates the gateway with the new image and the same settings, and brings the previous version back if the new one doesn't start. It also updates itself. Choose where releases come from with `--updates registry` (default: ghcr.io), `--updates local` (only images copied to this server, for example by another server), or `--updates off` (no updater). See [ADR-0014](adr/0014-console-upgrades.md).
+
+**With the installer**, as before:
+
 Get the installer from the newest image (`--pull always` makes Docker fetch the newest one) and run it:
 
 ```sh
@@ -228,6 +233,16 @@ The settings live in the gateway's container. After `--uninstall` they are gone;
 - **A specific version:** `sudo sh install.sh --version vX.Y.Z`.
 - **The pre-release test build:** `sudo sh install.sh --image ghcr.io/onthethirdday/aegis:staging`. Use this only on test servers. The image is not remembered: the next plain upgrade goes back to the release.
 
+**Servers with slow or no access to ghcr.io** (for example in mainland China): copy the image from a server that has it, keeping its version tag, then run the installer from that image. A release version already on the machine is used without contacting the registry:
+
+```sh
+# on a server that has it (VERSION as in the release, e.g. 0.7.0)
+docker save ghcr.io/onthethirdday/aegis:VERSION | gzip -1 | ssh root@other-server 'docker load'
+# on the other server
+docker run --rm --pull never --entrypoint cat   ghcr.io/onthethirdday/aegis:VERSION /usr/share/aegisnet/install.sh > install.sh
+sudo sh install.sh
+```
+
 ### Cloudflare connector updates
 
 With Cloudflare Tunnel, the gateway runs Cloudflare's connector, `cloudflared`, and keeps it up to date by itself. Once a week, and each time the gateway starts, it checks cloudflared's latest release on GitHub.
@@ -247,6 +262,18 @@ docker exec aegis aegisctl cloudflared auto-update off   # or on
 Use your `--name` instead of `aegis` if you installed with one. Upgrading the gateway (above) also brings the connector that was current when the image was built.
 
 A cloudflared you run yourself, outside AegisNet (for example on another machine), isn't managed by the gateway. Update it the way you installed it: your package manager (`apt`/`dnf`, Cloudflare's repository at pkg.cloudflare.com), `brew upgrade cloudflared` on macOS, or a newer `cloudflare/cloudflared` image tag for Docker. Then restart its service.
+
+## Optional: direct QUIC for games and calls
+
+Devices normally reach the gateway over TCP (WebSocket, directly or through Cloudflare). Over TCP, one lost packet holds up everything behind it until it is resent, which games and calls feel as short freezes on mobile data. With direct QUIC, devices connect over UDP instead, and app UDP stays UDP the whole way. They fall back to the usual address by themselves whenever QUIC can't get through, so nothing breaks on networks that block UDP.
+
+QUIC can't go through Cloudflare: devices must reach this server's own address on a UDP port.
+
+1. Publish the UDP port: install or upgrade with `--quic` (it uses the device port number, e.g. UDP 443). The installer remembers it on later upgrades; `--no-quic` removes it.
+2. Allow that UDP port in the server's firewall or cloud security group, and forward it on your router if the server is at home.
+3. In the console: **Connectivity → Direct QUIC → Turn QUIC on**. With direct connections, devices use the same address and port number. With Cloudflare Tunnel, enter the server's public IP or DNS name and the UDP port; devices then see that address.
+
+Devices pick it up the next time they connect, without a new invitation. The phone and desktop apps show "via QUIC (UDP)" while it's in use.
 
 ## Optional: keep the device root key offline
 

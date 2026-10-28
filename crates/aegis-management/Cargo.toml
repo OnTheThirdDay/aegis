@@ -20,6 +20,7 @@ aegis-traffic-policy = { workspace = true }
 aegis-policy = { workspace = true }
 aegis-platform = { workspace = true }
 aegis-provision = { workspace = true }
+aegis-updater = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 axum = { workspace = true }
 hyper = { workspace = true }

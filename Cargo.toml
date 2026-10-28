@@ -4,7 +4,7 @@ members = ["crates/*", "apps/aegisd", "apps/aegisctl", "apps/aegis-client", "xta
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.80"
 license = "UNLICENSED"
@@ -28,6 +28,7 @@ aegis-policy = { path = "crates/aegis-policy" }
 aegis-traffic-policy = { path = "crates/aegis-traffic-policy" }
 aegis-identity = { path = "crates/aegis-identity" }
 aegis-transport-ws = { path = "crates/aegis-transport-ws" }
+aegis-transport-quic = { path = "crates/aegis-transport-quic" }
 aegis-inbound-socks = { path = "crates/aegis-inbound-socks" }
 aegis-inbound-http = { path = "crates/aegis-inbound-http" }
 aegis-dns = { path = "crates/aegis-dns" }
@@ -40,6 +41,7 @@ aegis-node = { path = "crates/aegis-node" }
 aegis-management = { path = "crates/aegis-management" }
 aegis-provision = { path = "crates/aegis-provision" }
 aegis-join = { path = "crates/aegis-join" }
+aegis-updater = { path = "crates/aegis-updater" }
 
 # Third-party candidates (06 §1). Not pre-approved: see docs/DEPENDENCIES.md.
 tokio = { version = "1.54", default-features = false }
@@ -63,6 +65,8 @@ ipnet = { version = "2.10", features = ["serde"] }
 httparse = "1.9"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+# QUIC (direct UDP tunnel): rustls/ring crypto, tokio runtime only.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 # PEM parsing via pki-types' PemObject (replaces unmaintained rustls-pemfile, RUSTSEC-2025-0134).
 rustls-pki-types = { version = "1.12", features = ["std"] }
 webpki-roots = "1.0"

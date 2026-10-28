@@ -50,6 +50,7 @@ pub async fn info(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
             "appliance": appliance.is_some(),
             "tunnel_only": ctx.tunnel_only(),
             "portal": crate::portal::status_json(&ctx),
+            "quic": super::devices::quic_status_json(&ctx),
             "console_certificate_sha256": ctx.console_fingerprint(),
             "connection": conn,
             "checklist": {
@@ -331,6 +332,185 @@ pub async fn put_portal(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) 
     })
     .await?;
     Ok(json(StatusCode::OK, &crate::portal::status_json(&ctx), &[]))
+}
+
+/// Configure direct QUIC: `{"enabled": bool, "host": name|null, "port":
+/// port|null}`, any of them; the rest stays. Devices learn the address the
+/// next time they connect (they fetch their endpoint) and fall back to the
+/// usual address when QUIC can't reach the server.
+pub async fn put_quic(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::PUT)?;
+    p.require(Permission::SystemConfigure)?;
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let obj = v
+        .as_object()
+        .filter(|o| {
+            !o.is_empty()
+                && o.keys()
+                    .all(|k| ["enabled", "host", "port"].contains(&k.as_str()))
+        })
+        .ok_or_else(|| ApiError::bad_request("invalid_body").detail("set enabled, host or port"))?;
+    let mut setting = super::devices::quic_setting(&ctx);
+    if let Some(e) = obj.get("enabled") {
+        let on = e.as_bool().ok_or_else(|| {
+            ApiError::bad_request("invalid_body").detail("enabled must be true or false")
+        })?;
+        setting["enabled"] = json!(on);
+    }
+    match obj.get("host") {
+        None => {}
+        Some(Value::Null) => setting["host"] = Value::Null,
+        Some(h) => {
+            let h = h.as_str().map(str::trim).unwrap_or("").to_ascii_lowercase();
+            if !super::devices::valid_public_host(&h) {
+                return Err(ApiError::bad_request("invalid_host")
+                    .detail("enter the server's public IP address or DNS name"));
+            }
+            setting["host"] = json!(h);
+        }
+    }
+    match obj.get("port") {
+        None => {}
+        Some(Value::Null) => setting["port"] = Value::Null,
+        Some(n) => {
+            let port = n
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .filter(|n| *n != 0)
+                .ok_or_else(|| {
+                    ApiError::bad_request("invalid_body").detail("port must be 1-65535")
+                })?;
+            setting["port"] = json!(port);
+        }
+    }
+    let (c, actor, audit_meta) = (ctx.clone(), p.id.clone(), setting.clone());
+    blocking(move || {
+        c.coord.store().tx(|tx| {
+            db::put_setting(tx, "quic", &setting)?;
+            db::append_audit(
+                tx,
+                AuditInsert {
+                    actor_id: Some(&actor),
+                    action: "quic.updated",
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata: audit_meta,
+                },
+            )
+        })?;
+        Ok(())
+    })
+    .await?;
+    Ok(json(
+        StatusCode::OK,
+        &super::devices::quic_status_json(&ctx),
+        &[],
+    ))
+}
+
+/// The updater counts as present while its heartbeat is this fresh.
+const UPDATER_STALE_SECS: u64 = 120;
+
+/// Version and upgrades as the console shows them: this gateway's version,
+/// what the updater container last found, and the automatic setting.
+fn updates_json(ctx: &crate::ManagementContext) -> Value {
+    let Some(data) = ctx.data_dir() else {
+        return json!({"running": env!("CARGO_PKG_VERSION"), "updater": false});
+    };
+    let status = aegis_updater::files::status(&data).unwrap_or(Value::Null);
+    let fresh = status["heartbeat"]
+        .as_u64()
+        .is_some_and(|t| db::now_unix().max(0) as u64 <= t + UPDATER_STALE_SECS);
+    json!({
+        "running": env!("CARGO_PKG_VERSION"),
+        "updater": fresh,
+        "source": status["source"],
+        "available": status["available"],
+        "checked_at": status["checked_at"],
+        "state": status["state"],
+        "message": status["message"],
+        "finished_at": status["finished_at"],
+        "auto": aegis_updater::files::auto(&data),
+    })
+}
+
+/// `GET /api/v1/system/updates`.
+pub async fn updates(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
+    let p = ctx.authenticate(&headers, &Method::GET)?;
+    p.require(Permission::SystemConfigure)?;
+    Ok(json(StatusCode::OK, &updates_json(&ctx), &[]))
+}
+
+/// `POST /api/v1/system/updates`: `{"action": "check"}`, `{"action":
+/// "upgrade", "version": "X.Y.Z"}` (or no version: the newest available),
+/// or `{"auto": bool}`. Requests go to the updater container through the
+/// data volume; the gateway itself never touches Docker.
+pub async fn post_updates(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
+    use aegis_updater::files::{self, Request};
+    let p = ctx.authenticate(&headers, &Method::POST)?;
+    p.require(Permission::SystemConfigure)?;
+    let v = read_json(&headers, body, &["application/json"]).await?;
+    let data = ctx
+        .data_dir()
+        .ok_or_else(|| ApiError::conflict("not_an_appliance"))?;
+    let (action, metadata) = if let Some(on) = v.get("auto") {
+        let on = on.as_bool().ok_or_else(|| {
+            ApiError::bad_request("invalid_body").detail("auto must be true or false")
+        })?;
+        files::set_auto(&data, on).map_err(|_| ApiError::unavailable())?;
+        ("system.auto_upgrade", json!({ "auto": on }))
+    } else {
+        if updates_json(&ctx)["updater"] != json!(true) {
+            return Err(ApiError::conflict("updater_missing").detail(
+                "the updater isn't running on this server: upgrade once with the newest install.sh, which sets it up",
+            ));
+        }
+        let request = match v["action"].as_str() {
+            Some("check") => Request::Check,
+            Some("upgrade") => match &v["version"] {
+                Value::Null => Request::Upgrade(None),
+                Value::String(s) => Request::Upgrade(Some(
+                    aegis_updater::version::Version::parse(s).ok_or_else(|| {
+                        ApiError::bad_request("invalid_version")
+                            .detail("version must look like 1.2.3")
+                    })?,
+                )),
+                _ => return Err(ApiError::bad_request("invalid_version")),
+            },
+            _ => {
+                return Err(ApiError::bad_request("invalid_body")
+                    .detail("set action (check or upgrade) or auto"))
+            }
+        };
+        files::write_request(&data, &request).map_err(|_| ApiError::unavailable())?;
+        let action = match request {
+            Request::Check => "system.update_check",
+            Request::Upgrade(_) => "system.upgrade_requested",
+        };
+        (action, json!({ "version": v["version"] }))
+    };
+    let (c, actor) = (ctx.clone(), p.id.clone());
+    blocking(move || {
+        c.coord.store().tx(|tx| {
+            db::append_audit(
+                tx,
+                AuditInsert {
+                    actor_id: Some(&actor),
+                    action,
+                    target_type: "system",
+                    target_id: None,
+                    decision: "allowed",
+                    revision_digest: None,
+                    metadata,
+                },
+            )
+        })?;
+        Ok(())
+    })
+    .await?;
+    Ok(json(StatusCode::ACCEPTED, &updates_json(&ctx), &[]))
 }
 
 /// Device CA custody: take the root key offline, renew the issuer with it,

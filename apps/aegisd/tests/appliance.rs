@@ -728,3 +728,157 @@ async fn cloudflare_device_port_is_one_of_cloudflares() {
     .await
     .expect("bounded");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_is_offered_to_devices_only_once_turned_on_and_complete() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let data = tmp.path().join("quic");
+        let running = launch_with_core(&data, "").await;
+        assert!(
+            running
+                .node
+                .ctx
+                .startup
+                .inbounds
+                .iter()
+                .any(|i| i.kind == aegis_config::InboundKind::Quic),
+            "the seed listens for QUIC"
+        );
+        let store = aegis_storage::Store::open(data.join("state.db")).expect("store");
+        store
+            .tx(|c| {
+                aegis_storage::put_setting(
+                    c,
+                    "connection",
+                    &json!({"mode": "cloudflare", "public_host": "gw.example.com", "public_port": 443, "outer_trust": "public"}),
+                )
+            })
+            .expect("connection");
+        let password = std::fs::read_to_string(data.join(appliance::INITIAL_PASSWORD_FILE))
+            .expect("initial password")
+            .trim()
+            .to_owned();
+        let web_ca = std::fs::read_to_string(data.join("secrets/web-ca.pem")).expect("web ca");
+        let mut c = Console::new(running.console.expect("console"), &web_ca);
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": password})))
+            .await;
+        assert_eq!(s, 200);
+        let (s, v) = c
+            .call(
+                reqwest::Method::POST,
+                "/auth/password",
+                Some(json!({"current_password": password, "new_password": "a much better passphrase"})),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let invite_quic = |v: &Value| {
+            aegis_join::parse_invite(v["code"].as_str().expect("code"))
+                .expect("invite")
+                .quic
+        };
+        // Off by default.
+        let (_, v) = c.call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "a"}))).await;
+        assert_eq!(invite_quic(&v), None);
+        // On, but through Cloudflare the server's own address is missing.
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/quic", Some(json!({"enabled": true})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["address"], Value::Null);
+        assert!(v["warning"].is_string());
+        let (_, v) = c.call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "b"}))).await;
+        assert_eq!(invite_quic(&v), None, "incomplete: not offered");
+        let (s, _) = c
+            .call(reqwest::Method::PUT, "/system/quic", Some(json!({"host": "not a host!"})))
+            .await;
+        assert_eq!(s, 400);
+        let (s, v) = c
+            .call(reqwest::Method::PUT, "/system/quic", Some(json!({"host": "203.0.113.7", "port": 8444})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["address"], "203.0.113.7:8444");
+        let (_, v) = c.call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "c"}))).await;
+        assert_eq!(invite_quic(&v).as_deref(), Some("203.0.113.7:8444"));
+        let (_, v) = c.call(reqwest::Method::GET, "/system/info", None).await;
+        assert_eq!(v["quic"]["enabled"], true);
+        // Off again: not offered.
+        c.call(reqwest::Method::PUT, "/system/quic", Some(json!({"enabled": false})))
+            .await;
+        let (_, v) = c.call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "d"}))).await;
+        assert_eq!(invite_quic(&v), None);
+        running.shutdown().await;
+    })
+    .await
+    .expect("bounded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn console_upgrades_go_through_the_updater_files() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let data = tmp.path().join("updates");
+        let running = launch_with_core(&data, "").await;
+        let password = std::fs::read_to_string(data.join(appliance::INITIAL_PASSWORD_FILE))
+            .expect("initial password")
+            .trim()
+            .to_owned();
+        let web_ca = std::fs::read_to_string(data.join("secrets/web-ca.pem")).expect("web ca");
+        let mut c = Console::new(running.console.expect("console"), &web_ca);
+        c.call(reqwest::Method::POST, "/auth/login", Some(json!({"username": "admin", "password": password})))
+            .await;
+        let (s, v) = c
+            .call(
+                reqwest::Method::POST,
+                "/auth/password",
+                Some(json!({"current_password": password, "new_password": "a much better passphrase"})),
+            )
+            .await;
+        assert_eq!(s, 200, "{v}");
+        // No updater yet: nothing to ask.
+        let (s, v) = c.call(reqwest::Method::GET, "/system/updates", None).await;
+        assert_eq!(s, 200);
+        assert_eq!(v["updater"], false);
+        assert_eq!(v["running"], env!("CARGO_PKG_VERSION"));
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/system/updates", Some(json!({"action": "check"})))
+            .await;
+        assert_eq!(s, 409, "refused without an updater");
+        // An updater reporting in.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        aegis_updater::files::write_status(
+            &data,
+            &json!({"heartbeat": now, "source": "local", "running": "0.7.0", "available": "0.8.0", "state": "idle"}),
+        )
+        .expect("status");
+        let (_, v) = c.call(reqwest::Method::GET, "/system/updates", None).await;
+        assert_eq!(v["updater"], true);
+        assert_eq!(v["available"], "0.8.0");
+        assert_eq!(v["source"], "local");
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/system/updates", Some(json!({"action": "upgrade", "version": "latest"})))
+            .await;
+        assert_eq!(s, 400, "only a release version");
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/system/updates", Some(json!({"action": "upgrade", "version": "0.8.0"})))
+            .await;
+        assert_eq!(s, 202);
+        assert_eq!(
+            aegis_updater::files::take_request(&data),
+            Some(aegis_updater::files::Request::Upgrade(Some(aegis_updater::version::Version(0, 8, 0))))
+        );
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/system/updates", Some(json!({"auto": true})))
+            .await;
+        assert_eq!(s, 202);
+        assert_eq!(v["auto"], true);
+        assert!(aegis_updater::files::auto(&data));
+        running.shutdown().await;
+    })
+    .await
+    .expect("bounded");
+}

@@ -71,6 +71,8 @@ pub struct Invite {
     #[serde(default)]
     pub outer_ca_pem: Option<String>,
     pub device_ca_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic: Option<String>,
 }
 
 impl Invite {
@@ -82,6 +84,7 @@ impl Invite {
             outer_server_name: self.outer_server_name.clone(),
             outer_ca_pem: self.outer_ca_pem.clone(),
             device_ca_sha256: self.device_ca_sha256.clone(),
+            quic: self.quic.clone(),
         }
     }
 }
@@ -110,6 +113,10 @@ pub struct Endpoint {
     #[serde(default)]
     pub outer_ca_pem: Option<String>,
     pub device_ca_sha256: String,
+    /// `host:port` of the gateway's direct QUIC (UDP) listener, when the
+    /// administrator turned it on. Tried first; `url` stays the fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic: Option<String>,
 }
 
 impl Endpoint {
@@ -127,6 +134,13 @@ impl Endpoint {
         }
         if self.outer_server_name.is_some() != self.outer_ca_pem.is_some() {
             return Err("incomplete edge trust");
+        }
+        if self
+            .quic
+            .as_deref()
+            .is_some_and(|q| q.len() > 300 || aegis_config::quic_address(q).is_none())
+        {
+            return Err("malformed QUIC address");
         }
         if let Some(ca) = &self.outer_ca_pem {
             aegis_identity::tls::parse_certs(ca).map_err(|_| "bad edge certificate")?;
@@ -186,6 +200,9 @@ pub struct Device {
     pub outer_server_name: Option<String>,
     pub device_ca_sha256: String,
     pub enrolled_at: i64,
+    /// The gateway's direct QUIC address, when it offers one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic: Option<String>,
 }
 
 impl Device {
@@ -555,6 +572,7 @@ pub async fn enroll(invite: &Invite, dir: &DeviceDir) -> Result<Device, JoinErro
         outer_server_name: invite.outer_server_name.clone(),
         device_ca_sha256: invite.device_ca_sha256.clone(),
         enrolled_at: now(),
+        quic: invite.quic.clone(),
     };
     let text = serde_json::to_string_pretty(&device)
         .map_err(|_| JoinError::Storage("serialize".into()))?;
@@ -653,7 +671,8 @@ pub async fn fetch_endpoint(dir: &DeviceDir) -> Result<Option<Endpoint>, JoinErr
         && endpoint.enroll_url == device.enroll_url
         && endpoint.server_name == device.server_name
         && endpoint.outer_server_name == device.outer_server_name
-        && endpoint.outer_ca_pem.as_deref().map(str::trim) == outer.as_deref().map(str::trim);
+        && endpoint.outer_ca_pem.as_deref().map(str::trim) == outer.as_deref().map(str::trim)
+        && endpoint.quic == device.quic;
     Ok((!same).then_some(endpoint))
 }
 
@@ -680,6 +699,7 @@ pub fn adopt_endpoint(dir: &DeviceDir, endpoint: &Endpoint) -> Result<Device, Jo
     device.enroll_url = endpoint.enroll_url.clone();
     device.server_name = endpoint.server_name.clone();
     device.outer_server_name = endpoint.outer_server_name.clone();
+    device.quic = endpoint.quic.clone();
     let text = serde_json::to_string_pretty(&device)
         .map_err(|_| JoinError::Storage("serialize".into()))?;
     write_private(&dir.device_file(), &text)?;
@@ -746,6 +766,10 @@ pub fn client_config_for(
 ) -> Result<aegis_config::NodeConfig, JoinError> {
     let device = dir.load()?;
     let path = |p: PathBuf| p.display().to_string();
+    let quic = match trial {
+        Some(e) => e.quic.clone(),
+        None => device.quic.clone(),
+    };
     let (url, server_name, outer) = match trial {
         Some(e) => {
             let outer = match (&e.outer_server_name, &e.outer_ca_pem) {
@@ -775,6 +799,9 @@ pub fn client_config_for(
     if let Some((name, ca)) = outer {
         outbound["outer_ca"] = json!(ca);
         outbound["outer_server_name"] = json!(name);
+    }
+    if let Some(q) = quic {
+        outbound["quic"] = json!(q);
     }
     let cfg = json!({
         "schema_version": "0.2",
@@ -850,6 +877,7 @@ mod tests {
             outer_server_name: None,
             device_ca_sha256: ca.into(),
             enrolled_at,
+            quic: None,
         };
         write_private(
             &dir.device_file(),

@@ -46,7 +46,18 @@ pub struct Tunnel {
     obs: Arc<LocalMetrics>,
     state: tokio::sync::Mutex<TunnelState>,
     connected: std::sync::atomic::AtomicBool,
+    /// Direct QUIC to the gateway, tried before WebSocket when configured.
+    quic: Option<aegis_transport_quic::ClientConfig>,
+    /// After QUIC failed, WebSocket alone is used until this time.
+    quic_retry_at: std::sync::Mutex<Option<Instant>>,
+    /// What carries the current session: 0 none, 1 WebSocket, 2 QUIC.
+    transport: std::sync::atomic::AtomicU8,
 }
+
+/// How long a QUIC attempt may take before WebSocket is used instead.
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// After QUIC failed, how long to stay on WebSocket before trying it again.
+const QUIC_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 impl Tunnel {
     pub fn new(
@@ -65,6 +76,7 @@ impl Tunnel {
             .client_tls
             .clone()
             .ok_or_else(|| "client identity not loaded".to_string())?;
+        let tls_for_quic = Arc::clone(&tls);
         let c = &cfg.core;
         Ok(Tunnel {
             outbound: ob.clone(),
@@ -110,6 +122,18 @@ impl Tunnel {
                 next_attempt: None,
             }),
             connected: std::sync::atomic::AtomicBool::new(false),
+            quic: ob
+                .quic
+                .as_ref()
+                .map(|address| aegis_transport_quic::ClientConfig {
+                    address: address.clone(),
+                    server_name: ob.server_name.clone().unwrap_or_default(),
+                    tls: Arc::clone(&tls_for_quic),
+                    connect_timeout: QUIC_CONNECT_TIMEOUT,
+                    limits: crate::quic_limits(cfg),
+                }),
+            quic_retry_at: std::sync::Mutex::new(None),
+            transport: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -163,7 +187,101 @@ impl Tunnel {
         }
     }
 
-    async fn connect_once(&self) -> Result<Session, ReasonGroup> {
+    /// What carries the current session: `quic`, `websocket`, or `None`.
+    pub fn transport(&self) -> Option<&'static str> {
+        if !self.connected() {
+            return None;
+        }
+        match self.transport.load(std::sync::atomic::Ordering::Relaxed) {
+            2 => Some("quic"),
+            1 => Some("websocket"),
+            _ => None,
+        }
+    }
+
+    /// A new session, and the QUIC connection under it when it runs on one.
+    async fn connect_once(
+        &self,
+    ) -> Result<(Session, Option<aegis_transport_quic::Connection>), ReasonGroup> {
+        if let Some(cfg) = &self.quic {
+            let due = self
+                .quic_retry_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none_or(|t| Instant::now() >= t);
+            if due {
+                match self.connect_quic(cfg).await {
+                    Ok((s, conn)) => {
+                        self.transport
+                            .store(2, std::sync::atomic::Ordering::Relaxed);
+                        return Ok((s, Some(conn)));
+                    }
+                    Err(()) => {
+                        *self.quic_retry_at.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(Instant::now() + QUIC_RETRY_AFTER);
+                    }
+                }
+            }
+        }
+        let s = self.connect_websocket().await?;
+        self.transport
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        Ok((s, None))
+    }
+
+    /// A session over direct QUIC: mutual TLS in the QUIC handshake (same
+    /// certificates and gateway checks as the WebSocket path's inner TLS),
+    /// the session on one stream, UDP flows on QUIC datagrams.
+    async fn connect_quic(
+        &self,
+        cfg: &aegis_transport_quic::ClientConfig,
+    ) -> Result<(Session, aegis_transport_quic::Connection), ()> {
+        let started = Instant::now();
+        let (conn, stream) = aegis_transport_quic::connect(cfg).await.map_err(|e| {
+            let kind = match &e {
+                aegis_transport_quic::QuicError::Timeout => "timeout",
+                aegis_transport_quic::QuicError::Connect(_) => "connect",
+                _ => "config",
+            };
+            self.note_failure("quic", kind, ReasonGroup::Transport, &e);
+        })?;
+        let gateway = aegis_transport_quic::peer_certificate(&conn)
+            .and_then(|c| aegis_identity::PeerIdentity::from_der(c.as_ref()).ok())
+            .ok_or(())
+            .and_then(|p| tls::check_gateway(&p).map(|()| p).map_err(|_| ()));
+        let Ok(gateway) = gateway else {
+            self.note_failure(
+                "quic",
+                "tls",
+                ReasonGroup::Tls,
+                &"gateway identity rejected",
+            );
+            conn.close(1u32.into(), b"identity");
+            return Err(());
+        };
+        let obs: Arc<dyn Observability> = self.obs.clone();
+        let mut session_cfg = self.session_cfg.clone();
+        session_cfg.expected_peer_node_id = Some(gateway.node_id);
+        session_cfg.datagram_path = Some(Arc::new(crate::quic::Path(conn.clone())));
+        let session = client_handshake(
+            stream,
+            session_cfg,
+            self.budget.child(self.peer_budget),
+            obs,
+        )
+        .await
+        .map_err(|e| {
+            self.note_failure("session", "agp", e.reason_group(), &e);
+            conn.close(1u32.into(), b"session");
+        })?;
+        self.obs.record(Event::HandshakeDuration {
+            seconds: started.elapsed().as_secs_f64(),
+            result: OperationResult::Ok,
+        });
+        Ok((session, conn))
+    }
+
+    async fn connect_websocket(&self) -> Result<Session, ReasonGroup> {
         let started = Instant::now();
         let ws = aegis_transport_ws::connect(&self.ws).await.map_err(|e| {
             let kind = match &e {
@@ -222,8 +340,11 @@ impl Tunnel {
             return Err(OpenFailure::Unavailable);
         }
         match self.connect_once().await {
-            Ok(s) => {
+            Ok((s, quic)) => {
                 let s = Arc::new(s);
+                if let Some(conn) = quic {
+                    tokio::spawn(crate::quic::datagram_reader(conn, &s));
+                }
                 st.backoff.reset();
                 st.breaker.record_success();
                 st.next_attempt = None;

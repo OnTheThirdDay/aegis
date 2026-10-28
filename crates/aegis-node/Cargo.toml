@@ -21,6 +21,7 @@ aegis-policy = { workspace = true }
 aegis-platform = { workspace = true }
 aegis-identity = { workspace = true }
 aegis-transport-ws = { workspace = true }
+aegis-transport-quic = { workspace = true }
 aegis-inbound-socks = { workspace = true }
 aegis-inbound-http = { workspace = true }
 aegis-dns = { workspace = true }

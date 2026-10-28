@@ -75,9 +75,15 @@ pub async fn launch(
         failpoints: None,
     };
     let mut node = start(seed).await.map_err(|e| e.code())?;
-    // Session limits are read at start: after upgrading stored ones, start
-    // again (once; nothing is connected yet).
-    if appliance_dir.is_some() && upgrade_session_limits(&node.ctx.coord).await {
+    // Listeners and session limits are read at start: after upgrading the
+    // stored profile, start again (once; nothing is connected yet).
+    let mut upgraded = false;
+    if appliance_dir.is_some() {
+        for (name, plan) in PROFILE_UPGRADES {
+            upgraded |= upgrade_profile(&node.ctx.coord, name, *plan).await;
+        }
+    }
+    if upgraded {
         node.shutdown(Duration::from_secs(1)).await;
         node = start(StartOptions {
             config: cfg,
@@ -209,11 +215,63 @@ const LEGACY_SESSION_LIMITS: [(&str, u64); 5] = [
     ("process_buffer_budget_bytes", 32 * 1024 * 1024),
 ];
 
-/// One-time upgrade of the active profile's session limits to the current
-/// defaults, only while all of them still hold the legacy values (anything
-/// an operator changed is left alone). Returns whether a new revision was
-/// activated; it applies from the next start.
-async fn upgrade_session_limits(coord: &Arc<aegis_core::Coordinator>) -> bool {
+/// Changes appliances set up by older versions get once: each plan returns
+/// a merge patch for the active profile, or `None` when it doesn't apply.
+type UpgradePlan = fn(&serde_json::Value) -> Option<serde_json::Value>;
+const PROFILE_UPGRADES: &[(&str, UpgradePlan)] = &[
+    ("session-limits-upgrade", session_limits_plan),
+    ("quic-inbound-upgrade", quic_inbound_plan),
+];
+
+/// Session limits to the current defaults, only while all of them still
+/// hold the legacy values (anything an operator changed is left alone).
+fn session_limits_plan(spec: &serde_json::Value) -> Option<serde_json::Value> {
+    let legacy = LEGACY_SESSION_LIMITS
+        .iter()
+        .all(|(k, v)| spec["core"][*k].as_u64() == Some(*v));
+    if !legacy {
+        return None;
+    }
+    let d = aegis_config::CoreConfig::default();
+    Some(serde_json::json!({"core": {
+        "max_streams_per_session": d.max_streams_per_session,
+        "stream_buffer_budget_bytes": d.stream_buffer_budget_bytes,
+        "session_window_bytes": d.session_window_bytes,
+        "peer_buffer_budget_bytes": d.peer_buffer_budget_bytes,
+        "process_buffer_budget_bytes": d.process_buffer_budget_bytes,
+    }}))
+}
+
+/// A QUIC listener on the device port number, for profiles from before
+/// QUIC existed. It is reachable only once the installer publishes the UDP
+/// port, and used only once an administrator turns QUIC on.
+fn quic_inbound_plan(spec: &serde_json::Value) -> Option<serde_json::Value> {
+    let inbounds = spec["inbounds"].as_array()?;
+    if inbounds.iter().any(|i| i["kind"] == "quic") {
+        return None;
+    }
+    let edge = inbounds.iter().find(|i| i["id"] == "edge")?;
+    let port = edge["bind"]
+        .as_str()?
+        .parse::<std::net::SocketAddr>()
+        .ok()?
+        .port();
+    let mut next = inbounds.clone();
+    next.push(serde_json::json!({
+        "id": "quic",
+        "kind": "quic",
+        "bind": format!("0.0.0.0:{port}"),
+    }));
+    Some(serde_json::json!({ "inbounds": next }))
+}
+
+/// Apply one upgrade plan to the active profile. Returns whether a new
+/// revision was activated; it applies from the next start.
+async fn upgrade_profile(
+    coord: &Arc<aegis_core::Coordinator>,
+    name: &'static str,
+    plan: UpgradePlan,
+) -> bool {
     let coord = Arc::clone(coord);
     tokio::task::spawn_blocking(move || -> Option<bool> {
         let runtime = coord.health().runtime_revision_id?;
@@ -228,20 +286,9 @@ async fn upgrade_session_limits(coord: &Arc<aegis_core::Coordinator>) -> bool {
             .read(|c| aegis_storage::get_revision(c, &runtime))
             .ok()?;
         let spec: serde_json::Value = serde_json::from_str(&revision.spec_json).ok()?;
-        let legacy = LEGACY_SESSION_LIMITS
-            .iter()
-            .all(|(k, v)| spec["core"][*k].as_u64() == Some(*v));
-        if !legacy {
+        let Some(patch) = plan(&spec) else {
             return Some(false);
-        }
-        let d = aegis_config::CoreConfig::default();
-        let patch = serde_json::json!({"core": {
-            "max_streams_per_session": d.max_streams_per_session,
-            "stream_buffer_budget_bytes": d.stream_buffer_budget_bytes,
-            "session_window_bytes": d.session_window_bytes,
-            "peer_buffer_budget_bytes": d.peer_buffer_budget_bytes,
-            "process_buffer_budget_bytes": d.process_buffer_budget_bytes,
-        }});
+        };
         let patched = coord
             .patch_profile(None, &profile.id, &profile.etag(), None, Some(&patch))
             .ok()?;
@@ -260,7 +307,7 @@ async fn upgrade_session_limits(coord: &Arc<aegis_core::Coordinator>) -> bool {
             actor_id: None,
             profile_id: patched.id.clone(),
             if_match: patched.etag(),
-            idempotency_key: format!("session-limits-upgrade-{}", report.target_revision_id),
+            idempotency_key: format!("{name}-{}", report.target_revision_id),
             target_revision_id: report.target_revision_id.clone(),
             config_digest: report.config_digest.clone(),
             validation_id: report.validation_id.clone(),
@@ -275,4 +322,26 @@ async fn upgrade_session_limits(coord: &Arc<aegis_core::Coordinator>) -> bool {
     .ok()
     .flatten()
     .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_profiles_get_a_quic_listener_on_the_device_port_once() {
+        let spec = serde_json::json!({"inbounds": [
+            {"id": "edge", "kind": "websocket", "bind": "0.0.0.0:8444"},
+            {"id": "tunnel-origin", "kind": "websocket", "bind": "127.0.0.1:18080"},
+        ]});
+        let patch = quic_inbound_plan(&spec).expect("planned");
+        let inbounds = patch["inbounds"].as_array().expect("inbounds");
+        assert_eq!(inbounds.len(), 3, "existing inbounds are kept");
+        assert_eq!(inbounds[2]["kind"], "quic");
+        assert_eq!(inbounds[2]["bind"], "0.0.0.0:8444");
+        // Already there: nothing to do.
+        assert!(quic_inbound_plan(&patch).is_none());
+        // No edge to take the port from: left alone.
+        assert!(quic_inbound_plan(&serde_json::json!({"inbounds": []})).is_none());
+    }
 }
