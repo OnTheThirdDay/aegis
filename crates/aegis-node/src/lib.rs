@@ -132,7 +132,14 @@ pub struct NodeContext {
     pub(crate) identity: RwLock<LoadedIdentity>,
     pub(crate) outer_tls: HashMap<String, Arc<outer_tls::ReloadingTls>>,
     pub(crate) tunnels: Mutex<HashMap<String, Arc<client::Tunnel>>>,
+    /// Tunnels replaced by a configuration or certificate change. Their
+    /// sessions carry streams that were open at the time; shutdown closes
+    /// them too.
+    retired_tunnels: Mutex<Vec<std::sync::Weak<client::Tunnel>>>,
     tunnel_update: tokio::sync::Mutex<()>,
+    /// Every accepted connection and admitted stream, so shutdown can stop
+    /// them all (direct relays have no session to close).
+    connections: Mutex<tokio::task::JoinSet<()>>,
     /// Process-wide reservations include authenticated AGP handshakes.
     session_slots: Arc<Semaphore>,
     resolver_cache: Mutex<Option<(String, Arc<Resolver>)>>,
@@ -173,10 +180,14 @@ impl NodeContext {
             self.sessions.close_all(ResetReason::PolicyRevoked);
         }
         *identity = loaded;
-        self.tunnels
+        let replaced: Vec<_> = self
+            .tunnels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .drain()
+            .map(|(_, t)| t)
+            .collect();
+        self.retire(replaced);
         Ok(())
     }
     pub fn current_ca(&self) -> Option<CaBundle> {
@@ -267,13 +278,24 @@ impl NodeContext {
         .map_err(|_| aegis_contracts::reason::OpenFailure::Unavailable)?
         .map_err(|_| aegis_contracts::reason::OpenFailure::Unavailable)?;
         let tunnel = Arc::new(tunnel);
-        let mut cache = self.tunnels.lock().unwrap_or_else(|e| e.into_inner());
-        cache.retain(|id, _| {
-            cfg.outbounds
-                .iter()
-                .any(|ob| ob.id == *id && ob.kind == aegis_config::OutboundKind::AgpTunnel)
-        });
-        cache.insert(outbound.id.clone(), Arc::clone(&tunnel));
+        let mut replaced = Vec::new();
+        {
+            let mut cache = self.tunnels.lock().unwrap_or_else(|e| e.into_inner());
+            cache.retain(|id, t| {
+                let keep = cfg
+                    .outbounds
+                    .iter()
+                    .any(|ob| ob.id == *id && ob.kind == aegis_config::OutboundKind::AgpTunnel);
+                if !keep {
+                    replaced.push(Arc::clone(t));
+                }
+                keep
+            });
+            if let Some(old) = cache.insert(outbound.id.clone(), Arc::clone(&tunnel)) {
+                replaced.push(old);
+            }
+        }
+        self.retire(replaced);
         Ok(tunnel)
     }
 
@@ -324,6 +346,26 @@ impl NodeContext {
 
     pub fn shutdown_signal(&self) -> watch::Receiver<bool> {
         self.shutdown.subscribe()
+    }
+
+    /// Run one connection's (or stream's) task where shutdown can stop it.
+    pub(crate) fn spawn_connection<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut set = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+        while set.try_join_next().is_some() {}
+        set.spawn(task);
+    }
+
+    /// Keep a replaced tunnel within reach of shutdown.
+    fn retire(&self, tunnels: impl IntoIterator<Item = Arc<client::Tunnel>>) {
+        let mut retired = self
+            .retired_tunnels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        retired.retain(|t| t.strong_count() > 0);
+        retired.extend(tunnels.into_iter().map(|t| Arc::downgrade(&t)));
     }
 }
 
@@ -481,7 +523,14 @@ impl NodeRuntime {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         ctx.sessions.close_all(ResetReason::Shutdown);
-        for t in &tunnels {
+        let retired: Vec<_> = ctx
+            .retired_tunnels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .filter_map(|t| t.upgrade())
+            .collect();
+        for t in tunnels.iter().chain(&retired) {
             t.close(ResetReason::Shutdown).await;
         }
         for t in &self.tasks {
@@ -492,6 +541,11 @@ impl NodeRuntime {
         for t in self.tasks {
             let _ = t.await;
         }
+        // Then stop every connection still running (direct relays, streams
+        // of replaced tunnels): nothing forwards once shutdown returns.
+        let mut connections =
+            std::mem::take(&mut *ctx.connections.lock().unwrap_or_else(|e| e.into_inner()));
+        connections.shutdown().await;
         ctx.coord.agent().transition(AgentState::Stopped);
     }
 }
@@ -622,7 +676,9 @@ pub async fn start_with_diagnostics(
         identity: RwLock::new(identity),
         outer_tls,
         tunnels: Mutex::new(tunnels),
+        retired_tunnels: Mutex::new(Vec::new()),
         tunnel_update: tokio::sync::Mutex::new(()),
+        connections: Mutex::new(tokio::task::JoinSet::new()),
         session_slots: Arc::new(Semaphore::new(active.core.max_sessions as usize)),
         resolver_cache: Mutex::new(None),
         shutdown,
@@ -635,42 +691,46 @@ pub async fn start_with_diagnostics(
             sessions.close_fingerprints(fps, ResetReason::PolicyRevoked)
         }));
     }
-    let mut bound = Vec::new();
-    let mut tasks = Vec::new();
+    // Bind every listener and read every credential before serving any:
+    // a startup that fails part way must leave nothing listening.
+    enum Serve {
+        Websocket,
+        Socks(Option<aegis_inbound_socks::Credentials>),
+        Http(Option<aegis_inbound_http::Credentials>),
+    }
+    let mut ready = Vec::new();
     for ib in &active.inbounds {
+        let serve = match ib.kind {
+            InboundKind::Websocket => Serve::Websocket,
+            InboundKind::Socks5 => Serve::Socks(
+                client::socks_credentials(ib, &ctx.secrets_dir).map_err(StartError::Identity)?,
+            ),
+            InboundKind::HttpConnect => Serve::Http(
+                client::http_credentials(ib, &ctx.secrets_dir).map_err(StartError::Identity)?,
+            ),
+        };
         let listener = tokio::net::TcpListener::bind(&ib.bind)
             .await
             .map_err(|e| StartError::Bind(format!("inbound {}: {}", ib.id, e.kind())))?;
         let addr = listener
             .local_addr()
             .map_err(|e| StartError::Bind(e.to_string()))?;
+        ready.push((ib, listener, addr, serve));
+    }
+    let mut bound = Vec::new();
+    let mut tasks = Vec::new();
+    for (ib, listener, addr, serve) in ready {
         bound.push((ib.id.clone(), addr));
-        let task = match ib.kind {
-            InboundKind::Websocket => {
-                tokio::spawn(gateway::serve(Arc::clone(&ctx), ib.clone(), listener))
+        let ctx = Arc::clone(&ctx);
+        tasks.push(match serve {
+            Serve::Websocket => tokio::spawn(gateway::serve(ctx, ib.clone(), listener)),
+            Serve::Socks(creds) => {
+                tokio::spawn(client::serve_socks(ctx, ib.clone(), listener, creds))
             }
-            InboundKind::Socks5 => {
-                let creds = client::socks_credentials(ib, &ctx.secrets_dir)
-                    .map_err(StartError::Identity)?;
-                tokio::spawn(client::serve_socks(
-                    Arc::clone(&ctx),
-                    ib.clone(),
-                    listener,
-                    creds,
-                ))
+            Serve::Http(creds) => {
+                tokio::spawn(client::serve_http(ctx, ib.clone(), listener, creds))
             }
-            InboundKind::HttpConnect => {
-                let creds =
-                    client::http_credentials(ib, &ctx.secrets_dir).map_err(StartError::Identity)?;
-                tokio::spawn(client::serve_http(
-                    Arc::clone(&ctx),
-                    ib.clone(),
-                    listener,
-                    creds,
-                ))
-            }
-        };
-        tasks.push(task);
+        });
     }
     Ok(NodeRuntime {
         ctx,

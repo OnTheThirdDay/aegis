@@ -189,9 +189,9 @@ pub async fn otlp(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
 pub async fn import(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> ApiResult {
     let p = ctx.authenticate(&headers, &Method::POST)?;
     p.require(Permission::DiagnosticsExplain)?;
-    let bytes = axum::body::to_bytes(body, MAX_IMPORT)
-        .await
-        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"))?;
+    // A report file can be several MiB on a slow link.
+    let bytes =
+        crate::http_util::read_body(body, MAX_IMPORT, std::time::Duration::from_secs(120)).await?;
     let reports = tokio::task::spawn_blocking(move || {
         if bytes.starts_with(&[0x1f, 0x8b]) {
             Report::from_gzip(&bytes)

@@ -571,7 +571,7 @@ impl ManagementContext {
         } else {
             Self::scopes_for(&p.roles)
         };
-        let (token, principal) = self.open_session(&p.id, scopes, two_factor);
+        let (token, principal) = self.open_session(&p, scopes, two_factor)?;
         let _ = self.coord.store().tx(|c| {
             db::append_audit(
                 c,
@@ -589,41 +589,55 @@ impl ManagementContext {
         Ok((token, principal))
     }
 
+    /// Open a cookie session for `checked`, the account as it was when its
+    /// credentials were verified. Disabling, role changes and password
+    /// resets commit to the store first and then purge sessions under the
+    /// sessions lock; re-reading the account under that same lock means a
+    /// sign-in that raced one of them either sees the change and is refused,
+    /// or inserts its session before the purge that removes it.
     fn open_session(
         &self,
-        principal_id: &str,
+        checked: &db::PrincipalRow,
         scopes: Vec<String>,
         mfa: bool,
-    ) -> (String, Principal) {
+    ) -> Result<(String, Principal), ApiError> {
         let token = random_token();
         let csrf = random_token();
         let expires_at = db::now_unix() + SESSION_TTL.as_secs() as i64;
-        self.auth
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                token_key(&token),
-                AdminSession {
-                    principal_id: principal_id.to_owned(),
-                    scopes: scopes.clone(),
-                    csrf_token: csrf.clone(),
-                    expires_at,
-                    kind: CredentialKind::Cookie,
-                    mfa,
-                },
-            );
-        (
+        let mut sessions = self.auth.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self
+            .coord
+            .store()
+            .read(|c| db::get_principal(c, &checked.id))
+            .map_err(|_| ApiError::unauthenticated())?;
+        if current.status != "active"
+            || current.roles != checked.roles
+            || current.password_hash != checked.password_hash
+        {
+            return Err(ApiError::unauthenticated().detail("the account changed while signing in"));
+        }
+        sessions.insert(
+            token_key(&token),
+            AdminSession {
+                principal_id: checked.id.clone(),
+                scopes: scopes.clone(),
+                csrf_token: csrf.clone(),
+                expires_at,
+                kind: CredentialKind::Cookie,
+                mfa,
+            },
+        );
+        Ok((
             token,
             Principal {
-                id: principal_id.to_owned(),
+                id: checked.id.clone(),
                 scopes,
                 kind: CredentialKind::Cookie,
                 expires_at,
                 csrf_token: Some(csrf),
                 mfa,
             },
-        )
+        ))
     }
 
     /// Drop every session (cookie and bearer) of a principal.
@@ -714,7 +728,11 @@ impl ManagementContext {
             }
         }
         // A session opened with a second factor stays one after the change.
-        Ok(self.open_session(&p.id, Self::scopes_for(&p.roles), mfa))
+        let changed = db::PrincipalRow {
+            password_hash: hash,
+            ..p
+        };
+        self.open_session(&changed, Self::scopes_for(&changed.roles), mfa)
     }
 
     /// Owner-created account with a one-time temporary password that must
@@ -1101,6 +1119,42 @@ mod tests {
         assert!(!op.contains(&Permission::IdentityRevoke));
         assert!(!op.contains(&Permission::NodesWrite));
         assert!(role_permissions("unknown").is_empty());
+    }
+
+    #[test]
+    fn a_sign_in_racing_an_account_change_opens_no_session() {
+        let store = Arc::new(db::Store::open_in_memory().expect("store"));
+        let ctx = context(Arc::clone(&store));
+        insert_owner(&store);
+        let user = db::PrincipalRow {
+            id: "test-operator".into(),
+            username: "operator".into(),
+            password_hash: "unused".into(),
+            status: "active".into(),
+            roles: vec!["operator".into()],
+        };
+        store
+            .tx(|c| db::insert_principal(c, &user))
+            .expect("insert user");
+        // The row a sign-in verified its password against, before the change.
+        let checked = store.read(|c| db::get_principal(c, &user.id)).expect("row");
+        ctx.update_user("test-owner", &user.id, None, Some("disabled"))
+            .expect("disable");
+        assert!(ctx.open_session(&checked, vec![], false).is_err());
+        ctx.update_user("test-owner", &user.id, None, Some("active"))
+            .expect("enable");
+        let checked = store.read(|c| db::get_principal(c, &user.id)).expect("row");
+        ctx.update_user("test-owner", &user.id, Some(&["viewer".into()]), None)
+            .expect("demote");
+        assert!(ctx.open_session(&checked, vec![], false).is_err());
+        // Unchanged: the session opens, and a later disable still ends it.
+        let checked = store.read(|c| db::get_principal(c, &user.id)).expect("row");
+        let (token, _) = ctx.open_session(&checked, vec![], false).expect("open");
+        let key = token_key(&token);
+        assert!(ctx.auth.sessions.lock().expect("lock").contains_key(&key));
+        ctx.update_user("test-owner", &user.id, None, Some("disabled"))
+            .expect("disable");
+        assert!(!ctx.auth.sessions.lock().expect("lock").contains_key(&key));
     }
 
     #[test]

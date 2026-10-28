@@ -140,16 +140,24 @@ impl AsyncWrite for MuxStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        // Reserve transmit memory as it is needed, up to the cap; the
-        // initial reservation always leaves room, so writes progress.
-        let want = (e.tx.len() + buf.len()).min(e.tx_cap) as u64;
-        let held = e.tx_reservation.bytes();
-        if want > held {
-            let _ = e.tx_reservation.try_grow(want - held);
+        // The buffer's allocation never exceeds its reservation: grow it
+        // ourselves (geometrically, up to the cap) only after reserving the
+        // new capacity, instead of letting `BytesMut` pick a larger one.
+        let want = (e.tx.len() + buf.len()).min(e.tx_cap);
+        if want > e.tx.capacity() {
+            let target = want.max(e.tx.capacity() * 2).min(e.tx_cap);
+            let held = e.tx_reservation.bytes() as usize;
+            if target > held {
+                let _ = e.tx_reservation.try_grow((target - held) as u64);
+            }
+            let cap = target.min(e.tx_reservation.bytes() as usize);
+            if cap > e.tx.capacity() {
+                let mut grown = bytes::BytesMut::with_capacity(cap);
+                grown.extend_from_slice(&e.tx);
+                e.tx = grown;
+            }
         }
-        let space = (e.tx_reservation.bytes() as usize)
-            .min(e.tx_cap)
-            .saturating_sub(e.tx.len());
+        let space = e.tx.capacity().min(e.tx_cap).saturating_sub(e.tx.len());
         if space == 0 {
             e.write_waker = Some(cx.waker().clone());
             return Poll::Pending;

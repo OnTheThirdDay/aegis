@@ -444,7 +444,7 @@ impl Shared {
         }
         e.state = StreamState::Reset;
         e.reset_reason = Some(reason);
-        e.tx.clear();
+        e.tx = BytesMut::new();
         e.fin_requested = false;
         e.reset = ResetPhase::AwaitingPeer {
             deadline: Instant::now() + self.cfg.reset_drain_timeout,
@@ -701,7 +701,16 @@ impl Session {
         };
         let started = std::time::Instant::now();
 
+        // If this future is dropped while waiting (the caller gave up), the
+        // guard ends the stream: an ACK may already sit in the channel, and
+        // nothing else would ever release the slot.
+        let guard = OpenGuard {
+            shared,
+            id,
+            armed: true,
+        };
         let outcome = tokio::time::timeout_at(deadline, rx).await;
+        guard.disarm();
         let elapsed = started.elapsed().as_secs_f64();
         let result = match outcome {
             Ok(Ok(OpenAck::Success)) => Ok(id),
@@ -817,6 +826,41 @@ impl Drop for Session {
             self.shared
                 .fail(&mut st, SessionError::Closed(ResetReason::Shutdown));
         }
+    }
+}
+
+/// Ends a client stream whose opener was cancelled before it took the
+/// result, whatever the ACK did meanwhile.
+struct OpenGuard<'a> {
+    shared: &'a Arc<Shared>,
+    id: u32,
+    armed: bool,
+}
+
+impl OpenGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpenGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let shared = self.shared;
+        let mut st = shared.lock();
+        let Some(e) = st.streams.get_mut(&self.id) else {
+            return;
+        };
+        e.open_waiter = None;
+        e.handle_alive = false;
+        if !e.state.is_terminal() && st.closed.is_none() {
+            if let Err(err) = shared.local_reset(&mut st, self.id, ResetReason::Cancelled) {
+                shared.fail(&mut st, err);
+            }
+        }
+        shared.try_remove(&mut st, self.id);
     }
 }
 
@@ -1714,7 +1758,7 @@ fn on_reset(
         e.reset_reason = Some(reason);
     }
     e.reset = ResetPhase::None;
-    e.tx.clear();
+    e.tx = BytesMut::new();
     e.fin_requested = false;
     e.wake_all();
     if let Some(w) = waiter {
@@ -1834,6 +1878,9 @@ fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result
             e.send_credit -= n as u64;
             st.send_session_credit -= n as u64;
             if e.tx.is_empty() {
+                // Release the allocation together with the reservation, or
+                // the drained buffer keeps memory no budget accounts for.
+                e.tx = BytesMut::new();
                 let keep = u64::from(shared.initial_tx());
                 let held = e.tx_reservation.bytes();
                 if held > keep {
@@ -1979,6 +2026,67 @@ async fn timer_task(shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The transmit buffer's allocation stays within its reservation while
+    /// it grows and drains, and an empty buffer holds no allocation.
+    #[tokio::test]
+    async fn transmit_allocation_stays_within_its_reservation() {
+        use aegis_contracts::observability::NoopObservability;
+        use tokio::io::AsyncWriteExt;
+        let obs: Arc<dyn Observability> = Arc::new(NoopObservability);
+        let cfg = |id: &str| SessionConfig {
+            node_id: id.into(),
+            ..SessionConfig::default()
+        };
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let budget = Budget::root(64 << 20);
+        let (sb, so) = (Arc::clone(&budget), Arc::clone(&obs));
+        let server =
+            tokio::spawn(async move { server_handshake(b, cfg("gw-1"), sb, so, "client-1").await });
+        let client = client_handshake(a, cfg("client-1"), Arc::clone(&budget), obs)
+            .await
+            .expect("client");
+        let (_server, mut incoming) = server.await.expect("join").expect("server");
+        let sink = tokio::spawn(async move {
+            let open = incoming.next().await.expect("open");
+            let mut s = open.accept().expect("accept");
+            let mut buf = vec![0u8; 64 * 1024];
+            while tokio::io::AsyncReadExt::read(&mut s, &mut buf)
+                .await
+                .is_ok_and(|n| n > 0)
+            {}
+        });
+        let dest = Destination::parse_authority("192.0.2.1:80").expect("dest");
+        let mut s = client
+            .open(dest, Duration::from_secs(5))
+            .await
+            .expect("open");
+        let check = |client: &Session| {
+            let st = client.shared.lock();
+            for e in st.streams.values() {
+                assert!(
+                    e.tx.capacity() as u64 <= e.tx_reservation.bytes(),
+                    "allocation {} over reservation {}",
+                    e.tx.capacity(),
+                    e.tx_reservation.bytes()
+                );
+            }
+        };
+        for round in 0..20usize {
+            let chunk = vec![round as u8; 37 * 1024 + round];
+            s.write_all(&chunk).await.expect("write");
+            check(&client);
+        }
+        s.flush().await.expect("flush");
+        check(&client);
+        {
+            let st = client.shared.lock();
+            let e = st.streams.values().next().expect("stream");
+            assert_eq!(e.tx.capacity(), 0, "a drained buffer keeps no allocation");
+        }
+        drop(s);
+        sink.abort();
+    }
 
     #[test]
     fn effective_streams_reserve_working_share() {

@@ -633,6 +633,9 @@ fn activate(app: &Appliance, hostname: &str, chain: &str, key: &str) -> Result<i
 /// Rewrite the edge manifest's SNI alternates atomically, removing files of
 /// replaced alternates afterwards.
 fn set_alternates(app: &Appliance, alternates: Vec<Value>) -> Result<(), String> {
+    let _lock = crate::appliance::MANIFEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let text = app
         .secrets
         .read("edge-tls.json")
