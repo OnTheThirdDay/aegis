@@ -60,6 +60,16 @@
     "valid": true
   },
   {
+    "name": "open_udp",
+    "hex": "41474e3101030000000000010000000c02015db8d822003500002710",
+    "valid": true
+  },
+  {
+    "name": "datagram",
+    "hex": "41474e31010c000000000001000000026869",
+    "valid": true
+  },
+  {
     "name": "bad_empty_data",
     "hex": "41474e31010500000000000100000000",
     "valid": false
@@ -87,6 +97,21 @@
   {
     "name": "bad_open_trailing",
     "hex": "41474e3101030000000000010000000d01015db8d82201bb0000271000",
+    "valid": false
+  },
+  {
+    "name": "bad_empty_datagram",
+    "hex": "41474e31010c00000000000100000000",
+    "valid": false
+  },
+  {
+    "name": "bad_datagram_stream_zero",
+    "hex": "41474e31010c0000000000000000000168",
+    "valid": false
+  },
+  {
+    "name": "bad_open_network",
+    "hex": "41474e3101030000000000010000000c03015db8d822003500002710",
     "valid": false
   }
 ]

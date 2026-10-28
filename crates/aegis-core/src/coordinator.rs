@@ -216,7 +216,11 @@ pub struct Coordinator {
     writer: Mutex<()>,
     failpoints: Arc<dyn FailPoints>,
     obs: Arc<dyn Observability>,
-    restart_required: Mutex<Vec<String>>,
+    /// The first configuration this process published: what its listeners,
+    /// identities and budgets were built from. Restart requirements are
+    /// measured against it, not against the previous revision, so a later
+    /// activation can't hide one that is still outstanding.
+    started_with: std::sync::OnceLock<aegis_config::NodeConfig>,
     on_revoke: Mutex<Option<RevokeHook>>,
 }
 
@@ -272,7 +276,7 @@ impl Coordinator {
             writer: Mutex::new(()),
             failpoints,
             obs,
-            restart_required: Mutex::new(Vec::new()),
+            started_with: std::sync::OnceLock::new(),
             on_revoke: Mutex::new(None),
         }
     }
@@ -823,14 +827,6 @@ impl Coordinator {
                 return Ok(job);
             }
         };
-        let restart = {
-            let current = self.gate.current();
-            security_diff(
-                current.as_ref().map(|b| &b.compiled.config),
-                &compiled.config,
-            )
-            .restart_required
-        };
         // 2. Recheck under the single-writer lock.
         let _w = self.lock_writer();
         let recheck = self.store.read_as(|c| -> CResult<()> {
@@ -934,6 +930,9 @@ impl Coordinator {
             FailAction::Fail => false,
             FailAction::Continue => self.gate.publish(expected.as_deref(), bundle).is_ok(),
         };
+        if published {
+            self.note_published();
+        }
         if !published {
             self.enter_reconciling(&mut job, "publication_failed");
             return Ok(job);
@@ -943,13 +942,7 @@ impl Coordinator {
         }
         // 5. Durable applied record.
         match self.complete_applied(&mut job, &op_id) {
-            Ok(()) => {
-                *self
-                    .restart_required
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = restart;
-                Ok(job)
-            }
+            Ok(()) => Ok(job),
             Err(CoordinatorError::Crashed) => Err(CoordinatorError::Crashed),
             Err(_) => {
                 // Published but not durably recorded: hold new admissions
@@ -1186,7 +1179,11 @@ impl Coordinator {
                     compiled: Arc::new(compiled),
                 });
                 let expected = self.gate.current_revision();
-                if self.gate.publish(expected.as_deref(), bundle).is_err() {
+                let published = self.gate.publish(expected.as_deref(), bundle).is_ok();
+                if published {
+                    self.note_published();
+                }
+                if !published {
                     self.agent.transition(AgentState::Degraded {
                         admission_allowed: false,
                     });
@@ -1252,6 +1249,7 @@ impl Coordinator {
             if self.gate.publish(current.as_deref(), bundle).is_err() {
                 return blocked("publication CAS mismatch".into());
             }
+            self.note_published();
         }
         let mut job = match intent
             .job_id
@@ -1424,6 +1422,7 @@ impl Coordinator {
             self.enter_reconciling(&mut job, "publication_failed");
             return Ok(job);
         }
+        self.note_published();
         if self.complete_applied(&mut job, &new_op).is_err() {
             self.enter_reconciling(&mut job, "applied_record_failed");
         }
@@ -1623,11 +1622,28 @@ impl Coordinator {
             applied_revision_id: applied,
             pending_operation_id: pending,
             updated_at: rfc3339(db::now_unix()),
-            restart_required: self
-                .restart_required
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+            restart_required: self.restart_required(),
+        }
+    }
+
+    /// Record the configuration this process started with (the first one
+    /// published); later publications leave it unchanged.
+    fn note_published(&self) {
+        if self.started_with.get().is_none() {
+            if let Some(b) = self.gate.current() {
+                let _ = self.started_with.set(b.compiled.config.clone());
+            }
+        }
+    }
+
+    /// What the active configuration changes that only a restart applies,
+    /// compared with what this process is actually running.
+    pub fn restart_required(&self) -> Vec<String> {
+        match (self.started_with.get(), self.gate.current()) {
+            (Some(running), Some(active)) => {
+                security_diff(Some(running), &active.compiled.config).restart_required
+            }
+            _ => Vec::new(),
         }
     }
 }

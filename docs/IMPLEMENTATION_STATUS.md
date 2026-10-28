@@ -42,8 +42,8 @@ Status legend:
 | C-003 multiplexer | PASS (dev) | `aegis-session`. |
 | C-004 WebSocket | PARTIAL | `aegis-transport-ws`. Direct path tested; local reverse proxy and Cloudflare paths are BLOCKED. |
 | C-005 HTTP/2 | NOT IMPL | Rejected by validation. |
-| C-006 DATAGRAM / UDP | NOT IMPL | The frame type is rejected; UDP explain answers "deny". |
-| D-001 SOCKS5 | PASS (dev) | `aegis-inbound-socks`. |
+| C-006 DATAGRAM / UDP | PASS (dev) | Optional feature 0x0001: UDP flows with DATAGRAM frames, bounded reserved buffers that drop instead of blocking ([ADR-0012](adr/0012-udp-flows.md)); `aegis-session/tests/datagram.rs`, vectors, `e2e.rs` SOCKS5 UDP ASSOCIATE. Head-of-line effects under loss are not measured. |
+| D-001 SOCKS5 | PASS (dev) | `aegis-inbound-socks`: CONNECT and UDP ASSOCIATE (no fragmentation). |
 | D-002 HTTP CONNECT | PASS (dev) | `aegis-inbound-http`. |
 | D-003 gateway egress | PASS (dev) | `aegis-policy::address`, `aegis-outbound-direct`. Per-user/network rate quotas are not implemented. |
 | D-004 DNS | PASS (dev) for M1 | `aegis-dns`: explicit resolvers, no fallback, IPv6 policy. Split DNS (M3/M4) is NOT IMPL. |
@@ -110,7 +110,8 @@ Status legend:
 | TC-N01 / TC-N02 / TC-N03 | PASS (dev) | Inbound unit tests plus `e2e.rs` (SSRF via literal, via DNS-resolved loopback, and via the metadata IP). |
 | TC-N04 | PASS (dev) | `aegis-policy/tests/golden.rs` (1,050 rules, order independence). |
 | TC-N05 | PARTIAL | Direct WebSocket path, byte-exact transfers, restart persistence. Cloudflare proxied, Tunnel and OCI paths are BLOCKED. |
-| TC-N06 / TC-N07 | NOT IMPL | |
+| TC-N06 | NOT IMPL | |
+| TC-N07 | PARTIAL | Boundaries up to the frame cap, bounded queues and counted drops, RESET, negotiation and peer violations (`aegis-session/tests/datagram.rs`); UDP through a gateway end to end (`e2e.rs`). No loss/reorder simulation or head-of-line measurement yet. |
 
 ### Observability
 

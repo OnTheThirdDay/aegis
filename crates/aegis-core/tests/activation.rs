@@ -159,6 +159,21 @@ fn stage_change(
     default_action: &str,
     key: &str,
 ) -> (String, String) {
+    stage_patch(
+        node,
+        profile_id,
+        &json!({"routing": {"default_action": default_action}}),
+        key,
+    )
+}
+
+/// Merge-patch the profile, validate, submit.
+fn stage_patch(
+    node: &Node,
+    profile_id: &str,
+    patch: &serde_json::Value,
+    key: &str,
+) -> (String, String) {
     let p = node
         .coord
         .store()
@@ -166,13 +181,7 @@ fn stage_change(
         .expect("p");
     let p = node
         .coord
-        .patch_profile(
-            None,
-            profile_id,
-            &p.etag(),
-            None,
-            Some(&json!({"routing": {"default_action": default_action}})),
-        )
+        .patch_profile(None, profile_id, &p.etag(), None, Some(patch))
         .expect("patch");
     let report = node
         .coord
@@ -230,6 +239,40 @@ fn happy_path_activation() {
     assert!(audit
         .iter()
         .any(|a| a.action == "activation.applied" && a.decision == "applied"));
+}
+
+#[test]
+fn a_later_activation_keeps_an_outstanding_restart_requirement() {
+    let (_d, path) = tmpdb();
+    let node = boot(&path, Arc::new(NoFailPoints));
+    let profile = initial(&node);
+    assert!(node.coord.health().restart_required.is_empty());
+    let run = |job: &str| {
+        let done = node.coord.run_job(job).expect("run");
+        assert_eq!(done.status, "succeeded", "{done:?}");
+    };
+    let (job, _) = stage_patch(
+        &node,
+        &profile.id,
+        &json!({"core": {"idle_timeout_seconds": 301}}),
+        "key-restart-0001",
+    );
+    run(&job);
+    let core = vec!["core budgets/timeouts changed".to_string()];
+    assert_eq!(node.coord.health().restart_required, core);
+    // A routing-only change doesn't apply the core change: still pending.
+    let (job, _) = stage_change(&node, &profile.id, "proxy", "key-restart-0002");
+    run(&job);
+    assert_eq!(node.coord.health().restart_required, core);
+    // Reverting it leaves nothing to restart for.
+    let (job, _) = stage_patch(
+        &node,
+        &profile.id,
+        &json!({"core": {"idle_timeout_seconds": 300}}),
+        "key-restart-0003",
+    );
+    run(&job);
+    assert!(node.coord.health().restart_required.is_empty());
 }
 
 #[test]

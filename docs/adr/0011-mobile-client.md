@@ -21,7 +21,7 @@ Users want the gateway on their phones. A local proxy, as on desktop, is of litt
 - The VPN interface's descriptor goes to the core, where a userspace TCP/IP stack (`ipstack`) terminates connections.
 - **TCP** is opened through the client node's local SOCKS proxy. Each connection then takes exactly the desktop data path: mutual TLS, AGP and gateway policy.
 - **DNS is fake-IP.** Every `A` query (UDP port 53, whatever server an app asks) is answered from 198.18.0.0/15, and a connection to one of those addresses is opened *by name*. The gateway therefore resolves every name, as `remote_required` demands. `AAAA`, HTTPS/SVCB and other record types get an empty answer, which keeps apps on IPv4.
-- **Other UDP and ICMP are dropped.** AGP carries TCP only. Browsers fall back from QUIC to TCP; calls, games and DNS-over-QUIC don't work until UDP support lands.
+- **Other UDP** (QUIC, calls, games) goes through the local proxy's UDP ASSOCIATE, one association per flow, and on to the gateway as AGP UDP flows ([ADR-0012](0012-udp-flows.md)). A gateway too old for UDP flows refuses them, and apps fall back to TCP. **ICMP** is dropped.
 - **Routes:**
   - All public IPv4 goes through the VPN, plus IPv6 global unicast (2000::/3) so that IPv6 literals can't leak.
   - Local ranges stay direct: RFC 1918, link-local, CGNAT 100.64/10, loopback and multicast. The routes are computed as a complement, because `excludeRoute` needs API 33.
@@ -56,5 +56,5 @@ Users want the gateway on their phones. A local proxy, as on desktop, is of litt
 ## Consequences
 
 - Phones get a real VPN with the gateway's identity pinning, policy and renewal unchanged. The packet path is new code, covered by host unit tests: fake DNS, routes and the SOCKS hop. End to end it was verified on an Android 15 emulator with 16 KB pages: enrollment, VPN consent, `nc` and Chrome (HTTPS) through a local gateway, and disconnect.
-- UDP applications don't work through the VPN yet.
+- UDP applications work through the VPN when the gateway supports UDP flows (ADR-0012).
 - iOS needs a Network Extension target (packet tunnel) and an Apple developer account for signing. The Rust core and Flutter UI carry over.

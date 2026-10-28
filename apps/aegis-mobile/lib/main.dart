@@ -500,7 +500,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ListTile(
                       leading: const Icon(Icons.lan_outlined),
                       title: const Text('Open connections'),
-                      subtitle: Text('${s.connections}'),
+                      subtitle: Text(s.udpFlows > 0
+                          ? '${s.connections}  ·  ${s.udpFlows} UDP'
+                          : '${s.connections}'),
                     ),
                   ],
                 ],

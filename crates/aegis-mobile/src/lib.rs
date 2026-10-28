@@ -319,6 +319,9 @@ pub fn status() -> Value {
         "connections": stats.tcp_open.load(Ordering::Relaxed),
         "connections_total": stats.tcp_total.load(Ordering::Relaxed),
         "connections_failed": stats.tcp_failed.load(Ordering::Relaxed),
+        "udp_flows": stats.udp_open.load(Ordering::Relaxed),
+        "udp_flows_total": stats.udp_total.load(Ordering::Relaxed),
+        "udp_flows_failed": stats.udp_failed.load(Ordering::Relaxed),
         "dns_queries": stats.dns_queries.load(Ordering::Relaxed),
         "dropped": stats.dropped.load(Ordering::Relaxed),
     }))

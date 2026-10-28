@@ -13,8 +13,8 @@ mod frame;
 
 pub use control::{
     decode_reset, decode_window_update, encode_reset, encode_window_update, Feature, GoAway, Hello,
-    Network, OpenAck, OpenRequest, CRITICAL_FEATURE_BIT, MAX_FEATURES, MAX_HELLO_LEN,
-    MAX_NODE_ID_LEN, MAX_OPEN_TIMEOUT_MS,
+    Network, OpenAck, OpenRequest, CRITICAL_FEATURE_BIT, FEATURE_DATAGRAM, MAX_FEATURES,
+    MAX_HELLO_LEN, MAX_NODE_ID_LEN, MAX_OPEN_TIMEOUT_MS,
 };
 pub use frame::{
     encode_frame, encode_header, Decoder, Frame, FrameType, Header, FLAG_RESET_ACK, HEADER_LEN,
@@ -30,7 +30,7 @@ pub enum ProtocolError {
     BadMagic,
     UnsupportedVersion(u8),
     UnknownFrameType(u8),
-    /// DATAGRAM (P1) is not negotiated in this build.
+    /// A frame type this build doesn't accept (none at present).
     UnsupportedFrameType(FrameType),
     ReservedFlags {
         frame_type: FrameType,

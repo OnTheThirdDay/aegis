@@ -1354,3 +1354,222 @@ async fn client_shutdown_closes_existing_tunnel_streams() {
         "client still forwards through its tunnel after shutdown: {result:?}"
     );
 }
+
+/// A UDP echo on `ip`: every datagram goes back to its sender.
+async fn udp_echo_server(ip: IpAddr) -> SocketAddr {
+    let s = tokio::net::UdpSocket::bind(SocketAddr::new(ip, 0))
+        .await
+        .expect("bind udp echo");
+    let addr = s.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = s.recv_from(&mut buf).await {
+            let _ = s.send_to(&buf[..n], from).await;
+        }
+    });
+    addr
+}
+
+/// SOCKS5 UDP ASSOCIATE: the control connection and the relay address.
+async fn socks_udp_associate(proxy: SocketAddr) -> (TcpStream, SocketAddr) {
+    let mut s = TcpStream::connect(proxy).await.expect("connect proxy");
+    s.write_all(&[5, 1, 0]).await.expect("greet");
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r).await.expect("method");
+    assert_eq!(r, [5, 0]);
+    s.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .expect("associate");
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).await.expect("reply");
+    assert_eq!(&reply[..4], &[5, 0, 0, 1], "associate refused");
+    let ip = std::net::Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]);
+    let port = u16::from_be_bytes([reply[8], reply[9]]);
+    (s, SocketAddr::new(IpAddr::V4(ip), port))
+}
+
+async fn udp_exchange(
+    socket: &tokio::net::UdpSocket,
+    relay: SocketAddr,
+    dest: &aegis_contracts::Destination,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    socket
+        .send_to(&aegis_inbound_socks::encode_udp(dest, data), relay)
+        .await
+        .expect("send");
+    let mut buf = vec![0u8; 65536];
+    let n = tokio::time::timeout(Duration::from_millis(1500), socket.recv(&mut buf))
+        .await
+        .ok()?
+        .expect("recv");
+    let (from, payload) = aegis_inbound_socks::parse_udp(&buf[..n]).expect("socks udp header");
+    assert_eq!(&from, dest, "reply names its source");
+    Some(payload.to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tc_n07_udp_through_socks_associate_and_the_tunnel() {
+    let Some(env) = setup().await else { return };
+    let echo = udp_echo_server(env.echo.ip()).await;
+    let (control, relay) =
+        socks_udp_associate(env.client.bound_addr("socks").expect("socks")).await;
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let dest = aegis_contracts::Destination::parse_authority(&echo.to_string()).expect("dest");
+    for size in [1usize, 512, 1400, 8000] {
+        let data: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        let back = udp_exchange(&socket, relay, &dest, &data)
+            .await
+            .expect("echoed through the gateway");
+        assert_eq!(back, data, "{size}-byte datagram");
+    }
+    // Gateway policy still applies: loopback isn't an allowed egress.
+    let denied_echo = udp_echo_server(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+    let denied =
+        aegis_contracts::Destination::parse_authority(&denied_echo.to_string()).expect("dest");
+    assert!(
+        udp_exchange(&socket, relay, &denied, b"x").await.is_none(),
+        "denied destination answered"
+    );
+    // Datagrams from another host port are ignored.
+    let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    assert!(udp_exchange(&stranger, relay, &dest, b"x").await.is_none());
+    // Closing the control connection ends the association and its flows.
+    drop(control);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while env.gw.ctx.gauges().streams_active > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("gateway flows closed");
+    assert!(udp_exchange(&socket, relay, &dest, b"x").await.is_none());
+}
+
+/// A client whose routes go direct (no gateway), listening on `socks_bind`
+/// and `http_bind`.
+fn direct_client_toml(dir: &Path, secrets: &Path, socks_bind: &str, http_bind: &str) -> String {
+    format!(
+        r#"
+schema_version = "0.1"
+node_id = "laptop-1"
+role = "client"
+[management]
+enabled = false
+config_store = "{store}"
+[secrets]
+dir = "{secrets}"
+[identity]
+peer_auth = "mutual_tls_1_3"
+client_identity = "secret://identity/client-cert"
+client_private_key = "secret://identity/client-key"
+trusted_server_ca = "secret://identity/server-ca"
+[[inbounds]]
+id = "socks"
+kind = "socks5"
+bind = "{socks_bind}"
+[[inbounds]]
+id = "http"
+kind = "http_connect"
+bind = "{http_bind}"
+[[outbounds]]
+id = "direct"
+kind = "direct_tcp"
+restricted_address_policy = "allow-private"
+[routing]
+default_outbound = "direct"
+default_action = "direct"
+[dns]
+mode = "local_explicit"
+ipv6_policy = "follow-routing-policy"
+resolver = "system"
+"#,
+        store = dir.join("direct-client.db").display(),
+        secrets = secrets.display(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_stops_direct_relays_before_returning() {
+    let Some(ip) = lan_ip() else {
+        eprintln!("BLOCKED: no non-loopback interface");
+        return;
+    };
+    let echo = echo_server(ip).await;
+    let dir = tempfile::tempdir().expect("tmp");
+    let secrets = dir.path().join("secrets");
+    provision(&secrets);
+    let cfg = parse_toml(&direct_client_toml(
+        dir.path(),
+        &secrets,
+        "127.0.0.1:0",
+        "127.0.0.1:0",
+    ))
+    .expect("cfg");
+    let client = start(StartOptions {
+        config: cfg,
+        store_path: dir.path().join("direct-client.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("start");
+    let (mut s, reply) = socks_connect(
+        client.bound_addr("socks").expect("socks"),
+        &echo.to_string(),
+        None,
+    )
+    .await;
+    assert_eq!(reply, 0);
+    s.write_all(b"before").await.expect("write");
+    let mut b = [0u8; 6];
+    s.read_exact(&mut b).await.expect("echo");
+    client.shutdown(Duration::ZERO).await;
+    // No waiting: once shutdown returned, the relay is gone.
+    let forwarded = async {
+        s.write_all(b"after!").await?;
+        s.read_exact(&mut b).await?;
+        Ok::<_, std::io::Error>(b)
+    };
+    let result = tokio::time::timeout(Duration::from_secs(2), forwarded).await;
+    assert!(
+        !matches!(result, Ok(Ok(_))),
+        "direct relay still forwards after shutdown: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_start_leaves_no_listener_behind() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let secrets = dir.path().join("secrets");
+    provision(&secrets);
+    let free = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let free_port = free.local_addr().expect("addr").port();
+    drop(free);
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy");
+    let taken_port = taken.local_addr().expect("addr").port();
+    let cfg = parse_toml(&direct_client_toml(
+        dir.path(),
+        &secrets,
+        &format!("127.0.0.1:{free_port}"),
+        &format!("127.0.0.1:{taken_port}"),
+    ))
+    .expect("cfg");
+    let err = start(StartOptions {
+        config: cfg,
+        store_path: dir.path().join("direct-client.db"),
+        failpoints: None,
+    })
+    .await
+    .err()
+    .expect("second bind fails");
+    assert_eq!(err.code(), "E_BIND");
+    assert!(
+        TcpStream::connect(("127.0.0.1", free_port)).await.is_err(),
+        "the first inbound is still listening"
+    );
+    drop(taken);
+}

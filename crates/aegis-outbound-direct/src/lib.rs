@@ -1,9 +1,11 @@
-//! Policy-restricted direct TCP egress (D-003).
+//! Policy-restricted direct TCP and UDP egress (D-003).
 //!
 //! Resolution happens once under the admitted DNS policy; every candidate
 //! address is passed through the caller's policy check (egress ACL, CIDR deny
 //! rules, IPv6 policy) and only validated addresses are dialed. There is no
-//! second, unchecked resolution, which closes DNS-rebinding gaps.
+//! second, unchecked resolution, which closes DNS-rebinding gaps. A UDP
+//! socket is connected to its one validated address, so it neither sends
+//! anywhere else nor accepts datagrams from anyone else.
 #![forbid(unsafe_code)]
 
 use aegis_contracts::capability::{
@@ -17,7 +19,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     module_id: "aegis.outbound.direct",
@@ -28,6 +30,7 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
     provides: &[
         Capability::ByteStream,
         Capability::HalfClose,
+        Capability::Datagram,
         Capability::EgressAcl,
     ],
     requires: &[],
@@ -111,7 +114,64 @@ impl DirectDialer {
     where
         F: Fn(IpAddr) -> Result<(), RouteDecision>,
     {
-        let candidates: Vec<IpAddr> = match &dest.host {
+        let candidates = self.candidates(dest, check).await?;
+        let mut last = DialError::Unreachable;
+        for ip in candidates.into_iter().take(MAX_ATTEMPTS) {
+            let addr = SocketAddr::new(ip, dest.port);
+            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    let _ = stream.set_nodelay(true);
+                    return Ok((stream, addr));
+                }
+                Ok(Err(e)) => last = classify_io(&e),
+                Err(_) => last = DialError::Timeout,
+            }
+        }
+        Err(last)
+    }
+
+    /// Resolve (if needed), validate every address with `check`, then bind
+    /// a UDP socket connected to the first validated address this host can
+    /// route to. Returns the socket and that address.
+    pub async fn bind_udp<F>(
+        &self,
+        dest: &Destination,
+        check: F,
+    ) -> Result<(UdpSocket, SocketAddr), DialError>
+    where
+        F: Fn(IpAddr) -> Result<(), RouteDecision>,
+    {
+        let candidates = self.candidates(dest, check).await?;
+        let mut last = DialError::Unreachable;
+        for ip in candidates.into_iter().take(MAX_ATTEMPTS) {
+            let addr = SocketAddr::new(ip, dest.port);
+            let any: SocketAddr = if ip.is_ipv4() {
+                (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+            } else {
+                (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+            };
+            let socket = match UdpSocket::bind(any).await {
+                Ok(s) => s,
+                Err(e) => {
+                    last = classify_io(&e);
+                    continue;
+                }
+            };
+            // Connecting sends nothing; it fails when there is no route.
+            match socket.connect(addr).await {
+                Ok(()) => return Ok((socket, addr)),
+                Err(e) => last = classify_io(&e),
+            }
+        }
+        Err(last)
+    }
+
+    /// The validated addresses for `dest`, in resolver order.
+    async fn candidates<F>(&self, dest: &Destination, check: F) -> Result<Vec<IpAddr>, DialError>
+    where
+        F: Fn(IpAddr) -> Result<(), RouteDecision>,
+    {
+        Ok(match &dest.host {
             Host::Ip(ip) => {
                 check(*ip).map_err(DialError::Denied)?;
                 vec![*ip]
@@ -137,20 +197,7 @@ impl DirectDialer {
                 }
                 allowed
             }
-        };
-        let mut last = DialError::Unreachable;
-        for ip in candidates.into_iter().take(MAX_ATTEMPTS) {
-            let addr = SocketAddr::new(ip, dest.port);
-            match tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => {
-                    let _ = stream.set_nodelay(true);
-                    return Ok((stream, addr));
-                }
-                Ok(Err(e)) => last = classify_io(&e),
-                Err(_) => last = DialError::Timeout,
-            }
-        }
-        Err(last)
+        })
     }
 }
 
@@ -201,6 +248,30 @@ mod tests {
             dialer.dial(&dest, |_| Ok(())).await,
             Err(DialError::Unsupported)
         ));
+    }
+
+    #[tokio::test]
+    async fn udp_is_checked_and_connected_to_its_destination() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let port = target.local_addr().expect("addr").port();
+        let other = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let dialer = DirectDialer::new(None, Duration::from_secs(1));
+        let dest = Destination::parse_authority(&format!("127.0.0.1:{port}")).expect("dest");
+        assert!(matches!(
+            dialer.bind_udp(&dest, deny_loopback).await,
+            Err(DialError::Denied(_))
+        ));
+        let (socket, peer) = dialer.bind_udp(&dest, |_| Ok(())).await.expect("bind");
+        assert_eq!(peer, target.local_addr().expect("addr"));
+        socket.send(b"ping").await.expect("send");
+        let mut buf = [0u8; 16];
+        let (n, from) = target.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(&buf[..n], b"ping");
+        // Only the destination's replies arrive.
+        other.send_to(b"spoof", from).await.expect("spoof");
+        target.send_to(b"pong", from).await.expect("reply");
+        let n = socket.recv(&mut buf).await.expect("reply");
+        assert_eq!(&buf[..n], b"pong");
     }
 
     #[tokio::test]

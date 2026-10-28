@@ -1,12 +1,13 @@
 //! Session engine: handshake, shared state, reader/writer/timer tasks.
 
 use crate::config::SessionConfig;
+use crate::datagram::DatagramFlow;
 use crate::error::{OpenError, SessionError};
 use crate::stream::MuxStream;
 use aegis_agp::{
     decode_reset, decode_window_update, encode_frame, encode_reset, encode_window_update, Decoder,
-    Frame, FrameType, GoAway, Hello, OpenAck, OpenRequest, ProtocolError, FLAG_RESET_ACK,
-    MAX_WINDOW, VERSION_MAJOR,
+    Frame, FrameType, GoAway, Hello, Network, OpenAck, OpenRequest, ProtocolError,
+    FEATURE_DATAGRAM, FLAG_RESET_ACK, MAX_WINDOW, VERSION_MAJOR,
 };
 use aegis_buffer::{Budget, Reservation};
 use aegis_contracts::observability::{Event, Observability, PoolClass};
@@ -51,7 +52,22 @@ pub struct SessionStats {
     pub stream_windows: u64,
     pub send_session_credit: u64,
     pub control_queued: usize,
+    /// Datagram bytes waiting to be written, and received ones waiting
+    /// for their flows' readers.
+    pub datagram_send_queued: u64,
+    pub datagram_recv_queued: u64,
+    /// Datagrams dropped (either direction) because a queue was full.
+    pub datagrams_dropped: u64,
     pub closed: bool,
+}
+
+/// What a logical stream carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamKind {
+    /// An ordered byte stream (TCP): DATA under credit, HALF_CLOSE.
+    Bytes,
+    /// A UDP flow: whole DATAGRAMs, no credit, droppable; ends by RESET.
+    Datagrams,
 }
 
 #[derive(Debug)]
@@ -144,8 +160,11 @@ impl ReceiveBuffer {
 
 #[derive(Debug)]
 pub(crate) struct Entry {
+    pub kind: StreamKind,
     pub state: StreamState,
     pub rx: ReceiveBuffer,
+    /// Received datagrams (UDP flows only), oldest first.
+    pub datagrams: VecDeque<Bytes>,
     pub rx_buffered: u32,
     pub rx_outstanding: u32,
     pub pending_grant: u32,
@@ -178,8 +197,10 @@ impl Entry {
         reservation: Reservation,
     ) -> Self {
         Entry {
+            kind: StreamKind::Bytes,
             state,
             rx: ReceiveBuffer::new(),
+            datagrams: VecDeque::new(),
             rx_buffered: 0,
             rx_outstanding: rx_window,
             pending_grant: 0,
@@ -198,6 +219,15 @@ impl Entry {
             open_waiter: None,
             handle_alive: true,
             tx_reservation: reservation,
+        }
+    }
+
+    /// A UDP flow: no receive window, credit or transmit buffer (its
+    /// datagrams live in the session's datagram buffers).
+    fn flow(state: StreamState, reservation: Reservation) -> Self {
+        Entry {
+            kind: StreamKind::Datagrams,
+            ..Entry::new(state, 0, 0, 0, reservation)
         }
     }
 
@@ -247,8 +277,16 @@ pub(crate) struct State {
     pub ping_outstanding: Option<Instant>,
     pub ping_counter: u64,
     pub incoming_tx: Option<mpsc::Sender<IncomingOpen>>,
+    /// Datagrams waiting for the writer, with their total size.
+    pub dgram_tx: VecDeque<(u32, Bytes)>,
+    pub dgram_tx_bytes: usize,
+    /// Bytes of received datagrams held across all flows.
+    pub dgram_rx_bytes: usize,
+    pub dgram_dropped: u64,
     _rx_reservation: Reservation,
     _control_reservation: Reservation,
+    /// Backs both datagram buffers while the feature is in use.
+    _datagram_reservation: Option<Reservation>,
 }
 
 pub(crate) struct Shared {
@@ -261,6 +299,8 @@ pub(crate) struct Shared {
     pub budget: Arc<Budget>,
     pub local_max_streams: u32,
     pub obs: Arc<dyn Observability>,
+    /// Both sides agreed on UDP flows (feature 0x0001).
+    pub datagrams: bool,
 }
 
 impl Shared {
@@ -268,16 +308,18 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn send_frame_cap(&self) -> usize {
+    pub(crate) fn send_frame_cap(&self) -> usize {
         self.peer.max_frame_payload.min(self.cfg.max_frame_payload) as usize
     }
 
-    /// Whether one more stream can be admitted: below `limit` streams and
-    /// its initial window within the stream-window budget.
-    pub(crate) fn admits(&self, st: &State, limit: u32) -> bool {
+    /// Whether one more stream can be admitted: below `limit` streams and,
+    /// for a byte stream, its initial window within the stream-window
+    /// budget (a UDP flow has no window).
+    pub(crate) fn admits(&self, st: &State, limit: u32, kind: StreamKind) -> bool {
         (st.streams.len() as u32) < limit
-            && st.stream_windows + u64::from(self.cfg.initial_stream_window)
-                <= self.cfg.stream_windows_budget(st.recv_reserved)
+            && (kind == StreamKind::Datagrams
+                || st.stream_windows + u64::from(self.cfg.initial_stream_window)
+                    <= self.cfg.stream_windows_budget(st.recv_reserved))
     }
 
     /// Initial transmit reservation of a stream.
@@ -375,13 +417,16 @@ impl Shared {
     /// credit again but stream credit is not replenished.
     fn discard_rx(&self, st: &mut State, id: u32) {
         let mut freed = 0u64;
+        let mut datagrams = 0usize;
         if let Some(e) = st.streams.get_mut(&id) {
             freed = u64::from(e.rx_buffered);
             e.rx.clear();
             e.rx_buffered = 0;
+            datagrams = e.datagrams.drain(..).map(|d| d.len()).sum();
         }
         st.recv_buffered -= freed;
         st.recv_pending_grant += freed;
+        st.dgram_rx_bytes -= datagrams;
     }
 
     /// Request a reset of stream `id` (RESET with ACK flag clear).
@@ -399,7 +444,7 @@ impl Shared {
         }
         e.state = StreamState::Reset;
         e.reset_reason = Some(reason);
-        e.tx.clear();
+        e.tx = BytesMut::new();
         e.fin_requested = false;
         e.reset = ResetPhase::AwaitingPeer {
             deadline: Instant::now() + self.cfg.reset_drain_timeout,
@@ -492,25 +537,35 @@ impl Session {
     fn open_locked(
         &self,
         st: &mut State,
+        kind: StreamKind,
         payload: &Bytes,
         tx: &mut Option<oneshot::Sender<OpenAck>>,
     ) -> Result<u32, OpenError> {
         let shared = &self.shared;
         let id = st.next_local_id.ok_or(OpenError::IdsExhausted)?;
+        let tx_bytes = match kind {
+            StreamKind::Bytes => u64::from(shared.initial_tx()),
+            StreamKind::Datagrams => 0,
+        };
         let reservation = shared
             .budget
-            .try_reserve(u64::from(shared.initial_tx()), PoolClass::Transmit)
+            .try_reserve(tx_bytes, PoolClass::Transmit)
             .map_err(|_| OpenError::Quota)?;
         st.next_local_id = id.checked_add(2);
-        let mut entry = Entry::new(
-            StreamState::Opening,
-            shared.cfg.initial_stream_window,
-            shared.peer.stream_window,
-            shared.cfg.stream_tx_buffer as usize,
-            reservation,
-        );
+        let mut entry = match kind {
+            StreamKind::Bytes => {
+                st.stream_windows += u64::from(shared.cfg.initial_stream_window);
+                Entry::new(
+                    StreamState::Opening,
+                    shared.cfg.initial_stream_window,
+                    shared.peer.stream_window,
+                    shared.cfg.stream_tx_buffer as usize,
+                    reservation,
+                )
+            }
+            StreamKind::Datagrams => Entry::flow(StreamState::Opening, reservation),
+        };
         entry.open_waiter = tx.take();
-        st.stream_windows += u64::from(shared.cfg.initial_stream_window);
         st.streams.insert(id, entry);
         if let Err(e) = shared.push_control(st, Frame::new(FrameType::Open, id, payload.clone())) {
             shared.fail(st, e.clone());
@@ -528,6 +583,40 @@ impl Session {
         destination: Destination,
         timeout: Duration,
     ) -> Result<MuxStream, OpenError> {
+        let id = self
+            .open_kind(StreamKind::Bytes, destination, timeout)
+            .await?;
+        Ok(MuxStream::new(Arc::clone(&self.shared), id))
+    }
+
+    /// Whether this session carries UDP flows (both sides agreed).
+    pub fn datagrams(&self) -> bool {
+        self.shared.datagrams
+    }
+
+    /// Open a UDP flow to `destination` (client role). Succeeds once the
+    /// gateway has a socket for it; fails `Unsupported` when the session
+    /// didn't negotiate UDP.
+    pub async fn open_datagram(
+        &self,
+        destination: Destination,
+        timeout: Duration,
+    ) -> Result<DatagramFlow, OpenError> {
+        if !self.shared.datagrams {
+            return Err(OpenError::Rejected(OpenFailure::Unsupported));
+        }
+        let id = self
+            .open_kind(StreamKind::Datagrams, destination, timeout)
+            .await?;
+        Ok(DatagramFlow::new(Arc::clone(&self.shared), id))
+    }
+
+    async fn open_kind(
+        &self,
+        kind: StreamKind,
+        destination: Destination,
+        timeout: Duration,
+    ) -> Result<u32, OpenError> {
         let start = tokio::time::Instant::now();
         let deadline = start + timeout;
         // The peer may count a stream we already released (its side closes a
@@ -536,7 +625,7 @@ impl Session {
         let slot_deadline = start + timeout.min(SLOT_WAIT);
         loop {
             match self
-                .open_once(destination.clone(), deadline, slot_deadline)
+                .open_once(kind, destination.clone(), deadline, slot_deadline)
                 .await
             {
                 Err(OpenError::Rejected(OpenFailure::Quota))
@@ -551,10 +640,11 @@ impl Session {
 
     async fn open_once(
         &self,
+        kind: StreamKind,
         destination: Destination,
         deadline: tokio::time::Instant,
         slot_deadline: tokio::time::Instant,
-    ) -> Result<MuxStream, OpenError> {
+    ) -> Result<u32, OpenError> {
         let shared = &self.shared;
         if !shared.is_client {
             return Err(OpenError::Rejected(OpenFailure::Unsupported));
@@ -576,7 +666,10 @@ impl Session {
             .unwrap_or(u32::MAX)
             .clamp(1, aegis_agp::MAX_OPEN_TIMEOUT_MS);
             let payload = OpenRequest {
-                network: aegis_agp::Network::Tcp,
+                network: match kind {
+                    StreamKind::Bytes => Network::Tcp,
+                    StreamKind::Datagrams => Network::Udp,
+                },
                 destination: destination.clone(),
                 timeout_ms,
             }
@@ -592,10 +685,10 @@ impl Session {
                     return Err(OpenError::GoingAway);
                 }
                 let limit = shared.peer.max_streams.min(shared.local_max_streams);
-                if !shared.admits(&st, limit) {
+                if !shared.admits(&st, limit, kind) {
                     None
                 } else {
-                    Some(self.open_locked(&mut st, &payload, &mut tx)?)
+                    Some(self.open_locked(&mut st, kind, &payload, &mut tx)?)
                 }
             };
             match opened {
@@ -608,10 +701,19 @@ impl Session {
         };
         let started = std::time::Instant::now();
 
+        // If this future is dropped while waiting (the caller gave up), the
+        // guard ends the stream: an ACK may already sit in the channel, and
+        // nothing else would ever release the slot.
+        let guard = OpenGuard {
+            shared,
+            id,
+            armed: true,
+        };
         let outcome = tokio::time::timeout_at(deadline, rx).await;
+        guard.disarm();
         let elapsed = started.elapsed().as_secs_f64();
         let result = match outcome {
-            Ok(Ok(OpenAck::Success)) => Ok(MuxStream::new(Arc::clone(shared), id)),
+            Ok(Ok(OpenAck::Success)) => Ok(id),
             Ok(Ok(OpenAck::Failure(f))) => Err(OpenError::Rejected(f)),
             Ok(Err(_)) => {
                 let st = shared.lock();
@@ -708,6 +810,9 @@ impl Session {
             stream_windows: st.stream_windows,
             send_session_credit: st.send_session_credit,
             control_queued: st.control.len(),
+            datagram_send_queued: st.dgram_tx_bytes as u64,
+            datagram_recv_queued: st.dgram_rx_bytes as u64,
+            datagrams_dropped: st.dgram_dropped,
             closed: st.closed.is_some(),
         }
     }
@@ -721,6 +826,41 @@ impl Drop for Session {
             self.shared
                 .fail(&mut st, SessionError::Closed(ResetReason::Shutdown));
         }
+    }
+}
+
+/// Ends a client stream whose opener was cancelled before it took the
+/// result, whatever the ACK did meanwhile.
+struct OpenGuard<'a> {
+    shared: &'a Arc<Shared>,
+    id: u32,
+    armed: bool,
+}
+
+impl OpenGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpenGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let shared = self.shared;
+        let mut st = shared.lock();
+        let Some(e) = st.streams.get_mut(&self.id) else {
+            return;
+        };
+        e.open_waiter = None;
+        e.handle_alive = false;
+        if !e.state.is_terminal() && st.closed.is_none() {
+            if let Err(err) = shared.local_reset(&mut st, self.id, ResetReason::Cancelled) {
+                shared.fail(&mut st, err);
+            }
+        }
+        shared.try_remove(&mut st, self.id);
     }
 }
 
@@ -761,8 +901,27 @@ impl IncomingOpen {
         &self.request
     }
 
-    /// Send OPEN_ACK success. Call only after the destination connected.
+    /// Send OPEN_ACK success for a TCP stream. Call only after the
+    /// destination connected.
     pub fn accept(mut self) -> Result<MuxStream, SessionError> {
+        let shared = self.establish(Network::Tcp)?;
+        Ok(MuxStream::new(shared, self.stream_id))
+    }
+
+    /// Send OPEN_ACK success for a UDP flow. Call only once the egress
+    /// socket for it exists.
+    pub fn accept_datagram(mut self) -> Result<DatagramFlow, SessionError> {
+        let shared = self.establish(Network::Udp)?;
+        Ok(DatagramFlow::new(shared, self.stream_id))
+    }
+
+    fn establish(&mut self, network: Network) -> Result<Arc<Shared>, SessionError> {
+        if self.request.network != network {
+            // A caller bug, not the peer's: refuse the stream cleanly.
+            self.responded = true;
+            reject_inner(&self.shared, self.stream_id, OpenFailure::Internal);
+            return Err(SessionError::Closed(ResetReason::Internal));
+        }
         self.responded = true;
         let shared = Arc::clone(&self.shared);
         let mut st = shared.lock();
@@ -795,7 +954,7 @@ impl IncomingOpen {
         }
         shared.writer.notify_one();
         drop(st);
-        Ok(MuxStream::new(shared, self.stream_id))
+        Ok(shared)
     }
 
     pub fn reject(mut self, failure: OpenFailure) {
@@ -867,6 +1026,17 @@ fn reserve(
     Ok((rx, ctl))
 }
 
+/// Reserve both datagram buffers when UDP flows are wanted; `None` (no
+/// UDP on this session) when not configured or the budget can't hold them.
+/// Taken after the stream reservations, so a tight budget keeps streams.
+fn reserve_datagrams(budget: &Arc<Budget>, cfg: &SessionConfig) -> Option<Reservation> {
+    if !cfg.datagrams {
+        return None;
+    }
+    let bytes = u64::from(cfg.datagram_recv_buffer) + u64::from(cfg.datagram_send_buffer);
+    budget.try_reserve(bytes, PoolClass::Receive).ok()
+}
+
 async fn write_frame<T: AsyncWrite + Unpin>(io: &mut T, frame: &Frame) -> Result<(), SessionError> {
     let mut buf = BytesMut::new();
     encode_frame(&mut buf, frame)?;
@@ -897,7 +1067,7 @@ async fn read_frame<T: AsyncRead + Unpin>(
     }
 }
 
-fn local_hello(cfg: &SessionConfig, window: u32, max_streams: u32) -> Hello {
+fn local_hello(cfg: &SessionConfig, window: u32, max_streams: u32, features: Vec<u16>) -> Hello {
     Hello {
         protocol_min: VERSION_MAJOR,
         protocol_max: VERSION_MAJOR,
@@ -906,7 +1076,7 @@ fn local_hello(cfg: &SessionConfig, window: u32, max_streams: u32) -> Hello {
         initial_stream_window: cfg.initial_stream_window,
         initial_session_window: window,
         max_frame_payload: cfg.max_frame_payload,
-        features: Vec::new(),
+        features,
     }
 }
 
@@ -935,9 +1105,15 @@ where
     cfg.validate()
         .map_err(|_| SessionError::Protocol(ProtocolError::Violation("invalid session config")))?;
     let (rx_res, ctl_res) = reserve(&budget, &cfg)?;
+    let mut dgram_res = reserve_datagrams(&budget, &cfg);
     let window = rx_res.bytes() as u32;
     let max_streams = cfg.effective_max_streams(window);
-    let hello = local_hello(&cfg, window, max_streams);
+    let offered = if dgram_res.is_some() {
+        vec![FEATURE_DATAGRAM]
+    } else {
+        Vec::new()
+    };
+    let hello = local_hello(&cfg, window, max_streams, offered);
     let timeout = cfg.handshake_timeout;
     let mut decoder = Decoder::new(cfg.max_frame_payload);
     let mut buf = BytesMut::new();
@@ -974,6 +1150,9 @@ where
     .await
     .map_err(|_| SessionError::HandshakeTimeout)??;
     let peer = peer_info(&ack);
+    if !ack.features.contains(&FEATURE_DATAGRAM) {
+        dgram_res = None;
+    }
     let (session, _) = start(
         io,
         decoder,
@@ -983,8 +1162,7 @@ where
         true,
         budget,
         obs,
-        rx_res,
-        ctl_res,
+        (rx_res, ctl_res, dgram_res),
         max_streams,
     );
     Ok(session)
@@ -1021,14 +1199,27 @@ where
     if hello.node_id != authenticated_node_id {
         return Err(SessionError::IdentityMismatch);
     }
-    let (version, features) = hello.negotiate(&[])?;
     let (rx_res, ctl_res) = reserve(&budget, &cfg)?;
+    // Select UDP flows only if the client offered them and we can back them.
+    let mut dgram_res = if hello.features.contains(&FEATURE_DATAGRAM) {
+        reserve_datagrams(&budget, &cfg)
+    } else {
+        None
+    };
+    let supported = if dgram_res.is_some() {
+        vec![FEATURE_DATAGRAM]
+    } else {
+        Vec::new()
+    };
+    let (version, features) = hello.negotiate(&supported)?;
+    if !features.contains(&FEATURE_DATAGRAM) {
+        dgram_res = None;
+    }
     let window = rx_res.bytes() as u32;
     let max_streams = cfg.effective_max_streams(window);
-    let mut ack = local_hello(&cfg, window, max_streams);
+    let mut ack = local_hello(&cfg, window, max_streams, features);
     ack.protocol_min = version;
     ack.protocol_max = version;
-    ack.features = features;
     tokio::time::timeout(
         timeout,
         write_frame(&mut io, &Frame::new(FrameType::HelloAck, 0, ack.encode()?)),
@@ -1045,8 +1236,7 @@ where
         false,
         budget,
         obs,
-        rx_res,
-        ctl_res,
+        (rx_res, ctl_res, dgram_res),
         max_streams,
     );
     Ok((session, incoming.expect("server role always has incoming")))
@@ -1062,8 +1252,7 @@ fn start<T>(
     is_client: bool,
     budget: Arc<Budget>,
     obs: Arc<dyn Observability>,
-    rx_res: Reservation,
-    ctl_res: Reservation,
+    (rx_res, ctl_res, dgram_res): (Reservation, Reservation, Option<Reservation>),
     local_max_streams: u32,
 ) -> (Session, Option<Incoming>)
 where
@@ -1097,9 +1286,15 @@ where
         ping_outstanding: None,
         ping_counter: 0,
         incoming_tx,
+        dgram_tx: VecDeque::new(),
+        dgram_tx_bytes: 0,
+        dgram_rx_bytes: 0,
+        dgram_dropped: 0,
         _rx_reservation: rx_res,
         _control_reservation: ctl_res,
+        _datagram_reservation: dgram_res,
     };
+    let datagrams = state._datagram_reservation.is_some();
     let (closed_tx, _) = watch::channel(false);
     let shared = Arc::new(Shared {
         state: Mutex::new(state),
@@ -1111,6 +1306,7 @@ where
         budget,
         local_max_streams,
         obs,
+        datagrams,
     });
     shared.obs.record(Event::SessionOpened);
     let (rd, wr) = tokio::io::split(io);
@@ -1228,7 +1424,7 @@ fn handle_frame(
     let id = frame.stream_id;
     match frame.frame_type {
         FrameType::Hello | FrameType::HelloAck => Err(violation("duplicate handshake")),
-        FrameType::Datagram => Err(violation("datagram not negotiated")),
+        FrameType::Datagram => on_datagram(shared, st, id, frame.payload),
         FrameType::Open => on_open(shared, st, id, frame.payload),
         FrameType::OpenAck => on_open_ack(shared, st, id, &frame.payload),
         FrameType::Data => on_data(shared, st, id, frame.payload),
@@ -1303,16 +1499,24 @@ fn on_open(
     if st.goaway_sent {
         return reject(st, OpenFailure::Unavailable);
     }
-    if !shared.admits(st, shared.local_max_streams) {
+    let kind = match request.network {
+        Network::Tcp => StreamKind::Bytes,
+        // The client must not open one unless we agreed; refusing (rather
+        // than failing the session) keeps it to that one stream.
+        Network::Udp if !shared.datagrams => return reject(st, OpenFailure::Unsupported),
+        Network::Udp => StreamKind::Datagrams,
+    };
+    if !shared.admits(st, shared.local_max_streams, kind) {
         shared.obs.record(Event::ResourceThrottle {
             reason: aegis_contracts::ReasonGroup::Quota,
         });
         return reject(st, OpenFailure::Quota);
     }
-    let Ok(reservation) = shared
-        .budget
-        .try_reserve(u64::from(shared.initial_tx()), PoolClass::Transmit)
-    else {
+    let tx_bytes = match kind {
+        StreamKind::Bytes => u64::from(shared.initial_tx()),
+        StreamKind::Datagrams => 0,
+    };
+    let Ok(reservation) = shared.budget.try_reserve(tx_bytes, PoolClass::Transmit) else {
         shared.obs.record(Event::ResourceThrottle {
             reason: aegis_contracts::ReasonGroup::Quota,
         });
@@ -1321,14 +1525,19 @@ fn on_open(
     let Some(tx) = st.incoming_tx.clone() else {
         return reject(st, OpenFailure::Unavailable);
     };
-    let entry = Entry::new(
-        StreamState::Opening,
-        shared.cfg.initial_stream_window,
-        shared.peer.stream_window,
-        shared.cfg.stream_tx_buffer as usize,
-        reservation,
-    );
-    st.stream_windows += u64::from(shared.cfg.initial_stream_window);
+    let entry = match kind {
+        StreamKind::Bytes => {
+            st.stream_windows += u64::from(shared.cfg.initial_stream_window);
+            Entry::new(
+                StreamState::Opening,
+                shared.cfg.initial_stream_window,
+                shared.peer.stream_window,
+                shared.cfg.stream_tx_buffer as usize,
+                reservation,
+            )
+        }
+        StreamKind::Datagrams => Entry::flow(StreamState::Opening, reservation),
+    };
     st.streams.insert(id, entry);
     let incoming = IncomingOpen {
         shared: Arc::clone(shared),
@@ -1406,6 +1615,9 @@ fn on_data(
     let Some(e) = st.streams.get_mut(&id) else {
         return Err(violation("DATA for unknown or closed stream"));
     };
+    if e.kind == StreamKind::Datagrams {
+        return Err(violation("DATA on a UDP flow"));
+    }
     if n > e.rx_outstanding || u64::from(n) > st.recv_outstanding {
         return Err(violation("DATA exceeds advertised credit"));
     }
@@ -1436,10 +1648,55 @@ fn on_data(
     Ok(())
 }
 
+/// One datagram for a UDP flow. It is queued for the flow's reader or,
+/// when the flow's queue or the session's datagram buffer is full,
+/// dropped: UDP loses packets rather than holding up the session.
+fn on_datagram(
+    shared: &Arc<Shared>,
+    st: &mut State,
+    id: u32,
+    payload: Bytes,
+) -> Result<(), SessionError> {
+    if !shared.datagrams {
+        return Err(violation("DATAGRAM not negotiated"));
+    }
+    let buffered = st.dgram_rx_bytes;
+    let Some(e) = st.streams.get_mut(&id) else {
+        if shared.previously_valid(st, id) {
+            return Ok(()); // in flight when the flow closed
+        }
+        return Err(violation("DATAGRAM for never-opened stream"));
+    };
+    if e.kind != StreamKind::Datagrams {
+        return Err(violation("DATAGRAM on a byte stream"));
+    }
+    match e.state {
+        StreamState::Established => {}
+        StreamState::Reset => return Ok(()),
+        _ => return Err(violation("DATAGRAM before the flow opened")),
+    }
+    if e.datagrams.len() >= shared.cfg.datagram_queue
+        || buffered + payload.len() > shared.cfg.datagram_recv_buffer as usize
+    {
+        st.dgram_dropped += 1;
+        return Ok(());
+    }
+    let n = payload.len();
+    e.datagrams.push_back(payload);
+    if let Some(w) = e.read_waker.take() {
+        w.wake();
+    }
+    st.dgram_rx_bytes += n;
+    Ok(())
+}
+
 fn on_half_close(shared: &Arc<Shared>, st: &mut State, id: u32) -> Result<(), SessionError> {
     let Some(e) = st.streams.get_mut(&id) else {
         return Err(violation("HALF_CLOSE for unknown stream"));
     };
+    if e.kind == StreamKind::Datagrams {
+        return Err(violation("HALF_CLOSE on a UDP flow"));
+    }
     if matches!(e.reset, ResetPhase::AwaitingPeer { .. }) {
         // Crossed our RESET; ignore, the RESET exchange finishes the stream.
         return Ok(());
@@ -1501,7 +1758,7 @@ fn on_reset(
         e.reset_reason = Some(reason);
     }
     e.reset = ResetPhase::None;
-    e.tx.clear();
+    e.tx = BytesMut::new();
     e.fin_requested = false;
     e.wake_all();
     if let Some(w) = waiter {
@@ -1542,6 +1799,9 @@ fn on_window_update(
         }
         return Err(violation("WINDOW_UPDATE for never-opened stream"));
     };
+    if e.kind == StreamKind::Datagrams {
+        return Err(violation("WINDOW_UPDATE on a UDP flow"));
+    }
     let next = e.send_credit + inc;
     if next > u64::from(MAX_WINDOW) {
         return Err(violation("stream window overflow"));
@@ -1559,8 +1819,9 @@ fn on_window_update(
 // Writer
 // ---------------------------------------------------------------------------
 
-/// Assemble one batch: all queued control frames first, then DATA from ready
-/// streams round-robin with a one-frame quantum.
+/// Assemble one batch: all queued control frames first, then datagrams (up
+/// to half the batch, so byte streams keep moving under UDP load), then DATA
+/// from ready streams round-robin with a one-frame quantum.
 fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result<(), SessionError> {
     while let Some(frame) = st.control.pop_front() {
         encode_frame(out, &frame)?;
@@ -1570,6 +1831,20 @@ fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result
     }
     if st.closed.is_some() {
         return Ok(());
+    }
+    while out.len() < WRITE_BATCH / 2 {
+        let Some((id, payload)) = st.dgram_tx.pop_front() else {
+            break;
+        };
+        st.dgram_tx_bytes -= payload.len();
+        // A flow reset since its datagram was queued sends nothing more.
+        let open = st
+            .streams
+            .get(&id)
+            .is_some_and(|e| e.state == StreamState::Established);
+        if open {
+            encode_frame(out, &Frame::new(FrameType::Datagram, id, payload))?;
+        }
     }
     let cap = shared.send_frame_cap();
     let mut visited = 0usize;
@@ -1603,6 +1878,9 @@ fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result
             e.send_credit -= n as u64;
             st.send_session_credit -= n as u64;
             if e.tx.is_empty() {
+                // Release the allocation together with the reservation, or
+                // the drained buffer keeps memory no budget accounts for.
+                e.tx = BytesMut::new();
                 let keep = u64::from(shared.initial_tx());
                 let held = e.tx_reservation.bytes();
                 if held > keep {
@@ -1748,6 +2026,67 @@ async fn timer_task(shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The transmit buffer's allocation stays within its reservation while
+    /// it grows and drains, and an empty buffer holds no allocation.
+    #[tokio::test]
+    async fn transmit_allocation_stays_within_its_reservation() {
+        use aegis_contracts::observability::NoopObservability;
+        use tokio::io::AsyncWriteExt;
+        let obs: Arc<dyn Observability> = Arc::new(NoopObservability);
+        let cfg = |id: &str| SessionConfig {
+            node_id: id.into(),
+            ..SessionConfig::default()
+        };
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let budget = Budget::root(64 << 20);
+        let (sb, so) = (Arc::clone(&budget), Arc::clone(&obs));
+        let server =
+            tokio::spawn(async move { server_handshake(b, cfg("gw-1"), sb, so, "client-1").await });
+        let client = client_handshake(a, cfg("client-1"), Arc::clone(&budget), obs)
+            .await
+            .expect("client");
+        let (_server, mut incoming) = server.await.expect("join").expect("server");
+        let sink = tokio::spawn(async move {
+            let open = incoming.next().await.expect("open");
+            let mut s = open.accept().expect("accept");
+            let mut buf = vec![0u8; 64 * 1024];
+            while tokio::io::AsyncReadExt::read(&mut s, &mut buf)
+                .await
+                .is_ok_and(|n| n > 0)
+            {}
+        });
+        let dest = Destination::parse_authority("192.0.2.1:80").expect("dest");
+        let mut s = client
+            .open(dest, Duration::from_secs(5))
+            .await
+            .expect("open");
+        let check = |client: &Session| {
+            let st = client.shared.lock();
+            for e in st.streams.values() {
+                assert!(
+                    e.tx.capacity() as u64 <= e.tx_reservation.bytes(),
+                    "allocation {} over reservation {}",
+                    e.tx.capacity(),
+                    e.tx_reservation.bytes()
+                );
+            }
+        };
+        for round in 0..20usize {
+            let chunk = vec![round as u8; 37 * 1024 + round];
+            s.write_all(&chunk).await.expect("write");
+            check(&client);
+        }
+        s.flush().await.expect("flush");
+        check(&client);
+        {
+            let st = client.shared.lock();
+            let e = st.streams.values().next().expect("stream");
+            assert_eq!(e.tx.capacity(), 0, "a drained buffer keeps no allocation");
+        }
+        drop(s);
+        sink.abort();
+    }
 
     #[test]
     fn effective_streams_reserve_working_share() {

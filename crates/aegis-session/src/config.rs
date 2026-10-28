@@ -35,6 +35,18 @@ pub struct SessionConfig {
     pub peer_ping_rate: u32,
     /// Bounded queue of OPENs awaiting the gateway's admission decision.
     pub incoming_queue: usize,
+    /// Offer (client) or accept (gateway) UDP flows: feature 0x0001,
+    /// DATAGRAM frames. Used only when both sides agree and the buffers
+    /// below can be reserved.
+    pub datagrams: bool,
+    /// Received datagrams one flow holds for its reader; newer ones are
+    /// dropped while it is full (UDP semantics: loss, never backpressure).
+    pub datagram_queue: usize,
+    /// Bytes of received datagrams held across all flows of the session.
+    pub datagram_recv_buffer: u32,
+    /// Bytes of datagrams waiting to be written; beyond it new ones are
+    /// dropped instead of queueing behind a slow transport.
+    pub datagram_send_buffer: u32,
 }
 
 impl Default for SessionConfig {
@@ -55,6 +67,10 @@ impl Default for SessionConfig {
             reset_drain_timeout: Duration::from_secs(10),
             peer_ping_rate: 10,
             incoming_queue: 64,
+            datagrams: false,
+            datagram_queue: 64,
+            datagram_recv_buffer: 512 * 1024,
+            datagram_send_buffer: 256 * 1024,
         }
     }
 }
@@ -82,6 +98,13 @@ impl SessionConfig {
         }
         if self.control_queue_frames < 16 {
             return Err("control_queue_frames too small");
+        }
+        if self.datagrams
+            && (self.datagram_queue == 0
+                || self.datagram_recv_buffer < MAX_PAYLOAD
+                || self.datagram_send_buffer < MAX_PAYLOAD)
+        {
+            return Err("datagram buffers must each hold one largest frame");
         }
         Ok(())
     }

@@ -395,14 +395,8 @@ pub async fn explain(State(ctx): State<Ctx>, headers: HeaderMap, body: Body) -> 
             &[],
         )
     };
-    if b.protocol == "udp" {
-        return Ok(respond(
-            "deny",
-            None,
-            "UDP (DATAGRAM) is not supported in this build; UDP flows are not forwarded".into(),
-        ));
-    }
-    if b.protocol != "tcp" {
+    // UDP flows are admitted by the same destination rules as TCP.
+    if b.protocol != "tcp" && b.protocol != "udp" {
         return Err(ApiError::bad_request("invalid_body"));
     }
     let Ok(host) = aegis_contracts::Host::parse(&b.destination_host) else {

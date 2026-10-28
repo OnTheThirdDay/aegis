@@ -159,8 +159,28 @@ pub fn json(
     resp
 }
 
-/// Read a body with the 1 MiB cap and parse it as JSON with an accepted
-/// content type.
+/// How long a client may take to send a request body. Without a bound, a
+/// client that announces a body and stalls holds its connection forever.
+pub const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Collect a body of at most `limit` bytes within `within`.
+pub async fn read_body(
+    body: Body,
+    limit: usize,
+    within: std::time::Duration,
+) -> Result<axum::body::Bytes, ApiError> {
+    match tokio::time::timeout(within, axum::body::to_bytes(body, limit)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(_)) => Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+        )),
+        Err(_) => Err(ApiError::new(StatusCode::REQUEST_TIMEOUT, "body_timeout")),
+    }
+}
+
+/// Read a body with the 1 MiB cap (within [`BODY_TIMEOUT`]) and parse it as
+/// JSON with an accepted content type.
 pub async fn read_json(
     headers: &HeaderMap,
     body: Body,
@@ -183,9 +203,7 @@ pub async fn read_json(
             "unsupported_media_type",
         ));
     }
-    let bytes = axum::body::to_bytes(body, MAX_BODY)
-        .await
-        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"))?;
+    let bytes = read_body(body, MAX_BODY, BODY_TIMEOUT).await?;
     serde_json::from_slice(&bytes).map_err(|_| ApiError::bad_request("malformed_json"))
 }
 

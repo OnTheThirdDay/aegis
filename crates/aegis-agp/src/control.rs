@@ -20,7 +20,12 @@ pub const MAX_FEATURES: usize = 64;
 /// understand one MUST reject the session.
 pub const CRITICAL_FEATURE_BIT: u16 = 0x8000;
 
-/// Features understood by this build. None are defined for AGP/1.0 yet.
+/// Optional feature: UDP flows (OPEN network 2) carrying DATAGRAM frames.
+/// Neither side may open a UDP flow or send DATAGRAM unless HELLO_ACK
+/// selected it, so peers without it never see either.
+pub const FEATURE_DATAGRAM: u16 = 0x0001;
+
+/// A negotiated feature ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Feature(pub u16);
 
@@ -173,6 +178,8 @@ impl Hello {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
     Tcp = 1,
+    /// A UDP flow to one destination (needs [`FEATURE_DATAGRAM`]).
+    Udp = 2,
 }
 
 /// OPEN body: requested network, bounded destination and requested timeout.
@@ -232,6 +239,7 @@ impl OpenRequest {
         need(b, 2, "open header")?;
         let network = match b.get_u8() {
             1 => Network::Tcp,
+            2 => Network::Udp,
             _ => return Err(ProtocolError::Malformed("unsupported network")),
         };
         let host = match b.get_u8() {
@@ -449,9 +457,13 @@ mod tests {
         raw.extend_from_slice(&"::ffff:10.0.0.1".parse::<Ipv6Addr>().expect("v6").octets());
         raw.extend_from_slice(&[0, 80, 0, 0, 0, 10]);
         assert!(OpenRequest::decode(Bytes::from(raw)).is_err());
-        // UDP network not supported.
+        // UDP flows decode; other networks don't.
+        let udp = OpenRequest::decode(Bytes::from_static(&[2, 1, 1, 2, 3, 4, 0, 53, 0, 0, 0, 10]))
+            .expect("udp");
+        assert_eq!(udp.network, Network::Udp);
+        assert_eq!(udp.encode().expect("encode").as_ref()[0], 2);
         assert!(
-            OpenRequest::decode(Bytes::from_static(&[2, 1, 1, 2, 3, 4, 0, 80, 0, 0, 0, 10]))
+            OpenRequest::decode(Bytes::from_static(&[3, 1, 1, 2, 3, 4, 0, 80, 0, 0, 0, 10]))
                 .is_err()
         );
         // Timeout zero.
