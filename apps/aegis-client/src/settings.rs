@@ -18,6 +18,9 @@ pub struct Settings {
     pub system_proxy: bool,
     /// Capture every app's traffic while connected (needs the VPN helper).
     pub system_vpn: bool,
+    /// With the system VPN: nothing gets out around it, also if it stops
+    /// unexpectedly.
+    pub kill_switch: bool,
     pub auto_connect: bool,
     /// Previous OS proxy values, kept while ours are applied so a crash can
     /// be undone at the next start.
@@ -33,6 +36,7 @@ impl Default for Settings {
             http_port: 8080,
             system_proxy: false,
             system_vpn: false,
+            kill_switch: false,
             auto_connect: false,
             proxy_saved: None,
             path: PathBuf::new(),

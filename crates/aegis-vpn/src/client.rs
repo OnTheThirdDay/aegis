@@ -13,8 +13,13 @@ pub enum HelperState {
     NotInstalled,
     /// Installed, but too old for this app: install again to update.
     Outdated { version: String },
-    /// Ready; `current` when it is this app's version.
-    Ready { version: String, current: bool },
+    /// Ready; `current` when it is this app's version; `blocked` when the
+    /// kill switch blocks traffic because the VPN ended unexpectedly.
+    Ready {
+        version: String,
+        current: bool,
+        blocked: bool,
+    },
 }
 
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
@@ -81,10 +86,15 @@ pub async fn state() -> HelperState {
         Ok(Reply {
             version: Some(version),
             protocol: Some(proto::PROTOCOL),
+            blocked,
             ..
         }) => {
             let current = version == env!("CARGO_PKG_VERSION");
-            HelperState::Ready { version, current }
+            HelperState::Ready {
+                version,
+                current,
+                blocked: blocked.unwrap_or(false),
+            }
         }
         Ok(reply) => HelperState::Outdated {
             version: reply.version.unwrap_or_default(),
@@ -102,10 +112,21 @@ pub struct Session {
 impl Session {
     /// Capture this computer's traffic into the local SOCKS proxy at
     /// `127.0.0.1:socks_port`, keeping `bypass` (the server's host names or
-    /// addresses) outside.
-    pub async fn start(socks_port: u16, bypass: Vec<String>) -> Result<Session, String> {
+    /// addresses) outside. With `kill_switch`, nothing else gets out, and
+    /// that stays so if the VPN ends without [`Session::stop`].
+    pub async fn start(
+        socks_port: u16,
+        bypass: Vec<String>,
+        kill_switch: bool,
+    ) -> Result<Session, String> {
         let mut channel = Channel::open().await?;
-        channel.ask(&Request::Start { socks_port, bypass }).await?;
+        channel
+            .ask(&Request::Start {
+                socks_port,
+                bypass,
+                kill_switch,
+            })
+            .await?;
         Ok(Session { channel })
     }
 
@@ -121,6 +142,15 @@ impl Session {
     pub async fn stop(mut self) {
         let _ = self.channel.ask(&Request::Stop).await;
     }
+}
+
+/// Release a kill switch left blocking after the VPN ended unexpectedly.
+pub async fn release() -> Result<(), String> {
+    Channel::open()
+        .await?
+        .ask(&Request::Release)
+        .await
+        .map(|_| ())
 }
 
 /// Install or update the helper for the current user. Asks for

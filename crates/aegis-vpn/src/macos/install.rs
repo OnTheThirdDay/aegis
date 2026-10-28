@@ -80,6 +80,8 @@ pub fn install(uid: &str) -> Result<(), String> {
 /// Stop and remove the helper.
 pub fn uninstall() -> Result<(), String> {
     let _ = launchctl(&["bootout", &format!("system/{LABEL}")]);
+    // A kill switch the helper left blocking goes with it.
+    let _ = super::pfctl(&["-a", super::ANCHOR, "-F", "all"], None);
     for path in [PLIST, BINARY, SOCKET] {
         match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {

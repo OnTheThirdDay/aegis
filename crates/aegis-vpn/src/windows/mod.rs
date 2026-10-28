@@ -5,10 +5,10 @@
 pub mod install;
 pub mod pipe;
 pub mod service;
-mod wfp;
+pub mod wfp;
 
 use crate::device::Packets;
-use crate::helper::{DnsSaved, HostRoute, System, Uplink};
+use crate::helper::{DnsSaved, HostRoute, System, Tun, Uplink};
 use aegis_tun::{dns, packet, routes};
 use route_manager::{Route, RouteManager};
 use std::io;
@@ -121,7 +121,7 @@ impl System for Windows {
         RouteManager::new()?.delete(&route_of(r))
     }
 
-    fn open_tun(&self) -> io::Result<(Packets, u32)> {
+    fn open_tun(&self) -> io::Result<(Packets, Tun)> {
         let wintun = self.wintun.to_string_lossy().into_owned();
         let build = || {
             tun_rs::DeviceBuilder::new()
@@ -165,7 +165,10 @@ impl System for Windows {
                 device: dev,
                 _keep: Some(Box::new(dns_guard)),
             },
-            index,
+            Tun {
+                index,
+                name: ADAPTER.into(),
+            },
         ))
     }
 
@@ -181,6 +184,23 @@ impl System for Windows {
 
     fn flush_dns_cache(&self) {
         let _ = hidden("ipconfig").arg("/flushdns").output();
+    }
+
+    fn block(
+        &self,
+        tun: Option<&Tun>,
+        allow: &[Ipv4Addr],
+        _token: Option<String>,
+    ) -> io::Result<Option<String>> {
+        wfp::kill_switch(tun.map(|t| t.index), allow).map(|()| None)
+    }
+
+    fn unblock(&self, _token: Option<&str>) -> io::Result<()> {
+        wfp::remove_kill_switch()
+    }
+
+    fn blocking(&self) -> bool {
+        wfp::kill_switch_present()
     }
 }
 

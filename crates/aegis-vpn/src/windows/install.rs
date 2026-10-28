@@ -147,7 +147,15 @@ pub fn uninstall() -> Result<(), String> {
             .map_err(|e| format!("Could not remove the service: {e}"))?;
     }
     let dir = install_dir();
-    for name in [EXE, "wintun.dll", "wintun-LICENSE.txt", "vpn-journal.json"] {
+    // A kill switch the helper left blocking goes with it.
+    let _ = super::wfp::remove_kill_switch();
+    for name in [
+        EXE,
+        "wintun.dll",
+        "wintun-LICENSE.txt",
+        "vpn-journal.json",
+        "vpn-journal.kill.json",
+    ] {
         let path = dir.join(name);
         if path.exists() {
             retry(|| std::fs::remove_file(&path))

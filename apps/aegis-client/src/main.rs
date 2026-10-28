@@ -441,6 +441,11 @@ impl App {
                 }
                 if aegis_vpn::supported() {
                     ui.checkbox(&mut self.edited.system_vpn, "System VPN: send every app's traffic through AegisNet while connected");
+                    ui.add_enabled(
+                        self.edited.system_vpn,
+                        egui::Checkbox::new(&mut self.edited.kill_switch, "Kill switch: block internet access if the system VPN stops unexpectedly"),
+                    )
+                    .on_hover_text("Disconnecting or quitting turns it off. If the app or the VPN stops unexpectedly, only your local network and your server stay reachable until you connect again or unblock. Restarting the computer always clears it.");
                 }
                 ui.checkbox(&mut self.edited.auto_connect, "Connect automatically when the app starts");
                 let changed = self.edited != self.settings;
@@ -507,7 +512,11 @@ impl App {
                 Some("Update VPN helper"),
                 true,
             ),
-            HelperState::Ready { version, current: false } => (
+            HelperState::Ready {
+                version,
+                current: false,
+                ..
+            } => (
                 format!("Installed (version {version}); this app can update it."),
                 Some("Update VPN helper"),
                 true,
@@ -559,6 +568,23 @@ impl eframe::App for App {
                 ui.label(RichText::new(e).color(RED));
             } else if let Some(i) = &s.info {
                 ui.label(RichText::new(i).color(GREEN));
+            }
+            let blocked = matches!(
+                s.vpn_helper,
+                aegis_vpn::client::HelperState::Ready { blocked: true, .. }
+            );
+            if blocked && !s.vpn_active {
+                ui.group(|ui| {
+                    ui.label(RichText::new("The system VPN stopped unexpectedly, so the kill switch is blocking this computer's internet access. Your local network and your server are still reachable.").color(RED));
+                    ui.horizontal(|ui| {
+                        if s.status == Status::Disconnected && ui.button("Connect").clicked() {
+                            self.engine.send(Command::Connect);
+                        }
+                        if ui.button("Unblock internet").clicked() {
+                            self.engine.send(Command::Unblock);
+                        }
+                    });
+                });
             }
             ui.add_space(6.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
