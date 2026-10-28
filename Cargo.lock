@@ -231,6 +231,7 @@ dependencies = [
  "aegis-session",
  "aegis-storage",
  "aegis-telemetry",
+ "aegis-transport-quic",
  "aegis-transport-ws",
  "bytes",
  "httparse",
@@ -343,6 +344,19 @@ dependencies = [
  "aegis-policy",
  "ipnet",
  "serde",
+]
+
+[[package]]
+name = "aegis-transport-quic"
+version = "0.6.0"
+dependencies = [
+ "aegis-contracts",
+ "aegis-identity",
+ "bytes",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
 ]
 
 [[package]]

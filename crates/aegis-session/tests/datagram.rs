@@ -433,3 +433,121 @@ async fn a_late_datagram_after_reset_is_ignored() {
     assert!(!session.is_closed(), "{:?}", session.close_reason());
     assert_eq!(session.stream_count(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// The transport's own datagram path (QUIC datagrams), feature 0x0002.
+// ---------------------------------------------------------------------------
+
+/// An in-memory datagram path: packets go to the peer's session, if fit.
+#[derive(Debug, Default)]
+struct Wire {
+    max: usize,
+    peer: std::sync::Mutex<Option<std::sync::Weak<Session>>>,
+    sent: std::sync::atomic::AtomicUsize,
+}
+
+impl aegis_session::DatagramPath for Wire {
+    fn max_packet(&self) -> Option<usize> {
+        Some(self.max)
+    }
+
+    fn send(&self, packet: Bytes) -> bool {
+        self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let peer = self.peer.lock().expect("lock").clone();
+        match peer.and_then(|w| w.upgrade()) {
+            Some(s) => {
+                s.deliver_datagram(packet);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn small_datagrams_take_the_transport_path_and_large_ones_the_session() {
+    let to_server = Arc::new(Wire {
+        max: 1200,
+        ..Wire::default()
+    });
+    let to_client = Arc::new(Wire {
+        max: 1200,
+        ..Wire::default()
+    });
+    let mut ccfg = cfg("client-1", true);
+    ccfg.datagram_path = Some(to_server.clone());
+    let mut scfg = cfg("gw-1", true);
+    scfg.datagram_path = Some(to_client.clone());
+    let (client, server, incoming) = pair_with(ccfg, scfg, Budget::root(64 << 20)).await;
+    let (client, server) = (Arc::new(client), Arc::new(server));
+    assert!(client.datagram_path() && server.datagram_path());
+    *to_server.peer.lock().expect("lock") = Some(Arc::downgrade(&server));
+    *to_client.peer.lock().expect("lock") = Some(Arc::downgrade(&client));
+    spawn_echo(incoming);
+    let flow = client
+        .open_datagram(dest(), Duration::from_secs(5))
+        .await
+        .expect("open");
+    for n in [1usize, 600, 1196, 1197, 4000] {
+        let d: Vec<u8> = (0..n).map(|i| i as u8).collect();
+        assert!(flow.send(&d).expect("send"));
+        assert_eq!(
+            within(flow.recv()).await.expect("echo").as_ref(),
+            d.as_slice()
+        );
+    }
+    // 1, 600 and 1196 bytes (+4 for the flow id) fit: both directions.
+    use std::sync::atomic::Ordering;
+    assert_eq!(to_server.sent.load(Ordering::SeqCst), 3);
+    assert_eq!(to_client.sent.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn the_path_is_used_only_when_both_sides_have_one() {
+    let wire = Arc::new(Wire {
+        max: 1200,
+        ..Wire::default()
+    });
+    let mut ccfg = cfg("client-1", true);
+    ccfg.datagram_path = Some(wire.clone());
+    let (client, server, incoming) =
+        pair_with(ccfg, cfg("gw-1", true), Budget::root(64 << 20)).await;
+    assert!(client.datagrams() && !client.datagram_path() && !server.datagram_path());
+    spawn_echo(incoming);
+    let flow = client
+        .open_datagram(dest(), Duration::from_secs(5))
+        .await
+        .expect("open");
+    assert!(flow.send(b"in the session").expect("send"));
+    assert_eq!(
+        within(flow.recv()).await.expect("echo").as_ref(),
+        b"in the session"
+    );
+    assert_eq!(wire.sent.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // A stray packet on a session without the path is ignored.
+    client.deliver_datagram(Bytes::from_static(&[0, 0, 0, 1, 9]));
+}
+
+#[tokio::test]
+async fn stray_transport_datagrams_are_dropped_not_fatal() {
+    let wire = Arc::new(Wire {
+        max: 1200,
+        ..Wire::default()
+    });
+    let mut ccfg = cfg("client-1", true);
+    ccfg.datagram_path = Some(wire.clone());
+    let mut scfg = cfg("gw-1", true);
+    scfg.datagram_path = Some(wire);
+    let (client, server, _incoming) = pair_with(ccfg, scfg, Budget::root(64 << 20)).await;
+    // Unknown flow, short packet, a flow id that was never opened.
+    for p in [
+        &[0u8, 0, 0, 7, 1][..],
+        &[0, 0, 1][..],
+        &[0, 0, 0, 1, 2, 3][..],
+    ] {
+        server.deliver_datagram(Bytes::copy_from_slice(p));
+        client.deliver_datagram(Bytes::copy_from_slice(p));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!server.is_closed() && !client.is_closed());
+}

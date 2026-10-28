@@ -331,6 +331,10 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Sent {}", fmt_bytes(s.bytes_up))).weak());
                     ui.label(RichText::new(format!("Received {}", fmt_bytes(s.bytes_down))).weak());
+                    if let Some(t) = s.transport {
+                        let via = if t == "quic" { "via QUIC (UDP)" } else { "via WebSocket (TCP)" };
+                        ui.label(RichText::new(via).weak());
+                    }
                 });
             });
         }

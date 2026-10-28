@@ -160,14 +160,73 @@ pub(crate) fn current_endpoint(ctx: &ManagementContext) -> Result<Value, ApiErro
             .map_err(|_| ApiError::conflict("edge_trust_unavailable"))?;
         (json!(DEFAULT_EDGE_SERVER_NAME), json!(ca))
     };
-    Ok(json!({
+    let mut e = json!({
         "url": endpoint(&host, port, "/agp", "wss"),
         "enroll_url": endpoint(&host, port, "/enroll", "https"),
         "server_name": conn.inner_server_name.as_deref().unwrap_or(DEFAULT_INNER_SERVER_NAME),
         "outer_server_name": outer_server_name,
         "outer_ca_pem": outer_ca_pem,
         "device_ca_sha256": device_ca_sha256,
-    }))
+    });
+    if let Some(q) = quic_address(ctx, &conn) {
+        e["quic"] = json!(q);
+    }
+    Ok(e)
+}
+
+/// The direct QUIC setting: `{"enabled", "host", "port"}` (host and port
+/// optional: the device address and port when devices connect directly).
+pub(crate) fn quic_setting(ctx: &ManagementContext) -> Value {
+    ctx.coord
+        .store()
+        .read(|c| db::get_setting(c, "quic"))
+        .ok()
+        .flatten()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+/// `host:port` devices use for direct QUIC, when it is on and complete.
+/// Through Cloudflare the device address is Cloudflare's, so QUIC needs
+/// its own host (the server's real address) and port.
+pub(crate) fn quic_address(ctx: &ManagementContext, conn: &Connection) -> Option<String> {
+    let s = quic_setting(ctx);
+    if s["enabled"] != json!(true) {
+        return None;
+    }
+    let direct = conn.mode.as_deref() != Some("cloudflare");
+    let host = s["host"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| direct.then(|| conn.public_host.clone()).flatten())
+        .filter(|h| valid_public_host(h))?;
+    let port = s["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .or_else(|| direct.then(|| conn.public_port.unwrap_or(443)))
+        .filter(|p| *p != 0)?;
+    Some(if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    })
+}
+
+/// The QUIC setting as the console shows it.
+pub(crate) fn quic_status_json(ctx: &ManagementContext) -> Value {
+    let conn = connection(ctx).unwrap_or_default();
+    let s = quic_setting(ctx);
+    let enabled = s["enabled"] == json!(true);
+    let address = quic_address(ctx, &conn);
+    json!({
+        "enabled": enabled,
+        "host": s["host"],
+        "port": s["port"],
+        "address": address,
+        "warning": (enabled && address.is_none()).then_some(
+            "Set the server's own address and UDP port: devices reach this server through Cloudflare, whose address can't carry QUIC."
+        ),
+    })
 }
 
 pub(crate) fn invite_code(

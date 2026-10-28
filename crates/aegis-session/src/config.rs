@@ -47,6 +47,10 @@ pub struct SessionConfig {
     /// Bytes of datagrams waiting to be written; beyond it new ones are
     /// dropped instead of queueing behind a slow transport.
     pub datagram_send_buffer: u32,
+    /// The transport's own unreliable datagrams (QUIC), used for UDP flows
+    /// when both sides have one (feature 0x0002). Datagrams too large for
+    /// it still go in the session.
+    pub datagram_path: Option<std::sync::Arc<dyn crate::DatagramPath>>,
 }
 
 impl Default for SessionConfig {
@@ -71,6 +75,7 @@ impl Default for SessionConfig {
             datagram_queue: 64,
             datagram_recv_buffer: 512 * 1024,
             datagram_send_buffer: 256 * 1024,
+            datagram_path: None,
         }
     }
 }
