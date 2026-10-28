@@ -1,9 +1,10 @@
 //! Gateway ingress: WebSocket → inner mTLS → AGP session → per-OPEN
 //! admission against the current policy → restricted dial → relay.
 
-use crate::egress::{admit_failure, dial_direct};
-use crate::relay::{finish_mux, relay, ActiveGuard};
+use crate::egress::{admit_failure, bind_direct_udp, dial_direct};
+use crate::relay::{finish_flow, finish_mux, relay, relay_datagrams, ActiveGuard, UDP_IDLE};
 use crate::{now_unix, NodeContext};
+use aegis_agp::Network;
 use aegis_config::InboundConfig;
 use aegis_contracts::observability::{Event, OperationResult};
 use aegis_contracts::reason::{OpenFailure, ReasonGroup};
@@ -493,6 +494,9 @@ async fn handle_open(
         class: admitted.decision.rule_class,
     });
     let timeout = Duration::from_millis(u64::from(open.request().timeout_ms));
+    if open.request().network == Network::Udp {
+        return handle_udp(ctx, &peer, &inbound_id, &admitted, open, timeout).await;
+    }
     let started = Instant::now();
     let tcp = match dial_direct(
         &ctx,
@@ -534,6 +538,55 @@ async fn handle_open(
     ));
     let outcome = relay(&mut mux, &mut tcp, idle).await;
     finish_mux(mux, outcome, ctx.obs());
+}
+
+/// One admitted UDP flow: a socket connected to the checked destination
+/// address, then datagrams both ways until the flow ends or idles out.
+async fn handle_udp(
+    ctx: Arc<NodeContext>,
+    peer: &PeerIdentity,
+    inbound_id: &str,
+    admitted: &Admitted,
+    open: IncomingOpen,
+    timeout: Duration,
+) {
+    let dest = open.request().destination.clone();
+    let started = Instant::now();
+    let socket = match bind_direct_udp(
+        &ctx,
+        admitted,
+        &dest,
+        inbound_id,
+        Some(&peer.node_id),
+        timeout,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(f) => {
+            ctx.obs().record(Event::StreamOpenDuration {
+                seconds: started.elapsed().as_secs_f64(),
+                result: if f == OpenFailure::Denied {
+                    OperationResult::Denied
+                } else {
+                    OperationResult::Error
+                },
+            });
+            ctx.obs().record(Event::StreamClosed {
+                result: OperationResult::Error,
+                reason: f.group(),
+            });
+            open.reject(f);
+            return;
+        }
+    };
+    let Ok(flow) = open.accept_datagram() else {
+        return;
+    };
+    ctx.obs().record(Event::StreamOpened);
+    let _active = ActiveGuard::new(&ctx.streams_active);
+    let outcome = relay_datagrams(&flow, &socket, UDP_IDLE).await;
+    finish_flow(flow, outcome, ctx.obs());
 }
 
 #[cfg(test)]

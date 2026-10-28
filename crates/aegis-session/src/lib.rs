@@ -16,14 +16,19 @@
 //!   with a one-frame quantum.
 //! * **No resumption.** Losing the transport fails all streams; reconnecting
 //!   creates a new session and new streams.
+//! * **UDP flows lose, never block.** When both sides agree (feature
+//!   0x0001), a stream can be a UDP flow carrying whole DATAGRAMs. They
+//!   use no credit; bounded, reserved queues drop instead of waiting.
 #![forbid(unsafe_code)]
 
 mod config;
+mod datagram;
 mod error;
 mod mux;
 mod stream;
 
 pub use config::SessionConfig;
+pub use datagram::DatagramFlow;
 pub use error::{OpenError, SessionError};
 pub use mux::{
     client_handshake, server_handshake, Incoming, IncomingOpen, PeerInfo, Session, SessionStats,

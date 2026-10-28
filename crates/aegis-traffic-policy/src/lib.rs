@@ -473,9 +473,7 @@ impl SystemVpnConfig {
                     .is_some_and(|p| p.contains(&IpProtocol::Udp))
         });
         if (udp_tunnel || mode == VpnMode::Global) && !caps.udp {
-            e.push(
-                "general UDP (DATAGRAM) is not available; System-VPN beta requires TCP+UDP".into(),
-            );
+            e.push("this host can't capture UDP; System-VPN beta requires TCP+UDP".into());
         }
         if self
             .dns

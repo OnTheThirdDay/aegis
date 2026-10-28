@@ -1,9 +1,10 @@
 //! Bidirectional relay with half-close propagation, idle timeout and an
-//! authoritative active-stream gauge.
+//! authoritative active-stream gauge; and the datagram relay of UDP flows.
 
 use aegis_contracts::observability::{Event, Observability, OperationResult};
 use aegis_contracts::reason::{ReasonGroup, ResetReason};
-use aegis_session::MuxStream;
+use aegis_session::{DatagramFlow, MuxStream};
+use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 /// Either side of a relay.
 pub enum Upstream {
@@ -182,6 +183,107 @@ pub fn finish_mux(mux: MuxStream, outcome: RelayOutcome, obs: &dyn Observability
         }
         RelayOutcome::Error(_) => {
             mux.reset(ResetReason::DestinationReset);
+            (OperationResult::Error, ReasonGroup::Transport)
+        }
+    };
+    obs.record(Event::StreamClosed { result, reason });
+}
+
+/// How long a UDP flow lives without a datagram in either direction. UDP has
+/// no close; QUIC and other UDP protocols send keepalives well within this.
+pub const UDP_IDLE: Duration = Duration::from_secs(120);
+
+/// Room for the largest UDP datagram.
+const UDP_BUFFER: usize = 64 * 1024;
+
+/// The far end of a UDP flow: the tunnel, or a direct socket.
+pub enum DatagramUpstream {
+    Flow(DatagramFlow),
+    Socket(UdpSocket),
+}
+
+impl DatagramUpstream {
+    /// Send one datagram. Loss (a full queue, no route) is not an error;
+    /// a flow that ended is.
+    pub async fn send(&self, datagram: &[u8]) -> io::Result<()> {
+        match self {
+            DatagramUpstream::Flow(f) => f.send(datagram).map(|_| ()),
+            DatagramUpstream::Socket(s) => {
+                let _ = s.send(datagram).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// The next datagram from the destination.
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<Bytes> {
+        match self {
+            DatagramUpstream::Flow(f) => f.recv().await,
+            DatagramUpstream::Socket(s) => loop {
+                match s.recv(buf).await {
+                    Ok(n) => return Ok(Bytes::copy_from_slice(&buf[..n])),
+                    // An ICMP error reported on the connected socket: the
+                    // destination dropped a datagram, nothing more.
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+                    Err(e) => return Err(e),
+                }
+            },
+        }
+    }
+}
+
+/// Relay a gateway UDP flow and its egress socket until the flow ends, the
+/// socket fails, or nothing moved for `idle`.
+pub async fn relay_datagrams(
+    flow: &DatagramFlow,
+    socket: &UdpSocket,
+    idle: Duration,
+) -> RelayOutcome {
+    let mut buf = vec![0u8; UDP_BUFFER];
+    let mut deadline = tokio::time::Instant::now() + idle;
+    loop {
+        tokio::select! {
+            d = flow.recv() => match d {
+                Ok(d) => {
+                    deadline = tokio::time::Instant::now() + idle;
+                    // A send that fails (no route) loses the datagram.
+                    let _ = socket.send(&d).await;
+                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    return RelayOutcome::Completed
+                }
+                Err(e) => return RelayOutcome::Error(e.kind()),
+            },
+            r = socket.recv(&mut buf) => match r {
+                Ok(n) => {
+                    deadline = tokio::time::Instant::now() + idle;
+                    // Larger than the tunnel carries: dropped, like any
+                    // datagram a path can't fit.
+                    if n <= flow.max_datagram() {
+                        if let Err(e) = flow.send(&buf[..n]) {
+                            return RelayOutcome::Error(e.kind());
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+                Err(e) => return RelayOutcome::Error(e.kind()),
+            },
+            _ = tokio::time::sleep_until(deadline) => return RelayOutcome::IdleTimeout,
+        }
+    }
+}
+
+/// Finish a UDP flow like [`finish_mux`]: idle flows end with a timeout
+/// RESET, failed ones with a destination RESET.
+pub fn finish_flow(flow: DatagramFlow, outcome: RelayOutcome, obs: &dyn Observability) {
+    let (result, reason) = match outcome {
+        RelayOutcome::Completed => (OperationResult::Ok, ReasonGroup::Other),
+        RelayOutcome::IdleTimeout => {
+            flow.reset(ResetReason::Timeout);
+            (OperationResult::Timeout, ReasonGroup::Timeout)
+        }
+        RelayOutcome::Error(_) => {
+            flow.reset(ResetReason::DestinationReset);
             (OperationResult::Error, ReasonGroup::Transport)
         }
     };
