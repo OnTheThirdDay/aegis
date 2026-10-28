@@ -140,7 +140,13 @@ impl System for MacOs {
             let net: Ipv6Addr = net.parse().map_err(io::Error::other)?;
             manager.add(&Route::new(IpAddr::V6(net), *len).with_if_index(index))?;
         }
-        Ok((Packets(dev), index))
+        Ok((
+            Packets {
+                device: dev,
+                _keep: None,
+            },
+            index,
+        ))
     }
 
     fn set_dns(&self) -> io::Result<DnsSaved> {

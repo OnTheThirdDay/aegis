@@ -35,7 +35,7 @@ tokio = { workspace = true, features = ["signal"] }
 [target.'cfg(windows)'.dependencies]
 # Service control manager: install, start, stop, and the service entry point.
 windows-service = "0.8.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_System_Rpc"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }

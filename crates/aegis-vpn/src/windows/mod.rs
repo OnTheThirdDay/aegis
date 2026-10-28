@@ -5,6 +5,7 @@
 pub mod install;
 pub mod pipe;
 pub mod service;
+mod wfp;
 
 use crate::device::Packets;
 use crate::helper::{DnsSaved, HostRoute, System, Uplink};
@@ -157,11 +158,19 @@ impl System for Windows {
             let net: Ipv6Addr = net.parse().map_err(io::Error::other)?;
             manager.add(&Route::new(IpAddr::V6(net), *len).with_if_index(index))?;
         }
-        Ok((Packets(dev), index))
+        // Lookups may leave only through the VPN while it runs.
+        let dns_guard = wfp::block_dns_outside(index)?;
+        Ok((
+            Packets {
+                device: dev,
+                _keep: Some(Box::new(dns_guard)),
+            },
+            index,
+        ))
     }
 
     /// The VPN's resolver is set on its own adapter, which is ahead of the
-    /// others; nothing else changes.
+    /// others, and DNS through any other adapter is blocked (`wfp`).
     fn set_dns(&self) -> io::Result<DnsSaved> {
         Ok(Vec::new())
     }

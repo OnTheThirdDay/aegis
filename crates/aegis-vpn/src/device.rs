@@ -6,7 +6,12 @@ use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub struct Packets(pub tun_rs::AsyncDevice);
+/// The device, and what must last exactly as long as it (Windows: the DNS
+/// leak protection filters).
+pub struct Packets {
+    pub device: tun_rs::AsyncDevice,
+    pub _keep: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
 
 impl AsyncRead for Packets {
     fn poll_read(
@@ -14,7 +19,7 @@ impl AsyncRead for Packets {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let n = ready!(self.0.poll_recv(cx, buf.initialize_unfilled()))?;
+        let n = ready!(self.device.poll_recv(cx, buf.initialize_unfilled()))?;
         buf.advance(n);
         Poll::Ready(Ok(()))
     }
@@ -26,7 +31,7 @@ impl AsyncWrite for Packets {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.0.poll_send(cx, buf)
+        self.device.poll_send(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {

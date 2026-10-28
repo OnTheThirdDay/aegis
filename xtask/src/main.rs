@@ -271,7 +271,7 @@ const UNSAFE_BOUNDARY: &[(&str, &str)] = &[
     ),
     (
         "crates/aegis-vpn",
-        "the Windows control pipe's access list and the service entry point",
+        "the Windows control pipe's access list, the service entry point and the WFP DNS filters",
     ),
 ];
 
