@@ -28,6 +28,7 @@ Exact versions are locked in `Cargo.lock`. Run `cargo deny check` and `cargo tre
 | rustls-pki-types 1.12+ | PEM parsing (`PemObject`) | `std` | rustls-pemfile (unmaintained, RUSTSEC-2025-0134; removed 2026-10-25) | pending |
 | webpki-roots 1.0 | outer-TLS public roots | — | rustls-native-certs (host store varies) | pending |
 | tokio-tungstenite 0.30 | WebSocket transport | `handshake` only; TLS done separately | hyper upgrade + custom framing | pending |
+| quinn 0.11 | direct QUIC transport (`aegis-transport-quic`, ADR-0013): the device mTLS is the QUIC handshake, one bidirectional stream per session, flow datagrams on QUIC datagrams | `runtime-tokio`, `rustls-ring` (no aws-lc, as for rustls) | s2n-quic (aws-lc only), quiche (C/BoringSSL build) | pending |
 | hickory-resolver 0.26.1+ (locked 0.26.3) | explicit-nameserver DNS | `tokio`; hosts file disabled; no system-conf | getaddrinfo only (no explicit servers) | pending; 0.24 had RUSTSEC-2026-0119 (fixed by upgrade) |
 | rusqlite 0.41 (bundled SQLite) | management store | `bundled` | sled/redb (WAL/SQL maturity) | pending; SQLite C provenance must be reviewed (OQ-05) |
 | axum 0.8 / http 1 | local management API | http1, json, tokio, query | hyper directly | pending |
