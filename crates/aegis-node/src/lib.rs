@@ -221,6 +221,7 @@ impl NodeContext {
             handshake_timeout: Duration::from_millis(u64::from(c.tls_handshake_timeout_ms)),
             keepalive_interval: Duration::from_secs(u64::from(c.keepalive_interval_seconds)),
             keepalive_timeout: Duration::from_secs(u64::from(c.keepalive_interval_seconds).max(10)),
+            datagrams: true,
             ..SessionConfig::default()
         }
     }
@@ -714,8 +715,11 @@ mod capacity_tests {
             streams >= 400,
             "only {streams} concurrent connections per session"
         );
+        // UDP flows' datagram buffers come out of the same peer budget.
         let needed = u64::from(core.session_window_bytes)
-            + u64::from(streams) * u64::from(cfg.initial_stream_window);
+            + u64::from(streams) * u64::from(cfg.initial_stream_window)
+            + u64::from(cfg.datagram_recv_buffer)
+            + u64::from(cfg.datagram_send_buffer);
         assert!(
             needed <= core.peer_buffer_budget_bytes,
             "peer budget too small: {needed}"

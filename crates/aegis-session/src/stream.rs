@@ -33,14 +33,14 @@ impl std::fmt::Debug for MuxStream {
     }
 }
 
-fn reset_err(reason: Option<ResetReason>) -> io::Error {
+pub(crate) fn reset_err(reason: Option<ResetReason>) -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionReset,
         format!("stream reset ({reason:?})"),
     )
 }
 
-fn closed_err() -> io::Error {
+pub(crate) fn closed_err() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "session closed")
 }
 

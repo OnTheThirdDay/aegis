@@ -73,6 +73,7 @@ impl FrameType {
                 | FrameType::Data
                 | FrameType::HalfClose
                 | FrameType::Reset
+                | FrameType::Datagram
         )
     }
 
@@ -110,9 +111,6 @@ impl Header {
         }
         let frame_type =
             FrameType::from_u8(raw[5]).ok_or(ProtocolError::UnknownFrameType(raw[5]))?;
-        if frame_type == FrameType::Datagram {
-            return Err(ProtocolError::UnsupportedFrameType(frame_type));
-        }
         let flags = u16::from_be_bytes([raw[6], raw[7]]);
         let allowed_flags = if frame_type == FrameType::Reset {
             FLAG_RESET_ACK
@@ -147,7 +145,7 @@ impl Header {
                 return Err(ProtocolError::BadLength { frame_type, length });
             }
         }
-        if frame_type == FrameType::Data && length == 0 {
+        if matches!(frame_type, FrameType::Data | FrameType::Datagram) && length == 0 {
             // Zero-length DATA carries nothing and only enables spin attacks.
             return Err(ProtocolError::BadLength { frame_type, length });
         }
@@ -370,11 +368,20 @@ mod tests {
             d.decode(&mut raw_header(7, 0x0002, 1, 1)),
             Err(ProtocolError::ReservedFlags { .. })
         ));
-        let mut d = Decoder::new(MAX_PAYLOAD);
-        assert!(matches!(
-            d.decode(&mut raw_header(12, 0, 1, 1)),
-            Err(ProtocolError::UnsupportedFrameType(FrameType::Datagram))
-        ));
+        // DATAGRAM (feature 0x0001) is framed like DATA: a logical stream,
+        // a nonempty payload, no flags. Negotiation is the session's check.
+        let mut dgram = raw_header(12, 0, 1, 2);
+        dgram.put_slice(b"hi");
+        let f = Decoder::new(MAX_PAYLOAD)
+            .decode(&mut dgram)
+            .expect("datagram")
+            .expect("complete");
+        assert_eq!(f.frame_type, FrameType::Datagram);
+        for (sid, flags, len) in [(0u32, 0u16, 1u32), (1, 0, 0), (1, 1, 1)] {
+            let mut b = raw_header(12, flags, sid, len);
+            b.resize(HEADER_LEN + len as usize, 0);
+            assert!(Decoder::new(MAX_PAYLOAD).decode(&mut b).is_err());
+        }
         let mut bad = raw_header(5, 0, 1, 1);
         bad[0] = b'X';
         assert_eq!(

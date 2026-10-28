@@ -186,7 +186,9 @@ Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl conn
 2. Send yourself the invitation (for example by chat or mail). Share it to **AegisNet**, or copy it and press **Paste** in the app. Then press **Join**.
 3. Press the power button and accept Android's VPN request. While connected, apps on the phone reach the internet through your server; local networks stay direct.
 
-The phone app carries TCP only for now: calls, games and other UDP apps don't work through it. Browsers fall back from QUIC to TCP by themselves.
+The phone app carries TCP and UDP, so calls, games and QUIC work through it too. With a server older than this version only TCP works, and apps fall back from QUIC to TCP by themselves.
+
+On a computer, apps that support SOCKS5 UDP (for example some games and messengers) can send UDP through `127.0.0.1:1080` as well; the HTTP proxy and the Windows system proxy are TCP only.
 
 **Several servers:** a device can join more than one server, each with its own invitation, and connects to one at a time.
 - Desktop: open **Add a server** and join; the connection moves to the new server. Choose another one under **Server**. **Settings → Remove this server** removes the one shown.

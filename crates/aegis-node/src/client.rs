@@ -2,8 +2,10 @@
 //! tunnel outbound (one multiplexed session per gateway, reconnected with
 //! bounded backoff; never a silent direct fallback).
 
-use crate::egress::{admit_failure, dial_direct};
-use crate::relay::{finish_mux, relay, ActiveGuard, RelayOutcome, Upstream};
+use crate::egress::{admit_failure, bind_direct_udp, dial_direct};
+use crate::relay::{
+    finish_flow, finish_mux, relay, ActiveGuard, DatagramUpstream, RelayOutcome, Upstream, UDP_IDLE,
+};
 use crate::{now_unix, LoadedIdentity, NodeContext};
 use aegis_buffer::Budget;
 use aegis_config::{secret, InboundConfig, NodeConfig, OutboundConfig, OutboundKind};
@@ -13,11 +15,12 @@ use aegis_contracts::Destination;
 use aegis_core::{Backoff, CircuitBreaker};
 use aegis_identity::tls;
 use aegis_inbound_http::HttpConnectConfig;
-use aegis_inbound_socks::{Reply, SocksConfig};
+use aegis_inbound_socks::{Command, Reply, SocksConfig};
 use aegis_policy::DecisionInput;
-use aegis_session::{client_handshake, MuxStream, OpenError, Session, SessionConfig};
+use aegis_session::{client_handshake, DatagramFlow, MuxStream, OpenError, Session, SessionConfig};
 use aegis_telemetry::{LocalMetrics, Severity};
 use aegis_transport_ws::WsClientConfig;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -93,6 +96,7 @@ impl Tunnel {
                 stream_tx_buffer: c.stream_buffer_budget_bytes,
                 handshake_timeout: Duration::from_millis(u64::from(c.tls_handshake_timeout_ms)),
                 keepalive_interval: Duration::from_secs(u64::from(c.keepalive_interval_seconds)),
+                datagrams: true,
                 ..SessionConfig::default()
             },
             tls_timeout: Duration::from_millis(u64::from(c.tls_handshake_timeout_ms)),
@@ -271,6 +275,31 @@ impl Tunnel {
         }
         Err(OpenFailure::Unavailable)
     }
+
+    /// Open a UDP flow, with the same retry rule as [`open`](Self::open).
+    /// A gateway without UDP support refuses it as unsupported.
+    pub async fn open_datagram(
+        &self,
+        dest: &Destination,
+        timeout: Duration,
+    ) -> Result<DatagramFlow, OpenFailure> {
+        for _ in 0..2 {
+            let s = self.session().await?;
+            match s.open_datagram(dest.clone(), timeout).await {
+                Ok(f) => return Ok(f),
+                Err(OpenError::GoingAway | OpenError::IdsExhausted) => {
+                    self.forget(&s).await;
+                    continue;
+                }
+                Err(OpenError::Session(_)) => {
+                    self.forget(&s).await;
+                    return Err(OpenFailure::Unavailable);
+                }
+                Err(e) => return Err(e.as_open_failure()),
+            }
+        }
+        Err(OpenFailure::Unavailable)
+    }
 }
 
 /// Admit a local connection and connect its upstream.
@@ -279,6 +308,51 @@ async fn route(
     dest: &Destination,
     inbound: &str,
 ) -> Result<Upstream, OpenFailure> {
+    let (admitted, ob, timeout) = admit(ctx, dest, inbound)?;
+    match ob.kind {
+        OutboundKind::AgpTunnel => {
+            let tunnel = ctx
+                .tunnel_for(&ob, &admitted.bundle.compiled.config)
+                .await?;
+            tunnel.open(dest, timeout).await.map(Upstream::Mux)
+        }
+        OutboundKind::DirectTcp => dial_direct(ctx, &admitted, dest, inbound, None, timeout)
+            .await
+            .map(Upstream::Tcp),
+    }
+}
+
+/// Admit a local UDP flow and open its upstream: a tunnel flow, or for a
+/// direct route a socket under the same egress checks as a direct dial.
+async fn route_udp(
+    ctx: &NodeContext,
+    dest: &Destination,
+    inbound: &str,
+) -> Result<DatagramUpstream, OpenFailure> {
+    let (admitted, ob, timeout) = admit(ctx, dest, inbound)?;
+    match ob.kind {
+        OutboundKind::AgpTunnel => {
+            let tunnel = ctx
+                .tunnel_for(&ob, &admitted.bundle.compiled.config)
+                .await?;
+            tunnel
+                .open_datagram(dest, timeout)
+                .await
+                .map(DatagramUpstream::Flow)
+        }
+        OutboundKind::DirectTcp => bind_direct_udp(ctx, &admitted, dest, inbound, None, timeout)
+            .await
+            .map(DatagramUpstream::Socket),
+    }
+}
+
+/// Admission of a local connection or flow: the decision, its outbound and
+/// the open timeout.
+fn admit(
+    ctx: &NodeContext,
+    dest: &Destination,
+    inbound: &str,
+) -> Result<(aegis_core::Admitted, OutboundConfig, Duration), OpenFailure> {
     let input = DecisionInput {
         destination: dest,
         inbound,
@@ -309,19 +383,12 @@ async fn route(
         .bundle
         .compiled
         .outbound(&outbound)
-        .ok_or(OpenFailure::Internal)?;
+        .ok_or(OpenFailure::Internal)?
+        .clone();
     let timeout = Duration::from_millis(u64::from(
         admitted.bundle.compiled.config.core.open_timeout_ms,
     ));
-    match ob.kind {
-        OutboundKind::AgpTunnel => {
-            let tunnel = ctx.tunnel_for(ob, &admitted.bundle.compiled.config).await?;
-            tunnel.open(dest, timeout).await.map(Upstream::Mux)
-        }
-        OutboundKind::DirectTcp => dial_direct(ctx, &admitted, dest, inbound, None, timeout)
-            .await
-            .map(Upstream::Tcp),
-    }
+    Ok((admitted, ob, timeout))
 }
 
 async fn run_relay(ctx: &NodeContext, mut local: TcpStream, mut upstream: Upstream) {
@@ -504,8 +571,13 @@ pub async fn serve_socks(
         let id = Arc::clone(&id);
         tokio::spawn(async move {
             let _ = tcp.set_nodelay(true);
-            let Ok(dest) = aegis_inbound_socks::handshake(&mut tcp, &cfg).await else {
-                return;
+            let dest = match aegis_inbound_socks::handshake(&mut tcp, &cfg).await {
+                Ok(Command::Connect(dest)) => dest,
+                Ok(Command::UdpAssociate { from_port }) => {
+                    udp_associate(ctx, tcp, id, from_port).await;
+                    return;
+                }
+                Err(_) => return,
             };
             match route(&ctx, &dest, &id).await {
                 Ok(up) => {
@@ -531,6 +603,183 @@ pub async fn serve_socks(
                 }
             }
         });
+    }
+}
+
+/// UDP flows one association carries at once; datagrams to further
+/// destinations are dropped until one ends.
+const ASSOCIATION_FLOWS: usize = 64;
+/// Datagrams waiting for a flow (its upstream may still be opening).
+const FLOW_QUEUE: usize = 32;
+
+/// A SOCKS5 UDP association: a relay socket on the address the client
+/// reached us on, accepting datagrams only from the client's host (and the
+/// port it named, if any). Each destination becomes its own admitted flow
+/// (a tunnel UDP flow or a direct socket); the association, and with it
+/// every flow, ends when the client closes the control connection.
+async fn udp_associate(
+    ctx: Arc<NodeContext>,
+    mut control: TcpStream,
+    inbound: Arc<str>,
+    from_port: Option<u16>,
+) {
+    use std::collections::HashMap;
+    use tokio::io::AsyncReadExt;
+    let (Ok(local), Ok(client)) = (control.local_addr(), control.peer_addr()) else {
+        return;
+    };
+    let relay = match tokio::net::UdpSocket::bind((local.ip(), 0)).await {
+        Ok(s) => Arc::new(s),
+        Err(_) => {
+            let _ =
+                aegis_inbound_socks::send_reply(&mut control, Reply::GeneralFailure, None).await;
+            return;
+        }
+    };
+    let bound = relay.local_addr().ok();
+    if aegis_inbound_socks::send_reply(&mut control, Reply::Succeeded, bound)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Replies go to wherever the client's first datagram came from.
+    let mut peer: Option<SocketAddr> = None;
+    let mut flows: HashMap<Destination, tokio::sync::mpsc::Sender<bytes::Bytes>> = HashMap::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut probe = [0u8; 1];
+    let mut shutdown = ctx.shutdown_signal();
+    loop {
+        let (n, from) = tokio::select! {
+            r = relay.recv_from(&mut buf) => match r {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            // The client closes the control connection to end the
+            // association (and anything it sends on it is ignored).
+            r = control.read(&mut probe) => match r {
+                Ok(n) if n > 0 => continue,
+                _ => break,
+            },
+            _ = shutdown.wait_for(|s| *s) => break,
+        };
+        if from.ip() != client.ip() || from_port.is_some_and(|p| p != from.port()) {
+            continue;
+        }
+        if *peer.get_or_insert(from) != from {
+            continue;
+        }
+        let Some((dest, data)) = aegis_inbound_socks::parse_udp(&buf[..n]) else {
+            continue;
+        };
+        let data = bytes::Bytes::copy_from_slice(data);
+        if let Some(tx) = flows.get(&dest) {
+            match tx.try_send(data) {
+                Ok(()) => continue,
+                // Full: this datagram is lost, as UDP allows.
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => continue,
+                // The flow ended (idle or refused): start a new one below.
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(data)) => {
+                    flows.remove(&dest);
+                    if let Some(tx) = start_flow(&ctx, &inbound, &relay, from, &dest, &mut flows) {
+                        let _ = tx.try_send(data);
+                    }
+                }
+            }
+        } else {
+            flows.retain(|_, tx| !tx.is_closed());
+            if let Some(tx) = start_flow(&ctx, &inbound, &relay, from, &dest, &mut flows) {
+                let _ = tx.try_send(data);
+            }
+        }
+    }
+}
+
+/// Start the flow task for `dest` in an association, unless it is full.
+fn start_flow(
+    ctx: &Arc<NodeContext>,
+    inbound: &Arc<str>,
+    relay: &Arc<tokio::net::UdpSocket>,
+    client: SocketAddr,
+    dest: &Destination,
+    flows: &mut std::collections::HashMap<Destination, tokio::sync::mpsc::Sender<bytes::Bytes>>,
+) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
+    if flows.len() >= ASSOCIATION_FLOWS {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(FLOW_QUEUE);
+    flows.insert(dest.clone(), tx.clone());
+    tokio::spawn(udp_flow(
+        Arc::clone(ctx),
+        Arc::clone(inbound),
+        Arc::clone(relay),
+        client,
+        dest.clone(),
+        rx,
+    ));
+    Some(tx)
+}
+
+/// One destination of an association: admit and open the upstream, then
+/// carry datagrams both ways until the association drops it or it idles.
+async fn udp_flow(
+    ctx: Arc<NodeContext>,
+    inbound: Arc<str>,
+    relay: Arc<tokio::net::UdpSocket>,
+    client: SocketAddr,
+    dest: Destination,
+    mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+) {
+    let upstream = match route_udp(&ctx, &dest, &inbound).await {
+        Ok(u) => u,
+        Err(f) => {
+            ctx.obs().record(Event::StreamClosed {
+                result: OperationResult::Denied,
+                reason: f.group(),
+            });
+            return;
+        }
+    };
+    ctx.obs().record(Event::StreamOpened);
+    let _active = ActiveGuard::new(&ctx.streams_active);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut deadline = tokio::time::Instant::now() + UDP_IDLE;
+    let outcome = loop {
+        tokio::select! {
+            d = rx.recv() => match d {
+                Some(d) => {
+                    deadline = tokio::time::Instant::now() + UDP_IDLE;
+                    if let Err(e) = upstream.send(&d).await {
+                        break RelayOutcome::Error(e.kind());
+                    }
+                }
+                None => break RelayOutcome::Completed,
+            },
+            r = upstream.recv(&mut buf) => match r {
+                Ok(d) => {
+                    deadline = tokio::time::Instant::now() + UDP_IDLE;
+                    let _ = relay
+                        .send_to(&aegis_inbound_socks::encode_udp(&dest, &d), client)
+                        .await;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    break RelayOutcome::Completed
+                }
+                Err(e) => break RelayOutcome::Error(e.kind()),
+            },
+            _ = tokio::time::sleep_until(deadline) => break RelayOutcome::IdleTimeout,
+        }
+    };
+    match upstream {
+        DatagramUpstream::Flow(f) => finish_flow(f, outcome, ctx.obs()),
+        DatagramUpstream::Socket(_) => ctx.obs().record(Event::StreamClosed {
+            result: match outcome {
+                RelayOutcome::Completed => OperationResult::Ok,
+                RelayOutcome::IdleTimeout => OperationResult::Timeout,
+                RelayOutcome::Error(_) => OperationResult::Error,
+            },
+            reason: ReasonGroup::Other,
+        }),
     }
 }
 

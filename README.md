@@ -50,7 +50,7 @@ The Integrations page lists the built-in integrations.
 
 `aegisctl join/connect` is the same client for headless machines.
 
-**Android app:** a VPN rather than a proxy, so every app's TCP traffic goes through the gateway; names are resolved there. It's installed from the console's downloads ([ADR-0011](docs/adr/0011-mobile-client.md)). iOS will follow on the same Rust core and Flutter UI.
+**Android app:** a VPN rather than a proxy, so every app's TCP and UDP traffic goes through the gateway; names are resolved there. It's installed from the console's downloads ([ADR-0011](docs/adr/0011-mobile-client.md)). iOS will follow on the same Rust core and Flutter UI.
 
 Design and limits: [ADR-0007](docs/adr/0007-appliance-console-and-portable-client.md). Evidence: [SPEC-12 acceptance](docs/SPEC12_ACCEPTANCE.md).
 
@@ -64,7 +64,7 @@ Design and limits: [ADR-0007](docs/adr/0007-appliance-console-and-portable-clien
   - automatic certificate renewal;
   - Cloudflare Tunnel and ACME integrations;
   - a portable GUI client.
-- **Data path:** SOCKS5, HTTP CONNECT and plain-HTTP forwarding on the client → WebSocket (`wss://`, works behind a TLS-terminating edge) → **inner mutual TLS 1.3** (no resumption, tickets or 0-RTT) → **AGP/1** multiplexed streams → gateway → policy-restricted TCP egress.
+- **Data path:** SOCKS5 (CONNECT and UDP ASSOCIATE), HTTP CONNECT and plain-HTTP forwarding on the client → WebSocket (`wss://`, works behind a TLS-terminating edge) → **inner mutual TLS 1.3** (no resumption, tickets or 0-RTT) → **AGP/1** multiplexed streams and UDP flows ([ADR-0012](docs/adr/0012-udp-flows.md)) → gateway → policy-restricted TCP and UDP egress.
 - **Per-OPEN admission:** every new logical stream, including one on a long-lived session, is checked against the *current* policy and the current revocation snapshot. Revoking a node closes its live sessions.
 - **Bounded resources:**
   - receive credit is reserved before it is advertised;

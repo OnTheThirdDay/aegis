@@ -1,7 +1,9 @@
-//! SOCKS5 inbound (FR-001): CONNECT only, IPv4/IPv6/domain, optional
-//! username/password authentication. The caller performs admission and dials
-//! between [`handshake`] and the reply; success is only sent once the
-//! destination is connected.
+//! SOCKS5 inbound (FR-001): CONNECT and UDP ASSOCIATE, IPv4/IPv6/domain,
+//! optional username/password authentication. The caller performs admission
+//! and dials between [`handshake`] and the reply; success is only sent once
+//! the destination is connected. For UDP ASSOCIATE the caller binds the
+//! relay socket and carries datagrams framed by [`parse_udp`] /
+//! [`encode_udp`] (no fragmentation) while the control connection lasts.
 #![forbid(unsafe_code)]
 
 use aegis_contracts::capability::{
@@ -27,7 +29,11 @@ pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
         OsFamily::Android,
         OsFamily::Ios,
     ],
-    provides: &[Capability::ByteStream, Capability::HalfClose],
+    provides: &[
+        Capability::ByteStream,
+        Capability::HalfClose,
+        Capability::Datagram,
+    ],
     requires: &[],
     budget: ResourceBudget {
         max_open_streams: 0,
@@ -45,6 +51,7 @@ const METHOD_NONE: u8 = 0x00;
 const METHOD_USERPASS: u8 = 0x02;
 const METHOD_REJECT: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -122,8 +129,19 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
-/// Negotiate method, authenticate and parse the CONNECT request.
-pub async fn handshake<S>(stream: &mut S, cfg: &SocksConfig) -> Result<Destination, SocksError>
+/// What the client asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    Connect(Destination),
+    /// Relay UDP datagrams. `from_port` is the source port the client said
+    /// it will send from, when it said one.
+    UdpAssociate {
+        from_port: Option<u16>,
+    },
+}
+
+/// Negotiate method, authenticate and parse the request.
+pub async fn handshake<S>(stream: &mut S, cfg: &SocksConfig) -> Result<Command, SocksError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -132,7 +150,7 @@ where
         .map_err(|_| SocksError::Timeout)?
 }
 
-async fn handshake_inner<S>(s: &mut S, cfg: &SocksConfig) -> Result<Destination, SocksError>
+async fn handshake_inner<S>(s: &mut S, cfg: &SocksConfig) -> Result<Command, SocksError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -184,50 +202,50 @@ where
         return Err(SocksError::BadVersion);
     }
     let cmd = req[1];
+    // The whole address is read before the request is judged; `None` is a
+    // domain that isn't a valid name.
     let host = match req[3] {
         0x01 => {
             let mut o = [0u8; 4];
             s.read_exact(&mut o).await?;
-            Host::Ip(IpAddr::V4(Ipv4Addr::from(o)))
+            Some(Host::Ip(IpAddr::V4(Ipv4Addr::from(o))))
         }
         0x04 => {
             let mut o = [0u8; 16];
             s.read_exact(&mut o).await?;
-            Host::Ip(aegis_contracts::destination::canonical_ip(IpAddr::V6(
-                Ipv6Addr::from(o),
+            Some(Host::Ip(aegis_contracts::destination::canonical_ip(
+                IpAddr::V6(Ipv6Addr::from(o)),
             )))
         }
         0x03 => {
             let len = s.read_u8().await? as usize;
             let mut name = vec![0u8; len];
             s.read_exact(&mut name).await?;
-            let _port = s.read_u16().await?;
-            let parsed = std::str::from_utf8(&name)
+            std::str::from_utf8(&name)
                 .ok()
-                .and_then(|n| normalize_domain(n).ok());
-            match parsed {
-                Some(d) => {
-                    if cmd != CMD_CONNECT {
-                        return reject(s, Reply::CommandNotSupported).await;
-                    }
-                    if req[2] != 0 {
-                        return reject(s, Reply::GeneralFailure).await;
-                    }
-                    return finish(s, Host::Domain(d), _port).await;
-                }
-                None => return reject(s, Reply::HostUnreachable).await,
-            }
+                .and_then(|n| normalize_domain(n).ok())
+                .map(Host::Domain)
         }
         _ => return reject(s, Reply::AddressTypeNotSupported).await,
     };
     let port = s.read_u16().await?;
-    if cmd != CMD_CONNECT {
+    if cmd != CMD_CONNECT && cmd != CMD_UDP_ASSOCIATE {
         return reject(s, Reply::CommandNotSupported).await;
     }
     if req[2] != 0 {
         return reject(s, Reply::GeneralFailure).await;
     }
-    finish(s, host, port).await
+    if cmd == CMD_UDP_ASSOCIATE {
+        // The address is only a hint of where datagrams will come from
+        // (often 0.0.0.0:0); the caller accepts them from the client's IP.
+        return Ok(Command::UdpAssociate {
+            from_port: (port != 0).then_some(port),
+        });
+    }
+    let Some(host) = host else {
+        return reject(s, Reply::HostUnreachable).await;
+    };
+    finish(s, host, port).await.map(Command::Connect)
 }
 
 async fn finish<S>(s: &mut S, host: Host, port: u16) -> Result<Destination, SocksError>
@@ -275,7 +293,68 @@ where
     s.flush().await
 }
 
+/// Split a client's UDP relay datagram (RFC 1928 section 7: RSV, FRAG,
+/// address, port, data) into its destination and data. Fragments (FRAG
+/// other than 0) and malformed headers give `None`: the datagram is dropped.
+pub fn parse_udp(packet: &[u8]) -> Option<(Destination, &[u8])> {
+    let (head, rest) = packet.split_first_chunk::<4>()?;
+    if head[..3] != [0, 0, 0] {
+        return None;
+    }
+    let (host, rest) = match head[3] {
+        0x01 => {
+            let (o, rest) = rest.split_first_chunk::<4>()?;
+            (Host::Ip(IpAddr::V4(Ipv4Addr::from(*o))), rest)
+        }
+        0x04 => {
+            let (o, rest) = rest.split_first_chunk::<16>()?;
+            let ip = aegis_contracts::destination::canonical_ip(IpAddr::V6(Ipv6Addr::from(*o)));
+            (Host::Ip(ip), rest)
+        }
+        0x03 => {
+            let (len, rest) = rest.split_first()?;
+            let len = usize::from(*len);
+            if rest.len() < len {
+                return None;
+            }
+            let (name, rest) = rest.split_at(len);
+            let name = normalize_domain(std::str::from_utf8(name).ok()?).ok()?;
+            (Host::Domain(name), rest)
+        }
+        _ => return None,
+    };
+    let (port, data) = rest.split_first_chunk::<2>()?;
+    let dest = Destination::new(host, u16::from_be_bytes(*port)).ok()?;
+    Some((dest, data))
+}
+
+/// Frame `data` from `source` for the client (the reverse of [`parse_udp`]).
+pub fn encode_udp(source: &Destination, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 22);
+    out.extend_from_slice(&[0, 0, 0]);
+    match &source.host {
+        Host::Ip(IpAddr::V4(ip)) => {
+            out.push(0x01);
+            out.extend_from_slice(&ip.octets());
+        }
+        Host::Ip(IpAddr::V6(ip)) => {
+            out.push(0x04);
+            out.extend_from_slice(&ip.octets());
+        }
+        Host::Domain(name) => {
+            out.push(0x03);
+            // Destination names are at most 253 bytes.
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    out.extend_from_slice(&source.port.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
 
@@ -289,7 +368,17 @@ mod tests {
         }
     }
 
+    /// A CONNECT handshake: the destination, or the error.
     async fn run(input: Vec<u8>, c: SocksConfig) -> (Result<Destination, SocksError>, Vec<u8>) {
+        let (r, out) = run_command(input, c).await;
+        let r = r.map(|cmd| match cmd {
+            Command::Connect(d) => d,
+            other => panic!("expected CONNECT, got {other:?}"),
+        });
+        (r, out)
+    }
+
+    async fn run_command(input: Vec<u8>, c: SocksConfig) -> (Result<Command, SocksError>, Vec<u8>) {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let srv = tokio::spawn(async move { handshake(&mut server, &c).await });
         client.write_all(&input).await.expect("write");
@@ -370,5 +459,57 @@ mod tests {
         let (r, out) = run(vec![5, 1, 0], cfg(Some(("user", "pass")))).await;
         assert_eq!(r, Err(SocksError::NoAcceptableMethod));
         assert_eq!(out, vec![5, 0xFF]);
+    }
+
+    #[tokio::test]
+    async fn udp_associate_requests() {
+        let (r, _) = run_command(vec![5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0], cfg(None)).await;
+        assert_eq!(r, Ok(Command::UdpAssociate { from_port: None }));
+        let (r, _) = run_command(
+            vec![5, 1, 0, 5, 3, 0, 1, 10, 0, 0, 2, 0x1f, 0x90],
+            cfg(None),
+        )
+        .await;
+        assert_eq!(
+            r,
+            Ok(Command::UdpAssociate {
+                from_port: Some(8080)
+            })
+        );
+        // BIND stays unsupported.
+        let (r, _) = run_command(vec![5, 1, 0, 5, 2, 0, 1, 0, 0, 0, 0, 0, 0], cfg(None)).await;
+        assert_eq!(r, Err(SocksError::Rejected(Reply::CommandNotSupported)));
+    }
+
+    #[test]
+    fn udp_headers_round_trip_and_reject_fragments() {
+        for authority in ["93.184.216.34:53", "[2001:db8::1]:443", "example.com:443"] {
+            let dest = Destination::parse_authority(authority).expect("dest");
+            let packet = encode_udp(&dest, b"payload");
+            let (parsed, data) = parse_udp(&packet).expect("parse");
+            assert_eq!(parsed, dest);
+            assert_eq!(data, b"payload");
+        }
+        let dest = Destination::parse_authority("192.0.2.1:53").expect("dest");
+        let mut fragment = encode_udp(&dest, b"x");
+        fragment[2] = 1;
+        assert!(parse_udp(&fragment).is_none(), "fragments are dropped");
+        let mut reserved = encode_udp(&dest, b"x");
+        reserved[0] = 1;
+        assert!(parse_udp(&reserved).is_none());
+        assert!(parse_udp(&[0, 0, 0, 1, 1, 2]).is_none(), "truncated");
+        assert!(parse_udp(&[0, 0, 0, 3, 5, b'a']).is_none(), "short name");
+        let mut port0 = encode_udp(&dest, b"");
+        let n = port0.len();
+        port0[n - 2..].copy_from_slice(&[0, 0]);
+        assert!(parse_udp(&port0).is_none(), "port 0");
+        // A mixed-case name is normalized like CONNECT's.
+        let mut upper = vec![0, 0, 0, 3, 11];
+        upper.extend_from_slice(b"Example.COM");
+        upper.extend_from_slice(&[0, 53]);
+        assert_eq!(
+            parse_udp(&upper).expect("name").0.to_string(),
+            "example.com:53"
+        );
     }
 }

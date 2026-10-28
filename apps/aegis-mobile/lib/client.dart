@@ -66,6 +66,7 @@ class Status {
     this.bytesUp = 0,
     this.bytesDown = 0,
     this.connections = 0,
+    this.udpFlows = 0,
   });
 
   factory Status.fromJson(Map<String, dynamic> j) => Status(
@@ -82,6 +83,7 @@ class Status {
         bytesUp: (j['bytes_up'] as num?)?.toInt() ?? 0,
         bytesDown: (j['bytes_down'] as num?)?.toInt() ?? 0,
         connections: (j['connections'] as num?)?.toInt() ?? 0,
+        udpFlows: (j['udp_flows'] as num?)?.toInt() ?? 0,
       );
 
   final ConnectionState state;
@@ -95,6 +97,9 @@ class Status {
   final int bytesUp;
   final int bytesDown;
   final int connections;
+
+  /// Open UDP flows (calls, games, QUIC).
+  final int udpFlows;
 }
 
 DateTime? _time(Object? unix) =>
