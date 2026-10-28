@@ -35,6 +35,7 @@ On macOS, install Docker Desktop and make sure it's running. Enable *Start Docke
 | 8443 | the HTTPS web console | 8453, 8463, 9443 | `--console-port N` |
 | 443 | devices connecting directly | 8444, 8454, 9444 | `--port N` |
 | 80 | Let's Encrypt HTTP validation (only during issuance) | not used | `--http-port N` (`0` = don't use) |
+| UDP, same number as the device port | direct QUIC (optional, faster for games and calls) | — | published only with `--quic` |
 
 ## 2. Install
 
@@ -247,6 +248,18 @@ docker exec aegis aegisctl cloudflared auto-update off   # or on
 Use your `--name` instead of `aegis` if you installed with one. Upgrading the gateway (above) also brings the connector that was current when the image was built.
 
 A cloudflared you run yourself, outside AegisNet (for example on another machine), isn't managed by the gateway. Update it the way you installed it: your package manager (`apt`/`dnf`, Cloudflare's repository at pkg.cloudflare.com), `brew upgrade cloudflared` on macOS, or a newer `cloudflare/cloudflared` image tag for Docker. Then restart its service.
+
+## Optional: direct QUIC for games and calls
+
+Devices normally reach the gateway over TCP (WebSocket, directly or through Cloudflare). Over TCP, one lost packet holds up everything behind it until it is resent, which games and calls feel as short freezes on mobile data. With direct QUIC, devices connect over UDP instead, and app UDP stays UDP the whole way. They fall back to the usual address by themselves whenever QUIC can't get through, so nothing breaks on networks that block UDP.
+
+QUIC can't go through Cloudflare: devices must reach this server's own address on a UDP port.
+
+1. Publish the UDP port: install or upgrade with `--quic` (it uses the device port number, e.g. UDP 443). The installer remembers it on later upgrades; `--no-quic` removes it.
+2. Allow that UDP port in the server's firewall or cloud security group, and forward it on your router if the server is at home.
+3. In the console: **Connectivity → Direct QUIC → Turn QUIC on**. With direct connections, devices use the same address and port number. With Cloudflare Tunnel, enter the server's public IP or DNS name and the UDP port; devices then see that address.
+
+Devices pick it up the next time they connect, without a new invitation. The phone and desktop apps show "via QUIC (UDP)" while it's in use.
 
 ## Optional: keep the device root key offline
 

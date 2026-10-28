@@ -216,6 +216,8 @@ pub enum InboundKind {
     Websocket,
     Socks5,
     HttpConnect,
+    /// Direct QUIC (UDP) device ingress: mutual TLS in the QUIC handshake.
+    Quic,
 }
 
 impl InboundKind {
@@ -224,6 +226,7 @@ impl InboundKind {
             InboundKind::Websocket => "websocket",
             InboundKind::Socks5 => "socks5",
             InboundKind::HttpConnect => "http_connect",
+            InboundKind::Quic => "quic",
         }
     }
 }
@@ -320,6 +323,10 @@ pub struct OutboundConfig {
     /// still use the URL host. At most 8.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connect_addresses: Vec<String>,
+    /// agp_tunnel: `host:port` of the gateway's QUIC (UDP) listener. The
+    /// tunnel tries it first and falls back to `url` when it can't connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic: Option<String>,
     /// agp_tunnel: acknowledge a plaintext `ws://` outer hop to a non-loopback
     /// host (inner mTLS still protects data). Never implied.
     #[serde(default)]

@@ -725,6 +725,7 @@ async function renderConnectivity() {
     v.append(cloudflareCard(cf, conn));
     v.append(acmeCard(acme, conn));
   }
+  v.append(quicCard(info.quic || {}, conn));
   if (["applying", "removing", "issuing", "planning", "verifying"].includes(cf.state) || ["issuing", "removing"].includes(acme.state)) {
     pollTimer = window.setTimeout(() => { if (currentView === "connectivity") renderConnectivity().catch(() => {}); }, 2500);
   }
@@ -750,6 +751,44 @@ function directCard(conn, managed) {
       field("Port", port, "The host port forwarded to the gateway's edge listener."),
     ]),
     el("div", { class: "row" }, [save]),
+  ]);
+}
+
+/** Direct QUIC: a faster UDP path next to the usual address.
+ * @param {any} q @param {any} conn */
+function quicCard(q, conn) {
+  const viaCloudflare = conn.mode === "cloudflare";
+  const host = /** @type {HTMLInputElement} */ (el("input", { autocomplete: "off", value: q.host || "", placeholder: viaCloudflare ? "the server's public IP or DNS name" : "same as devices: " + (conn.public_host || "") }));
+  const port = /** @type {HTMLInputElement} */ (el("input", { type: "number", min: "1", max: "65535", value: q.port ? String(q.port) : "", placeholder: viaCloudflare ? "the UDP port forwarded here" : "same as devices: " + String(conn.public_port || 443) }));
+  const toggle = button(q.enabled ? "Turn QUIC off" : "Turn QUIC on", q.enabled ? "ghost small" : "small");
+  busy(toggle, async () => {
+    await api("PUT", "/system/quic", { body: { enabled: !q.enabled } });
+    await renderConnectivity();
+  });
+  const save = button("Save QUIC address", "ghost small");
+  busy(save, async () => {
+    const h = host.value.trim();
+    const p = port.value.trim();
+    await api("PUT", "/system/quic", { body: { host: h || null, port: p ? Number(p) : null } });
+    notice("Saved. Devices use it from their next connection.");
+    await renderConnectivity();
+  });
+  const controls = el("div", {}, [
+    el("div", { class: "cols" }, [
+      field("Server address for QUIC (optional)", host, viaCloudflare
+        ? "Required with Cloudflare Tunnel: Cloudflare can't carry QUIC, so devices need this server's own address. Using it shows that address to every device."
+        : "Leave empty to use the device address."),
+      field("UDP port (optional)", port, "Leave empty for the device port number. Forward this UDP port on your router or firewall to the server."),
+    ]),
+    el("div", { class: "row" }, [save, toggle]),
+  ]);
+  controls.hidden = !can("system:configure");
+  return card("Direct QUIC (faster UDP, for games and calls)", [
+    el("p", { class: "muted" }, ["Devices try QUIC over UDP first and use the usual address when it can't connect. With QUIC, app UDP (games, calls, QUIC websites) travels as UDP the whole way instead of inside a TCP connection, so a lost packet no longer stalls everything behind it. Same certificates and policy as the usual path."]),
+    el("p", { class: "muted" }, ["The server must be reachable on a UDP port: install or upgrade with ", el("code", {}, ["sudo sh install.sh --quic"]), " to publish it (the device port number, over UDP), and forward that UDP port on your router if needed."]),
+    el("p", {}, [pill(q.enabled ? "on" : "off"), " ", q.address ? el("code", {}, [q.address]) : el("span", { class: "muted" }, [q.enabled ? "(no address yet)" : ""])]),
+    q.warning ? el("p", { class: "warn-text" }, [q.warning]) : null,
+    controls,
   ]);
 }
 

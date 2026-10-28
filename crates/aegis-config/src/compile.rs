@@ -23,6 +23,18 @@ impl ModuleIds {
     pub const HTTP_CONNECT: &'static str = "aegis.inbound.http_connect";
     pub const DIRECT: &'static str = "aegis.outbound.direct";
     pub const TUNNEL: &'static str = "aegis.outbound.agp_tunnel";
+    pub const QUIC: &'static str = "aegis.transport.quic";
+}
+
+/// `host:port` (or `[v6]:port`) with a nonzero port and a valid host.
+pub fn quic_address(addr: &str) -> Option<(String, u16)> {
+    if let Ok(a) = addr.parse::<SocketAddr>() {
+        return (a.port() != 0 && !a.ip().is_unspecified()).then(|| (a.ip().to_string(), a.port()));
+    }
+    let (host, port) = addr.rsplit_once(':')?;
+    let port: u16 = port.parse().ok().filter(|p| *p != 0)?;
+    let host = aegis_contracts::destination::normalize_domain(host).ok()?;
+    Some((host, port))
 }
 
 /// The installed capability environment a profile is validated against.
@@ -365,7 +377,8 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
 
     // Inbounds.
     let mut ids = HashSet::new();
-    let mut binds: HashSet<SocketAddr> = HashSet::new();
+    // (UDP?, address): a QUIC listener may share a port number with TCP.
+    let mut binds: HashSet<(bool, SocketAddr)> = HashSet::new();
     let mut ws_count = 0;
     let mut local_count = 0;
     for ib in &cfg.inbounds {
@@ -398,7 +411,7 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
             }
         };
         if let Some(b) = bind.filter(|b| b.port() != 0) {
-            if !binds.insert(b) {
+            if !binds.insert((ib.kind == InboundKind::Quic, b)) {
                 ctx.err(format!("inbound {}: bind address used twice", ib.id));
             }
         }
@@ -406,6 +419,7 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
             InboundKind::Websocket => ModuleIds::WEBSOCKET,
             InboundKind::Socks5 => ModuleIds::SOCKS5,
             InboundKind::HttpConnect => ModuleIds::HTTP_CONNECT,
+            InboundKind::Quic => ModuleIds::QUIC,
         };
         if let Err(e) = reg.check(module, role) {
             ctx.err(format!("inbound {}: {e}", ib.id));
@@ -446,6 +460,26 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
                 if bind.is_some_and(|b| !is_loopback_bind(&b)) {
                     ctx.warn(format!(
                         "inbound {}: websocket listener is not loopback; expose it only on a trusted bridge or behind the edge",
+                        ib.id
+                    ));
+                }
+            }
+            InboundKind::Quic => {
+                if role != Role::Gateway {
+                    ctx.err(format!(
+                        "inbound {}: quic ingress is a gateway inbound",
+                        ib.id
+                    ));
+                }
+                if !(1..=1024).contains(&ib.max_pending_handshakes) {
+                    ctx.err(format!(
+                        "inbound {}: max_pending_handshakes must be 1..=1024",
+                        ib.id
+                    ));
+                }
+                if ib.auth.is_some() || !ib.allowed_origins.is_empty() {
+                    ctx.err(format!(
+                        "inbound {}: quic peers authenticate with mutual TLS; auth and allowed_origins don't apply",
                         ib.id
                     ));
                 }
@@ -509,9 +543,13 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
         }
         match ob.kind {
             OutboundKind::DirectTcp => {
-                if ob.url.is_some() || ob.server_name.is_some() || ob.outer_ca.is_some() {
+                if ob.url.is_some()
+                    || ob.server_name.is_some()
+                    || ob.outer_ca.is_some()
+                    || ob.quic.is_some()
+                {
                     ctx.err(format!(
-                        "outbound {}: url/server_name/outer_ca apply only to agp_tunnel",
+                        "outbound {}: url/server_name/outer_ca/quic apply only to agp_tunnel",
                         ob.id
                     ));
                 }
@@ -558,6 +596,17 @@ pub fn compile(cfg: &NodeConfig, env: &Environment<'_>) -> Result<CompiledConfig
                         }
                     }
                     None => ctx.err(format!("outbound {}: url must be ws:// or wss://host[:port]/path without credentials", ob.id)),
+                }
+                if let Some(q) = &ob.quic {
+                    if quic_address(q).is_none() {
+                        ctx.err(format!(
+                            "outbound {}: quic must be host:port (or [v6]:port)",
+                            ob.id
+                        ));
+                    }
+                    if let Err(e) = reg.check(ModuleIds::QUIC, role) {
+                        ctx.err(format!("outbound {}: {e}", ob.id));
+                    }
                 }
                 match &ob.server_name {
                     Some(n) if aegis_contracts::destination::normalize_domain(n).is_ok() => {}

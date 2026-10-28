@@ -42,6 +42,7 @@ Status legend:
 | C-003 multiplexer | PASS (dev) | `aegis-session`. |
 | C-004 WebSocket | PARTIAL | `aegis-transport-ws`. Direct path tested; local reverse proxy and Cloudflare paths are BLOCKED. |
 | C-005 HTTP/2 | NOT IMPL | Rejected by validation. |
+| QUIC transport | PASS (dev) | Direct QUIC with mTLS in the handshake, AGP on one stream, UDP flows as QUIC datagrams, WebSocket fallback ([ADR-0013](adr/0013-direct-quic.md)); `aegis-transport-quic/tests`, `e2e.rs` (QUIC and fallback). Not measured on lossy or real mobile paths. |
 | C-006 DATAGRAM / UDP | PASS (dev) | Optional feature 0x0001: UDP flows with DATAGRAM frames, bounded reserved buffers that drop instead of blocking ([ADR-0012](adr/0012-udp-flows.md)); `aegis-session/tests/datagram.rs`, vectors, `e2e.rs` SOCKS5 UDP ASSOCIATE. Head-of-line effects under loss are not measured. |
 | D-001 SOCKS5 | PASS (dev) | `aegis-inbound-socks`: CONNECT and UDP ASSOCIATE (no fragmentation). |
 | D-002 HTTP CONNECT | PASS (dev) | `aegis-inbound-http`. |

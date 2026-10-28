@@ -11,6 +11,7 @@ mod egress;
 mod gateway;
 pub mod modules;
 mod outer_tls;
+mod quic;
 pub mod relay;
 mod sessions;
 
@@ -140,6 +141,8 @@ pub struct NodeContext {
     /// Every accepted connection and admitted stream, so shutdown can stop
     /// them all (direct relays have no session to close).
     connections: Mutex<tokio::task::JoinSet<()>>,
+    /// QUIC listeners, whose TLS configuration follows certificate reloads.
+    quic_endpoints: Mutex<Vec<aegis_transport_quic::Endpoint>>,
     /// Process-wide reservations include authenticated AGP handshakes.
     session_slots: Arc<Semaphore>,
     resolver_cache: Mutex<Option<(String, Arc<Resolver>)>>,
@@ -175,6 +178,18 @@ impl NodeContext {
             Arc::clone(self.gate.identity_store()),
         )
         .map_err(|_| "replacement_identity_rejected")?;
+        if let Some(tls) = &loaded.server_tls {
+            let limits = quic_limits(&cfg);
+            for endpoint in self
+                .quic_endpoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+            {
+                aegis_transport_quic::reload(endpoint, tls, &limits)
+                    .map_err(|_| "replacement_identity_rejected")?;
+            }
+        }
         let mut identity = self.identity.write().unwrap_or_else(|e| e.into_inner());
         if identity.trust_digest != loaded.trust_digest {
             self.sessions.close_all(ResetReason::PolicyRevoked);
@@ -218,6 +233,16 @@ impl NodeContext {
             buffer_control: self.budget.class_used(PoolClass::Control),
             buffer_total: self.budget.used(),
         }
+    }
+
+    /// What carries the client's tunnel now: `quic`, `websocket`, or
+    /// `None` while it isn't connected.
+    pub fn tunnel_transport(&self) -> Option<&'static str> {
+        self.tunnels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find_map(|t| t.transport())
     }
 
     pub(crate) fn session_config(&self) -> SessionConfig {
@@ -546,6 +571,28 @@ impl NodeRuntime {
         let mut connections =
             std::mem::take(&mut *ctx.connections.lock().unwrap_or_else(|e| e.into_inner()));
         connections.shutdown().await;
+        // QUIC listeners: quinn closes the UDP socket once its last handle
+        // is gone and its driver notices, so wait (bounded) until the port
+        // can be bound again: it is free when shutdown returns, as for TCP.
+        let endpoints =
+            std::mem::take(&mut *ctx.quic_endpoints.lock().unwrap_or_else(|e| e.into_inner()));
+        let addrs: Vec<SocketAddr> = endpoints
+            .iter()
+            .filter_map(|e| e.local_addr().ok())
+            .collect();
+        for e in &endpoints {
+            e.close(0u32.into(), b"shutdown");
+            let _ = tokio::time::timeout(Duration::from_secs(1), e.wait_idle()).await;
+        }
+        drop(endpoints);
+        for addr in addrs {
+            for _ in 0..100 {
+                if std::net::UdpSocket::bind(addr).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
         ctx.coord.agent().transition(AgentState::Stopped);
     }
 }
@@ -679,6 +726,7 @@ pub async fn start_with_diagnostics(
         retired_tunnels: Mutex::new(Vec::new()),
         tunnel_update: tokio::sync::Mutex::new(()),
         connections: Mutex::new(tokio::task::JoinSet::new()),
+        quic_endpoints: Mutex::new(Vec::new()),
         session_slots: Arc::new(Semaphore::new(active.core.max_sessions as usize)),
         resolver_cache: Mutex::new(None),
         shutdown,
@@ -694,18 +742,50 @@ pub async fn start_with_diagnostics(
     // Bind every listener and read every credential before serving any:
     // a startup that fails part way must leave nothing listening.
     enum Serve {
-        Websocket,
-        Socks(Option<aegis_inbound_socks::Credentials>),
-        Http(Option<aegis_inbound_http::Credentials>),
+        Websocket(tokio::net::TcpListener),
+        Socks(
+            tokio::net::TcpListener,
+            Option<aegis_inbound_socks::Credentials>,
+        ),
+        Http(
+            tokio::net::TcpListener,
+            Option<aegis_inbound_http::Credentials>,
+        ),
+        Quic(aegis_transport_quic::Endpoint),
     }
     let mut ready = Vec::new();
     for ib in &active.inbounds {
-        let serve = match ib.kind {
-            InboundKind::Websocket => Serve::Websocket,
-            InboundKind::Socks5 => Serve::Socks(
+        if ib.kind == InboundKind::Quic {
+            let bind = ib
+                .bind
+                .parse()
+                .map_err(|_| StartError::Bind(format!("inbound {}: bind", ib.id)))?;
+            let tls = ctx
+                .identity
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .server_tls
+                .clone()
+                .ok_or_else(|| StartError::Identity("quic needs the gateway identity".into()))?;
+            let endpoint = aegis_transport_quic::server(bind, &tls, &quic_limits(&active))
+                .map_err(|e| StartError::Bind(format!("inbound {}: {e}", ib.id)))?;
+            let addr = endpoint
+                .local_addr()
+                .map_err(|e| StartError::Bind(e.to_string()))?;
+            ready.push((ib, addr, Serve::Quic(endpoint)));
+            continue;
+        }
+        enum Creds {
+            None,
+            Socks(Option<aegis_inbound_socks::Credentials>),
+            Http(Option<aegis_inbound_http::Credentials>),
+        }
+        let creds = match ib.kind {
+            InboundKind::Websocket | InboundKind::Quic => Creds::None,
+            InboundKind::Socks5 => Creds::Socks(
                 client::socks_credentials(ib, &ctx.secrets_dir).map_err(StartError::Identity)?,
             ),
-            InboundKind::HttpConnect => Serve::Http(
+            InboundKind::HttpConnect => Creds::Http(
                 client::http_credentials(ib, &ctx.secrets_dir).map_err(StartError::Identity)?,
             ),
         };
@@ -715,20 +795,28 @@ pub async fn start_with_diagnostics(
         let addr = listener
             .local_addr()
             .map_err(|e| StartError::Bind(e.to_string()))?;
-        ready.push((ib, listener, addr, serve));
+        let serve = match creds {
+            Creds::None => Serve::Websocket(listener),
+            Creds::Socks(c) => Serve::Socks(listener, c),
+            Creds::Http(c) => Serve::Http(listener, c),
+        };
+        ready.push((ib, addr, serve));
     }
     let mut bound = Vec::new();
     let mut tasks = Vec::new();
-    for (ib, listener, addr, serve) in ready {
+    for (ib, addr, serve) in ready {
         bound.push((ib.id.clone(), addr));
         let ctx = Arc::clone(&ctx);
         tasks.push(match serve {
-            Serve::Websocket => tokio::spawn(gateway::serve(ctx, ib.clone(), listener)),
-            Serve::Socks(creds) => {
-                tokio::spawn(client::serve_socks(ctx, ib.clone(), listener, creds))
-            }
-            Serve::Http(creds) => {
-                tokio::spawn(client::serve_http(ctx, ib.clone(), listener, creds))
+            Serve::Websocket(l) => tokio::spawn(gateway::serve(ctx, ib.clone(), l)),
+            Serve::Socks(l, creds) => tokio::spawn(client::serve_socks(ctx, ib.clone(), l, creds)),
+            Serve::Http(l, creds) => tokio::spawn(client::serve_http(ctx, ib.clone(), l, creds)),
+            Serve::Quic(endpoint) => {
+                ctx.quic_endpoints
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(endpoint.clone());
+                tokio::spawn(gateway::serve_quic(ctx, ib.clone(), endpoint))
             }
         });
     }
@@ -749,6 +837,16 @@ pub fn validate_offline(cfg: &NodeConfig) -> Result<aegis_config::CompiledConfig
         aegis_platform::host_vpn_capabilities(os),
     )
     .compile(cfg)
+}
+
+/// QUIC connection limits from the node's core settings.
+pub(crate) fn quic_limits(cfg: &NodeConfig) -> aegis_transport_quic::Limits {
+    let keepalive = u64::from(cfg.core.keepalive_interval_seconds).clamp(5, 15);
+    aegis_transport_quic::Limits {
+        keepalive: Duration::from_secs(keepalive),
+        idle_timeout: Duration::from_secs(keepalive * 4),
+        ..aegis_transport_quic::Limits::default()
+    }
 }
 
 pub(crate) fn now_unix() -> i64 {

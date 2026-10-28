@@ -25,6 +25,12 @@ pub const CRITICAL_FEATURE_BIT: u16 = 0x8000;
 /// selected it, so peers without it never see either.
 pub const FEATURE_DATAGRAM: u16 = 0x0001;
 
+/// Optional feature: UDP flows' datagrams may also travel outside the
+/// session, on the transport's own unreliable datagrams (QUIC), each as
+/// `flow id: u32` followed by the payload. Needs [`FEATURE_DATAGRAM`] and
+/// a transport that has such datagrams.
+pub const FEATURE_DATAGRAM_PATH: u16 = 0x0002;
+
 /// A negotiated feature ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Feature(pub u16);

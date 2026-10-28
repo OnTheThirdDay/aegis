@@ -28,7 +28,7 @@ mod mux;
 mod stream;
 
 pub use config::SessionConfig;
-pub use datagram::DatagramFlow;
+pub use datagram::{DatagramFlow, DatagramPath};
 pub use error::{OpenError, SessionError};
 pub use mux::{
     client_handshake, server_handshake, Incoming, IncomingOpen, PeerInfo, Session, SessionStats,

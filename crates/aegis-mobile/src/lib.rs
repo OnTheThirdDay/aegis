@@ -55,6 +55,8 @@ struct Snapshot {
     connected_since: Option<u64>,
     bytes_up: u64,
     bytes_down: u64,
+    /// What carries the tunnel: `quic` or `websocket`.
+    transport: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -316,6 +318,7 @@ pub fn status() -> Value {
         "connected_since": s.connected_since,
         "bytes_up": s.bytes_up,
         "bytes_down": s.bytes_down,
+        "transport": s.transport,
         "connections": stats.tcp_open.load(Ordering::Relaxed),
         "connections_total": stats.tcp_total.load(Ordering::Relaxed),
         "connections_failed": stats.tcp_failed.load(Ordering::Relaxed),
@@ -385,6 +388,7 @@ async fn session<D>(
         ticks = ticks.wrapping_add(1);
         let gauges = node.ctx.gauges();
         let m = node.ctx.metrics.snapshot(gauges);
+        let transport = node.ctx.tunnel_transport();
         let probe = ticks % PROBE_EVERY == 1 || gauges.sessions_active == 0;
         let verified = if probe {
             Some(aegis_join::verify_tunnel(socks).await)
@@ -394,6 +398,7 @@ async fn session<D>(
         update(&snapshot, |s| {
             s.bytes_up = m.transport_bytes_up;
             s.bytes_down = m.transport_bytes_down;
+            s.transport = transport;
             match verified {
                 Some(true) => {
                     if s.state != State::Connected {

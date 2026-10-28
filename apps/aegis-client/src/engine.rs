@@ -51,6 +51,8 @@ pub struct Snapshot {
     pub http: Option<SocketAddr>,
     pub bytes_up: u64,
     pub bytes_down: u64,
+    /// What carries the tunnel: `quic` or `websocket`.
+    pub transport: Option<&'static str>,
     pub certificate_expires_at: Option<i64>,
     pub connected_since: Option<Instant>,
     pub error: Option<String>,
@@ -74,6 +76,7 @@ impl Default for Snapshot {
             http: None,
             bytes_up: 0,
             bytes_down: 0,
+            transport: None,
             certificate_expires_at: None,
             connected_since: None,
             error: None,
@@ -641,6 +644,7 @@ impl Worker {
         let Some(node) = &self.node else { return };
         let gauges = node.ctx.gauges();
         let m = node.ctx.metrics.snapshot(gauges);
+        let transport = node.ctx.tunnel_transport();
         let live = gauges.sessions_active > 0;
         let mut verified = None;
         if probe || !live {
@@ -657,6 +661,7 @@ impl Worker {
         self.update(|s| {
             s.bytes_up = m.transport_bytes_up;
             s.bytes_down = m.transport_bytes_down;
+            s.transport = transport;
             match verified {
                 Some(Ok(())) => {
                     if s.status != Status::Connected {

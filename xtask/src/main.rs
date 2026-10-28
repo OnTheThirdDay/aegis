@@ -69,6 +69,26 @@ const RULES: &[(&str, &str, &str)] = &[
         "transports are registered by the composition root",
     ),
     (
+        "aegis-transport-quic",
+        "aegis-management",
+        "transports cannot depend on management",
+    ),
+    (
+        "aegis-transport-quic",
+        "aegis-storage",
+        "transports cannot depend on storage",
+    ),
+    (
+        "aegis-transport-quic",
+        "aegis-core",
+        "transports are registered by the composition root",
+    ),
+    (
+        "aegis-transport-quic",
+        "aegis-session",
+        "the transport carries bytes and datagrams; the node wires sessions",
+    ),
+    (
         "aegis-inbound-socks",
         "aegis-management",
         "inbounds cannot depend on management",
