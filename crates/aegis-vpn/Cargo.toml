@@ -1,0 +1,41 @@
+[package]
+name = "aegis-vpn"
+description = "Desktop system VPN (Windows: Wintun, macOS: utun): the privileged helper service, its installer, and the app's side of the control channel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+# The workspace forbids unsafe code; this crate needs it at the platform
+# boundary only (the Windows control pipe's access list, the service entry
+# point), where it is allowed per item (ADR-0015).
+[lints.rust]
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(has_wintun)"] }
+
+[lints.clippy]
+unwrap_used = "warn"
+panic = "warn"
+
+[dependencies]
+aegis-tun = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "fs"] }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+# TUN device (Wintun on Windows, utun on macOS) and the routing table.
+tun-rs = { version = "2.8.15", default-features = false, features = ["async_tokio"] }
+route_manager = "0.2.17"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tokio = { workspace = true, features = ["signal"] }
+
+[target.'cfg(windows)'.dependencies]
+# Service control manager: install, start, stop, and the service entry point.
+windows-service = "0.8.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }

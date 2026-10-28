@@ -42,6 +42,8 @@ aegis-management = { path = "crates/aegis-management" }
 aegis-provision = { path = "crates/aegis-provision" }
 aegis-join = { path = "crates/aegis-join" }
 aegis-updater = { path = "crates/aegis-updater" }
+aegis-tun = { path = "crates/aegis-tun" }
+aegis-vpn = { path = "crates/aegis-vpn" }
 
 # Third-party candidates (06 §1). Not pre-approved: see docs/DEPENDENCIES.md.
 tokio = { version = "1.54", default-features = false }

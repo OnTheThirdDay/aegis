@@ -4,15 +4,17 @@
 # Sized for the free plan of a private repository (2,000 Linux minutes a
 # month; Windows counts 2x, macOS 10x, and every job rounds up to whole
 # minutes), so:
-#   * one cached Linux job does fmt, clippy, architecture rules, tests and a
-#     Windows compile check (mingw), on code pushes to any branch but main
+#   * one cached Linux job does fmt, clippy, architecture rules, tests, a
+#     Windows compile check (mingw) and a lint of the desktop VPN helper for
+#     Windows and macOS, on code pushes to any branch but main
 #     (main only ever receives content already tested on staging; its gate
 #     runs in release.yml);
 #   * documentation-only pushes run nothing;
 #   * staging additionally runs the dependency gates (cargo-deny, cargo-audit);
 #   * fuzzing and the large property budget run weekly (and on demand);
 #   * pull requests only run branch-policy, and only into main;
-#   * macOS is built only by release.yml for releases on main.
+#   * macOS is built only by release.yml for releases on main (the helper
+#     crate is pure Rust, so it is linted for macOS here without an SDK).
 #
 # Reference implementation only: protected environments, Pi/CF lab runners
 # and signing are NOT configured here and remain BLOCKED until provisioned.
@@ -64,7 +66,7 @@ jobs:
         timeout-minutes: 15
         run: |
           bash .github/scripts/apt-install.sh gcc-mingw-w64-x86-64
-          rustup target add x86_64-pc-windows-gnu
+          rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           # Only the long-lived branches write the cache; work branches read it.
@@ -83,6 +85,10 @@ jobs:
           AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
           CFLAGS_x86_64_pc_windows_gnu: -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00
         run: cargo check --locked --workspace --target x86_64-pc-windows-gnu
+      - name: Desktop VPN helper lint (Windows, macOS)
+        run: |
+          cargo clippy --locked -p aegis-vpn --target x86_64-pc-windows-gnu -- -D warnings
+          cargo clippy --locked -p aegis-vpn --target aarch64-apple-darwin -- -D warnings
       - name: Dependency gates (staging)
         if: github.ref == 'refs/heads/staging' || github.event_name == 'workflow_dispatch'
         run: |

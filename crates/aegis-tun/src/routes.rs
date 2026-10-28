@@ -29,6 +29,12 @@ fn contains((net, len): (u32, u8), (other, other_len): (u32, u8)) -> bool {
     len <= other_len && (len == 0 || (net ^ other) >> (32 - len) == 0)
 }
 
+/// Whether the VPN captures traffic to `ip` (it isn't local).
+pub fn captured(ip: Ipv4Addr) -> bool {
+    let ip = (u32::from(ip), 32);
+    !LOCAL.iter().any(|(n, l)| contains((u32::from(*n), *l), ip))
+}
+
 /// The IPv4 routes to add: 0.0.0.0/0 minus [`LOCAL`], as CIDRs.
 pub fn ipv4() -> Vec<(Ipv4Addr, u8)> {
     let local: Vec<(u32, u8)> = LOCAL.iter().map(|(n, l)| (u32::from(*n), *l)).collect();
@@ -88,6 +94,8 @@ mod tests {
         ] {
             assert!(!covered(ip.parse().expect("ip")), "{ip}");
         }
+        assert!(captured(Ipv4Addr::new(104, 16, 1, 1)));
+        assert!(!captured(Ipv4Addr::new(192, 168, 4, 31)));
         let routes = ipv4();
         assert!(routes.len() < 64, "a compact set: {}", routes.len());
         // No overlaps.

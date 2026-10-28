@@ -42,10 +42,11 @@ pub struct Stats {
 }
 
 /// Run the packet path on `device` until `stop` turns true or the device
-/// closes. Connections in flight end with it.
+/// closes, answering DNS with `dns`. Connections in flight end with it.
 pub async fn run<D>(
     device: D,
     proxy: SocketAddr,
+    dns: FakeDns,
     stats: Arc<Stats>,
     mut stop: watch::Receiver<bool>,
 ) where
@@ -55,7 +56,7 @@ pub async fn run<D>(
     let _ = config.mtu(MTU);
     config.udp_timeout(UDP_TIMEOUT);
     let mut stack = IpStack::new(config, device);
-    let dns = Arc::new(Mutex::new(FakeDns::default()));
+    let dns = Arc::new(Mutex::new(dns));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         let stream = tokio::select! {
@@ -291,7 +292,13 @@ mod tests {
         let (device, mut net) = tokio::io::duplex(1 << 16);
         let stats = Arc::new(Stats::default());
         let (stop_tx, stop) = watch::channel(false);
-        let path = tokio::spawn(run(device, proxy, Arc::clone(&stats), stop));
+        let path = tokio::spawn(run(
+            device,
+            proxy,
+            FakeDns::default(),
+            Arc::clone(&stats),
+            stop,
+        ));
         let app = SocketAddrV4::new(Ipv4Addr::new(172, 19, 0, 1), 40000);
         let server = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 443);
         net.write_all(&udp_packet(app, server, b"quic initial"))
