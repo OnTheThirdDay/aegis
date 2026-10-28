@@ -25,6 +25,9 @@
 #   --tunnel-only      nothing public: console and device port on this machine
 #                      only, no HTTP-01 port; devices use Cloudflare Tunnel
 #   --direct           undo --tunnel-only on an upgrade
+#   --quic             also publish UDP on the device port number, for direct
+#                      QUIC (turn it on in the console under Connectivity)
+#   --no-quic          undo --quic on an upgrade
 #   --console-port N   host port of the HTTPS console        (default 8443)
 #   --port N           host port devices connect to           (default 443)
 #   --http-port N      host port for Let's Encrypt HTTP-01    (default 80; 0 = none)
@@ -56,6 +59,7 @@ HTTP_PORT=""
 ADDRESSES=""
 LOCAL_CONSOLE=""
 TUNNEL_ONLY=""
+QUIC=""
 FRESH=0
 UNINSTALL=0
 PURGE=0
@@ -76,6 +80,8 @@ while [ $# -gt 0 ]; do
     --public-console) LOCAL_CONSOLE=0; shift ;;
     --tunnel-only) TUNNEL_ONLY=1; shift ;;
     --direct) TUNNEL_ONLY=0; shift ;;
+    --quic) QUIC=1; shift ;;
+    --no-quic) QUIC=0; shift ;;
     --fresh) FRESH=1; shift ;;
     --name) NAME=${2:?}; shift 2 ;;
     --version) VERSION=${2:?}; shift 2 ;;
@@ -116,6 +122,7 @@ recall_docker() {
           if [ "$host_ip" = 127.0.0.1 ]; then TUNNEL_ONLY=1; else TUNNEL_ONLY=0; fi
         fi ;;
       8080/tcp) http_seen=1; if [ -z "$HTTP_PORT" ]; then HTTP_PORT=$host_port; fi ;;
+      8444/udp) if [ -z "$QUIC" ]; then QUIC=1; fi ;;
     esac
   done
   if [ -z "$HTTP_PORT" ] && [ "$http_seen" = 0 ]; then HTTP_PORT=0; fi
@@ -144,6 +151,20 @@ port_busy() {
   fi
 }
 
+# Whether image reference $1 ends in a release version tag (:1.2.3).
+is_release_tag() {
+  tag=${1##*:}
+  case "$1" in *:*) ;; *) return 1 ;; esac
+  case "$tag" in
+    *[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+  case "$tag" in
+    *.*.*.*) return 1 ;;
+    *.*.*) return 0 ;;
+  esac
+  return 1
+}
+
 # First free port of the candidates (the first one when none is free).
 pick_port() {
   for candidate in "$@"; do
@@ -154,6 +175,7 @@ pick_port() {
 
 if [ "$UNINSTALL" = 0 ] && [ "$FRESH" = 0 ]; then recall_docker; fi
 [ -n "$TUNNEL_ONLY" ] || TUNNEL_ONLY=0
+[ -n "$QUIC" ] || QUIC=0
 if [ "$TUNNEL_ONLY" = 1 ]; then
   # Nothing public: the console needs ssh -L, and HTTP-01 can't reach us.
   [ -n "$LOCAL_CONSOLE" ] || LOCAL_CONSOLE=1
@@ -181,6 +203,7 @@ describe_settings() {
   console_where="reachable from the network"; [ "$LOCAL_CONSOLE" = 1 ] && console_where="this machine only"
   devices_where="all addresses"; [ "$TUNNEL_ONLY" = 1 ] && devices_where="this machine only; devices use Cloudflare Tunnel"
   say "  console port $CONSOLE_PORT ($console_where); device port $EDGE_PORT ($devices_where); HTTP validation port $HTTP_PORT (0 = none)"
+  if [ "$QUIC" = 1 ]; then say "  direct QUIC: UDP port $EDGE_PORT (published)"; fi
   if [ -n "$ADDRESSES" ]; then say "  addresses $ADDRESSES"; fi
 }
 if [ "$UNINSTALL" = 0 ]; then
@@ -262,6 +285,10 @@ print_summary() { # password fingerprint addresses
     say "  port in your firewall, or set up Cloudflare Tunnel in the console (no open ports;"
     say "  install with --tunnel-only to keep this port off the network)."
   fi
+  if [ "$QUIC" = 1 ]; then
+    say "  Direct QUIC: UDP port $EDGE_PORT is published. Forward it on your router if"
+    say "  needed, then turn QUIC on in the console under Connectivity."
+  fi
   say ""
 }
 
@@ -300,8 +327,20 @@ docker_install() {
         IMAGE="ghcr.io/$LOWER_REPO:latest"
       fi
     fi
-    say "Pulling $IMAGE..."
-    docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
+    # A release tag (X.Y.Z) never changes, so one already on this machine
+    # (pulled before, or copied here from another server) is used without
+    # asking the registry. Moving tags (latest, staging) are pulled; if the
+    # registry can't be reached, a copy already here is used.
+    if is_release_tag "$IMAGE" && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+      say "Using $IMAGE (already on this machine)."
+    else
+      say "Pulling $IMAGE..."
+      if ! docker pull -q "$IMAGE" >/dev/null; then
+        docker image inspect "$IMAGE" >/dev/null 2>&1 \
+          || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
+        say "Could not reach the registry; using the copy of $IMAGE already on this machine."
+      fi
+    fi
   fi
   docker volume create "$NAME-data" >/dev/null
   docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -320,12 +359,15 @@ docker_install() {
       -p "$console_bind:$CONSOLE_PORT:8443" -p "$edge_bind:$EDGE_PORT:8444" $1 \
       "$IMAGE" >/dev/null 2>"$err"
   }
-  extra=""; [ "$HTTP_PORT" != 0 ] && extra="-p $HTTP_PORT:8080"
+  # Direct QUIC is reached on UDP even when TCP stays local (--tunnel-only):
+  # Cloudflare can't carry it.
+  quic_publish=""; [ "$QUIC" = 1 ] && quic_publish="-p 0.0.0.0:$EDGE_PORT:8444/udp"
+  extra="$quic_publish"; [ "$HTTP_PORT" != 0 ] && extra="$extra -p $HTTP_PORT:8080"
   if ! run "$extra"; then
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     if [ -n "$extra" ] && grep -qiE 'port is already allocated|address already in use' "$err"; then
       say "Port $HTTP_PORT is in use; continuing without Let's Encrypt HTTP validation (DNS validation still works)."
-      run "" || { cat "$err" >&2; rm -f "$err"; die "could not start the container"; }
+      run "$quic_publish" || { cat "$err" >&2; rm -f "$err"; die "could not start the container"; }
     else
       cat "$err" >&2; rm -f "$err"
       die "could not start the container (port $CONSOLE_PORT or $EDGE_PORT in use? try --console-port / --port)"

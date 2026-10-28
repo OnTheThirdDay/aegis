@@ -7,7 +7,7 @@ use crate::stream::MuxStream;
 use aegis_agp::{
     decode_reset, decode_window_update, encode_frame, encode_reset, encode_window_update, Decoder,
     Frame, FrameType, GoAway, Hello, Network, OpenAck, OpenRequest, ProtocolError,
-    FEATURE_DATAGRAM, FLAG_RESET_ACK, MAX_WINDOW, VERSION_MAJOR,
+    FEATURE_DATAGRAM, FEATURE_DATAGRAM_PATH, FLAG_RESET_ACK, MAX_WINDOW, VERSION_MAJOR,
 };
 use aegis_buffer::{Budget, Reservation};
 use aegis_contracts::observability::{Event, Observability, PoolClass};
@@ -301,6 +301,9 @@ pub(crate) struct Shared {
     pub obs: Arc<dyn Observability>,
     /// Both sides agreed on UDP flows (feature 0x0001).
     pub datagrams: bool,
+    /// Both sides agreed to carry flows' datagrams on the transport's own
+    /// datagrams too (feature 0x0002): the path to send them on.
+    pub datagram_path: Option<Arc<dyn crate::DatagramPath>>,
 }
 
 impl Shared {
@@ -750,6 +753,34 @@ impl Session {
         result
     }
 
+    /// A packet from the transport's datagram path (see
+    /// [`DatagramPath`](crate::DatagramPath)): queued for its flow, or
+    /// dropped when it doesn't belong to an open one or the queue is full.
+    pub fn deliver_datagram(&self, packet: Bytes) {
+        let shared = &self.shared;
+        if shared.datagram_path.is_none() || packet.len() <= crate::datagram::FLOW_ID_LEN {
+            return;
+        }
+        let id = u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]);
+        let payload = packet.slice(crate::datagram::FLOW_ID_LEN..);
+        let mut st = shared.lock();
+        if st.closed.is_some() {
+            return;
+        }
+        let _ = queue_datagram(shared, &mut st, id, payload, false);
+    }
+
+    /// Whether flows' datagrams also use the transport's datagram path.
+    pub fn datagram_path(&self) -> bool {
+        self.shared.datagram_path.is_some()
+    }
+
+    /// A signal that turns true once the session has terminated (for tasks
+    /// that must not keep the session alive).
+    pub fn closed_signal(&self) -> watch::Receiver<bool> {
+        self.shared.closed_tx.subscribe()
+    }
+
     /// Forbid new streams; existing streams drain normally.
     pub fn goaway(&self) {
         let shared = &self.shared;
@@ -1108,10 +1139,10 @@ where
     let mut dgram_res = reserve_datagrams(&budget, &cfg);
     let window = rx_res.bytes() as u32;
     let max_streams = cfg.effective_max_streams(window);
-    let offered = if dgram_res.is_some() {
-        vec![FEATURE_DATAGRAM]
-    } else {
-        Vec::new()
+    let offered = match (&dgram_res, &cfg.datagram_path) {
+        (Some(_), Some(_)) => vec![FEATURE_DATAGRAM, FEATURE_DATAGRAM_PATH],
+        (Some(_), None) => vec![FEATURE_DATAGRAM],
+        _ => Vec::new(),
     };
     let hello = local_hello(&cfg, window, max_streams, offered);
     let timeout = cfg.handshake_timeout;
@@ -1153,6 +1184,7 @@ where
     if !ack.features.contains(&FEATURE_DATAGRAM) {
         dgram_res = None;
     }
+    let path = ack.features.contains(&FEATURE_DATAGRAM_PATH);
     let (session, _) = start(
         io,
         decoder,
@@ -1164,6 +1196,7 @@ where
         obs,
         (rx_res, ctl_res, dgram_res),
         max_streams,
+        path,
     );
     Ok(session)
 }
@@ -1206,15 +1239,16 @@ where
     } else {
         None
     };
-    let supported = if dgram_res.is_some() {
-        vec![FEATURE_DATAGRAM]
-    } else {
-        Vec::new()
+    let supported = match (&dgram_res, &cfg.datagram_path) {
+        (Some(_), Some(_)) => vec![FEATURE_DATAGRAM, FEATURE_DATAGRAM_PATH],
+        (Some(_), None) => vec![FEATURE_DATAGRAM],
+        _ => Vec::new(),
     };
     let (version, features) = hello.negotiate(&supported)?;
     if !features.contains(&FEATURE_DATAGRAM) {
         dgram_res = None;
     }
+    let path = features.contains(&FEATURE_DATAGRAM_PATH);
     let window = rx_res.bytes() as u32;
     let max_streams = cfg.effective_max_streams(window);
     let mut ack = local_hello(&cfg, window, max_streams, features);
@@ -1238,6 +1272,7 @@ where
         obs,
         (rx_res, ctl_res, dgram_res),
         max_streams,
+        path,
     );
     Ok((session, incoming.expect("server role always has incoming")))
 }
@@ -1254,6 +1289,7 @@ fn start<T>(
     obs: Arc<dyn Observability>,
     (rx_res, ctl_res, dgram_res): (Reservation, Reservation, Option<Reservation>),
     local_max_streams: u32,
+    datagram_path: bool,
 ) -> (Session, Option<Incoming>)
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -1295,6 +1331,11 @@ where
         _datagram_reservation: dgram_res,
     };
     let datagrams = state._datagram_reservation.is_some();
+    let datagram_path = if datagrams && datagram_path {
+        cfg.datagram_path.clone()
+    } else {
+        None
+    };
     let (closed_tx, _) = watch::channel(false);
     let shared = Arc::new(Shared {
         state: Mutex::new(state),
@@ -1307,6 +1348,7 @@ where
         local_max_streams,
         obs,
         datagrams,
+        datagram_path,
     });
     shared.obs.record(Event::SessionOpened);
     let (rd, wr) = tokio::io::split(io);
@@ -1660,20 +1702,41 @@ fn on_datagram(
     if !shared.datagrams {
         return Err(violation("DATAGRAM not negotiated"));
     }
+    queue_datagram(shared, st, id, payload, true)
+}
+
+/// Queue a received datagram for flow `id`. In the session (`strict`) the
+/// rules are those of any frame; from the transport's datagram path, which
+/// may reorder and race the stream, anything unexpected is just dropped.
+fn queue_datagram(
+    shared: &Arc<Shared>,
+    st: &mut State,
+    id: u32,
+    payload: Bytes,
+    strict: bool,
+) -> Result<(), SessionError> {
     let buffered = st.dgram_rx_bytes;
+    let unexpected = |st: &mut State, what: &'static str| {
+        if strict {
+            Err(violation(what))
+        } else {
+            st.dgram_dropped += 1;
+            Ok(())
+        }
+    };
     let Some(e) = st.streams.get_mut(&id) else {
         if shared.previously_valid(st, id) {
             return Ok(()); // in flight when the flow closed
         }
-        return Err(violation("DATAGRAM for never-opened stream"));
+        return unexpected(st, "DATAGRAM for never-opened stream");
     };
     if e.kind != StreamKind::Datagrams {
-        return Err(violation("DATAGRAM on a byte stream"));
+        return unexpected(st, "DATAGRAM on a byte stream");
     }
     match e.state {
         StreamState::Established => {}
         StreamState::Reset => return Ok(()),
-        _ => return Err(violation("DATAGRAM before the flow opened")),
+        _ => return unexpected(st, "DATAGRAM before the flow opened"),
     }
     if e.datagrams.len() >= shared.cfg.datagram_queue
         || buffered + payload.len() > shared.cfg.datagram_recv_buffer as usize

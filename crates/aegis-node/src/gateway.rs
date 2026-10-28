@@ -397,6 +397,25 @@ async fn handle_connection(
         seconds: started.elapsed().as_secs_f64(),
         result: OperationResult::Ok,
     });
+    let inbound_id: Arc<str> = Arc::from(inbound.id.as_str());
+    run_session(ctx, inbound_id, peer, tls_stream, None, permit).await;
+}
+
+/// An authenticated peer's AGP session, whatever carried it: negotiate,
+/// register for revocation, then admit each OPEN until the session ends.
+/// `quic` is the QUIC connection when the session runs over one: its
+/// datagrams then carry UDP flows too. The pending-handshake `permit` is
+/// released once the session is up.
+async fn run_session<T>(
+    ctx: Arc<NodeContext>,
+    inbound_id: Arc<str>,
+    peer: PeerIdentity,
+    io: T,
+    quic: Option<aegis_transport_quic::Connection>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     // Reserve atomically before AGP negotiation. A count followed by an
     // await and later insertion allows concurrent handshakes past the cap.
     let Ok(_session_slot) = Arc::clone(&ctx.session_slots).try_acquire_owned() else {
@@ -407,14 +426,11 @@ async fn handle_connection(
     };
     let budget = ctx.budget.child(ctx.startup.core.peer_buffer_budget_bytes);
     let obs: Arc<dyn aegis_contracts::Observability> = ctx.metrics.clone();
-    let (session, mut incoming) = match server_handshake(
-        tls_stream,
-        ctx.session_config(),
-        budget,
-        obs,
-        &peer.node_id,
-    )
-    .await
+    let mut cfg = ctx.session_config();
+    cfg.datagram_path = quic
+        .clone()
+        .map(|c| Arc::new(crate::quic::Path(c)) as Arc<dyn aegis_session::DatagramPath>);
+    let (session, mut incoming) = match server_handshake(io, cfg, budget, obs, &peer.node_id).await
     {
         Ok(v) => v,
         Err(e) => {
@@ -436,10 +452,12 @@ async fn handle_connection(
     };
     let session = Arc::new(session);
     let reg_id = ctx.sessions.insert(peer.fingerprint, Arc::clone(&session));
-    // The pending quota covers the entire WS + mTLS + AGP handshake.
+    // The pending quota covers the entire transport + mTLS + AGP handshake.
     drop(permit);
+    if let Some(conn) = &quic {
+        crate::quic::spawn_datagram_reader(&ctx, conn.clone(), &session);
+    }
     let peer = Arc::new(peer);
-    let inbound_id: Arc<str> = Arc::from(inbound.id.as_str());
     loop {
         tokio::select! {
             next = incoming.next() => match next {
@@ -456,6 +474,92 @@ async fn handle_connection(
         }
     }
     ctx.sessions.remove(reg_id);
+    if let Some(conn) = quic {
+        conn.close(0u32.into(), b"session closed");
+    }
+}
+
+/// The gateway's QUIC listener: each connection is a device that completed
+/// the mutual TLS handshake (same certificates and checks as the inner TLS
+/// of the WebSocket path), then opens one stream for its AGP session.
+pub async fn serve_quic(
+    ctx: Arc<NodeContext>,
+    inbound: InboundConfig,
+    endpoint: aegis_transport_quic::Endpoint,
+) {
+    let pending = Arc::new(Semaphore::new(inbound.max_pending_handshakes as usize));
+    let inbound_id: Arc<str> = Arc::from(inbound.id.as_str());
+    let mut shutdown = ctx.shutdown_signal();
+    loop {
+        let incoming = tokio::select! {
+            i = endpoint.accept() => match i {
+                Some(i) => i,
+                None => return,
+            },
+            _ = shutdown.wait_for(|s| *s) => {
+                endpoint.close(0u32.into(), b"shutdown");
+                return;
+            }
+        };
+        let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
+            ctx.obs().record(Event::ResourceThrottle {
+                reason: ReasonGroup::Quota,
+            });
+            incoming.refuse();
+            continue;
+        };
+        ctx.diagnostics.count("gateway.quic.accepted");
+        let task_ctx = Arc::clone(&ctx);
+        let inbound_id = Arc::clone(&inbound_id);
+        Arc::clone(&ctx).spawn_connection(async move {
+            handle_quic(task_ctx, inbound_id, incoming, permit).await;
+        });
+    }
+}
+
+async fn handle_quic(
+    ctx: Arc<NodeContext>,
+    inbound_id: Arc<str>,
+    incoming: aegis_transport_quic::Incoming,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let started = Instant::now();
+    let timeout = Duration::from_millis(u64::from(ctx.startup.core.tls_handshake_timeout_ms));
+    let conn = match tokio::time::timeout(timeout, incoming).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            if ctx.diagnostics.is_recording() {
+                ctx.diagnostics.note(
+                    Severity::Warn,
+                    "gateway.quic.rejected",
+                    &[("error", &e.to_string())],
+                );
+            }
+            ctx.obs().record(Event::AuthFailure {
+                reason: ReasonGroup::Tls,
+            });
+            return;
+        }
+        Err(_) => return,
+    };
+    // The handshake's verifier already required a valid, unrevoked device
+    // certificate; this reads the identity it proved.
+    let peer = aegis_transport_quic::peer_certificate(&conn)
+        .and_then(|c| PeerIdentity::from_der(c.as_ref()).ok())
+        .filter(|p| p.role == Some(aegis_contracts::Role::Client));
+    let Some(peer) = peer else {
+        conn.close(1u32.into(), b"identity");
+        return;
+    };
+    ctx.obs().record(Event::HandshakeDuration {
+        seconds: started.elapsed().as_secs_f64(),
+        result: OperationResult::Ok,
+    });
+    let Ok(stream) = aegis_transport_quic::accept_stream(&conn, timeout).await else {
+        conn.close(1u32.into(), b"no session");
+        return;
+    };
+    run_session(ctx, inbound_id, peer, stream, Some(conn), permit).await;
 }
 
 /// One logical stream. The session's earlier admissions grant nothing:

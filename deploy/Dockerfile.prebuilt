@@ -11,8 +11,8 @@
 #
 # Runtime contract: unprivileged uid 10001, read-only root filesystem, no
 # capabilities, one volume for all state. The console (8443) is HTTPS-only;
-# devices connect to the edge (8444); 8080 answers ACME HTTP-01 challenges
-# only while a certificate is being issued.
+# devices connect to the edge (8444, and 8444/udp for direct QUIC); 8080
+# answers ACME HTTP-01 challenges only while a certificate is being issued.
 #
 # Pin the base image to a reviewed digest before release use.
 FROM debian:bookworm-slim
@@ -39,7 +39,7 @@ COPY install.sh /usr/share/aegisnet/install.sh
 ENV AEGIS_DATA_DIR=/var/lib/aegisnet
 USER 10001:10001
 VOLUME ["/var/lib/aegisnet"]
-EXPOSE 8443 8444 8080
+EXPOSE 8443 8444 8444/udp 8080
 # Health uses the owner-only local IPC socket; there is deliberately no
 # unauthenticated HTTP health endpoint.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

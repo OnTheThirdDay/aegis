@@ -1573,3 +1573,103 @@ async fn a_failed_start_leaves_no_listener_behind() {
     );
     drop(taken);
 }
+
+/// A gateway with a QUIC listener next to its WebSocket one, and a client
+/// told about it (or about `quic_override`, e.g. a port nobody answers).
+async fn setup_quic(quic_override: Option<String>) -> Option<Env> {
+    let Some(ip) = lan_ip() else {
+        eprintln!("BLOCKED: no non-loopback interface for an egress-permitted echo target");
+        return None;
+    };
+    let echo = echo_server(ip).await;
+    let dir = tempfile::tempdir().expect("tmp");
+    let secrets = dir.path().join("secrets");
+    let pki = provision(&secrets);
+    let gw_toml = format!(
+        "{}\n[[inbounds]]\nid = \"ingress-quic\"\nkind = \"quic\"\nbind = \"127.0.0.1:0\"\n",
+        gateway_toml(dir.path(), &format!("{ip}/32"))
+    );
+    let gw = start(StartOptions {
+        config: parse_toml(&gw_toml).expect("gw cfg"),
+        store_path: dir.path().join("gw.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("gateway start");
+    let quic = quic_override.unwrap_or_else(|| {
+        gw.bound_addr("ingress-quic")
+            .expect("quic addr")
+            .to_string()
+    });
+    let client_toml = client_toml(
+        dir.path(),
+        &secrets,
+        gw.bound_addr("ingress-ws").expect("ws addr"),
+    )
+    .replace(
+        "server_name = \"gateway.aegis.internal\"",
+        &format!("server_name = \"gateway.aegis.internal\"\nquic = \"{quic}\""),
+    );
+    let client = start(StartOptions {
+        config: parse_toml(&client_toml).expect("client cfg"),
+        store_path: dir.path().join("client.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("client start");
+    Some(Env {
+        _dir: dir,
+        gw,
+        client,
+        echo,
+        pki,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_and_udp_run_over_direct_quic() {
+    let Some(env) = setup_quic(None).await else {
+        return;
+    };
+    let proxy = env.client.bound_addr("socks").expect("socks");
+    let (s, reply) = socks_connect(proxy, &env.echo.to_string(), None).await;
+    assert_eq!(reply, 0);
+    echo_roundtrip(s, 256 * 1024).await;
+    assert_eq!(env.client.ctx.tunnel_transport(), Some("quic"));
+    let udp_echo = udp_echo_server(env.echo.ip()).await;
+    let (_control, relay) = socks_udp_associate(proxy).await;
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let dest = aegis_contracts::Destination::parse_authority(&udp_echo.to_string()).expect("dest");
+    // Small datagrams ride QUIC datagrams; large ones the session stream.
+    for size in [1usize, 500, 1100, 8000] {
+        let data: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
+        let back = udp_exchange(&socket, relay, &dest, &data)
+            .await
+            .expect("echoed over QUIC");
+        assert_eq!(back, data, "{size}-byte datagram");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_quic_port_falls_back_to_websocket() {
+    // A UDP port nobody serves QUIC on.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = silent.local_addr().expect("addr").to_string();
+    let Some(env) = setup_quic(Some(addr)).await else {
+        return;
+    };
+    let proxy = env.client.bound_addr("socks").expect("socks");
+    let started = std::time::Instant::now();
+    let (s, reply) = socks_connect(proxy, &env.echo.to_string(), None).await;
+    assert_eq!(reply, 0);
+    echo_roundtrip(s, 4096).await;
+    assert_eq!(env.client.ctx.tunnel_transport(), Some("websocket"));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "fallback took {:?}",
+        started.elapsed()
+    );
+    drop(silent);
+}

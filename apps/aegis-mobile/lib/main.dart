@@ -495,7 +495,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     ListTile(
                       leading: const Icon(Icons.swap_vert),
                       title: const Text('Traffic'),
-                      subtitle: Text('↑ ${_bytes(s.bytesUp)}   ↓ ${_bytes(s.bytesDown)}'),
+                      subtitle: Text('↑ ${_bytes(s.bytesUp)}   ↓ ${_bytes(s.bytesDown)}'
+                          '${s.transport == null ? '' : s.transport == 'quic' ? '   ·   via QUIC (UDP)' : '   ·   via WebSocket'}'),
                     ),
                     ListTile(
                       leading: const Icon(Icons.lan_outlined),

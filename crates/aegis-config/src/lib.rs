@@ -15,7 +15,7 @@ pub mod secret;
 mod types;
 
 pub use canonical::{canonical_json, digest_value};
-pub use compile::{compile, CompiledConfig, Environment, ModuleIds};
+pub use compile::{compile, quic_address, CompiledConfig, Environment, ModuleIds};
 pub use diff::{security_diff, Diff};
 pub use types::*;
 

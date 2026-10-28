@@ -20,6 +20,18 @@ use std::io;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// Datagrams outside the ordered transport: QUIC's unreliable datagrams.
+/// A packet is the flow's stream ID (u32, big endian) and the payload.
+pub trait DatagramPath: Send + Sync + std::fmt::Debug {
+    /// Largest packet the path can send now, if it can send any.
+    fn max_packet(&self) -> Option<usize>;
+    /// Send one packet; `false` when it wasn't sent.
+    fn send(&self, packet: Bytes) -> bool;
+}
+
+/// Bytes of the flow ID ahead of each payload on a [`DatagramPath`].
+pub(crate) const FLOW_ID_LEN: usize = 4;
+
 pub struct DatagramFlow {
     shared: Arc<Shared>,
     id: u32,
@@ -75,9 +87,26 @@ impl DatagramFlow {
                 "datagram larger than the tunnel carries",
             ));
         }
-        if datagram.is_empty()
-            || st.dgram_tx_bytes + datagram.len() > shared.cfg.datagram_send_buffer as usize
-        {
+        if datagram.is_empty() {
+            st.dgram_dropped += 1;
+            return Ok(false);
+        }
+        // The transport's own datagrams when it has them and this one fits:
+        // real UDP all the way, never queued behind the session's stream.
+        if let Some(path) = &shared.datagram_path {
+            if path
+                .max_packet()
+                .is_some_and(|max| datagram.len() + FLOW_ID_LEN <= max)
+            {
+                let mut packet = Vec::with_capacity(FLOW_ID_LEN + datagram.len());
+                packet.extend_from_slice(&self.id.to_be_bytes());
+                packet.extend_from_slice(datagram);
+                if path.send(Bytes::from(packet)) {
+                    return Ok(true);
+                }
+            }
+        }
+        if st.dgram_tx_bytes + datagram.len() > shared.cfg.datagram_send_buffer as usize {
             st.dgram_dropped += 1;
             return Ok(false);
         }

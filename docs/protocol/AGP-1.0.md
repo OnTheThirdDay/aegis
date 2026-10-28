@@ -36,7 +36,8 @@ Node ID is 1..64 ASCII `[A-Za-z0-9._-]`, exactly the authenticated certificate
 identity. Windows are 0..2147483647. Frame cap is 8192..65536. Features are <=64
 strictly ascending unique u16s. Bit 0x8000 marks a critical feature: unknown
 critical features reject negotiation; unknown optional offers are ignored.
-One feature is defined: 0x0001 (optional), UDP flows; see below. ACK cannot
+Two features are defined: 0x0001 (optional), UDP flows, and 0x0002
+(optional), their datagrams on the transport's own datagrams; see below. ACK cannot
 invent a feature or a version; new versions cannot reinterpret this layout.
 No OPEN/DATA before HELLO/ACK.
 
@@ -110,3 +111,20 @@ accepts datagrams from, any other address on that flow.
 * UDP over the ordered transport keeps head-of-line effects between flows
   of one session; flows are for applications that tolerate that (QUIC,
   voice, games, DNS), not a lossless tunnel.
+
+## Datagrams outside the session (feature 0x0002)
+
+Over a transport with its own unreliable datagrams (QUIC, ADR-0013), a
+client offers 0x0002 together with 0x0001; the gateway selects it only when
+it selects 0x0001 and has such datagrams too. Then either side may send a
+UDP flow's datagram as a transport datagram instead of a DATAGRAM frame:
+`flow id: u32` (big endian, the flow's stream ID) followed by 1 or more
+payload bytes. A datagram that doesn't fit the transport's current limit
+goes in the session as a DATAGRAM frame; both paths deliver to the same
+flow queue under the same limits.
+
+Transport datagrams may arrive before the OPEN_ACK on the session stream,
+after a RESET, or reordered: one that doesn't belong to an established UDP
+flow is dropped and counted, never a protocol error. The session itself
+(AGP over QUIC) runs on the one bidirectional stream the client opens; the
+QUIC handshake is the mutual TLS handshake, with ALPN `agp-quic/1`.

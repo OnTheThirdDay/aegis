@@ -456,6 +456,14 @@ bind = "{edge_host}:{edge_port}"
 path = "/agp"
 outer_tls = {{ bundle = "secret://edge-tls.json", server_name = "{EDGE_SERVER_NAME}", trusted_ca = "secret://web-ca.pem" }}
 
+# Direct QUIC (UDP), on the device port number. Unreachable unless the
+# installer publishes the UDP port (--quic); devices use it only when an
+# administrator turns QUIC on.
+[[inbounds]]
+id = "quic"
+kind = "quic"
+bind = "0.0.0.0:{edge_port}"
+
 [[inbounds]]
 id = "tunnel-origin"
 kind = "websocket"

@@ -483,6 +483,14 @@ where
         .map_err(|_| HandshakeError::Timeout)?
         .map_err(HandshakeError::Tls)?;
     let peer = PeerIdentity::from_connection(tls.get_ref().1).map_err(HandshakeError::Identity)?;
+    check_gateway(&peer)?;
+    Ok((tls, peer))
+}
+
+/// The client's policy for a gateway identity the chain validated: the
+/// gateway role, a bounded validity span, and SAN identity after the
+/// legacy cutoff. Every client transport applies it after its handshake.
+pub fn check_gateway(peer: &PeerIdentity) -> Result<(), HandshakeError> {
     if peer.role != Some(Role::Gateway) {
         return Err(HandshakeError::WrongRole);
     }
@@ -493,7 +501,7 @@ where
             "gateway identity policy rejected".into(),
         )));
     }
-    Ok((tls, peer))
+    Ok(())
 }
 
 /// For diagnostics: the OU string a role is encoded with.
