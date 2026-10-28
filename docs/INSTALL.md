@@ -202,6 +202,10 @@ On a computer, apps that support SOCKS5 UDP (for example some games and messenge
 
 ## 6. Upgrade
 
+**From the console** (after one upgrade with an installer that has it): the Overview page shows the running version and newer releases, with **Upgrade** and an optional **Upgrade automatically**. A small second container, `aegis-updater`, does the work: it recreates the gateway with the new image and the same settings, and brings the previous version back if the new one doesn't start. It also updates itself. Choose where releases come from with `--updates registry` (default: ghcr.io), `--updates local` (only images copied to this server, for example by another server), or `--updates off` (no updater). See [ADR-0014](adr/0014-console-upgrades.md).
+
+**With the installer**, as before:
+
 Get the installer from the newest image (`--pull always` makes Docker fetch the newest one) and run it:
 
 ```sh

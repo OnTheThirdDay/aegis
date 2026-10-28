@@ -177,6 +177,7 @@ dependencies = [
  "aegis-storage",
  "aegis-telemetry",
  "aegis-traffic-policy",
+ "aegis-updater",
  "argon2",
  "axum",
  "base64 0.22.1",
@@ -348,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-transport-quic"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aegis-contracts",
  "aegis-identity",
@@ -376,6 +377,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-updater"
+version = "0.7.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "aegisctl"
 version = "0.7.0"
 dependencies = [
@@ -390,6 +399,7 @@ dependencies = [
  "aegis-provision",
  "aegis-storage",
  "aegis-telemetry",
+ "aegis-updater",
  "rand 0.8.8",
  "serde_json",
  "tempfile",
@@ -412,6 +422,7 @@ dependencies = [
  "aegis-provision",
  "aegis-storage",
  "aegis-telemetry",
+ "aegis-updater",
  "bytes",
  "hex",
  "http",

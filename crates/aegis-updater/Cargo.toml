@@ -1,0 +1,16 @@
+[package]
+name = "aegis-updater"
+description = "Upgrades the gateway container from the console: a separate container with the Docker socket, driven through files in the data volume."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

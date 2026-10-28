@@ -38,6 +38,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "si
 serde_json = { workspace = true }
 
 [dev-dependencies]
+aegis-updater = { workspace = true }
 aegis-join = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 tempfile = "3"
