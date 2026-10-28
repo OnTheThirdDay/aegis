@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aegis-agp"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "bytes",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-buffer"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "proptest",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-client"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-config",
  "aegis-join",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-config"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "aegis-platform",
@@ -71,14 +71,14 @@ dependencies = [
 
 [[package]]
 name = "aegis-contracts"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegis-core"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-config",
  "aegis-contracts",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-dns"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "hickory-resolver",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-identity"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "hex",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-inbound-http"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "base64 0.22.1",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-inbound-socks"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "proptest",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-join"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-config",
  "aegis-contracts",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-management"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-config",
  "aegis-contracts",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-mobile"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-join",
  "aegis-node",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-node"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-agp",
  "aegis-buffer",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-outbound-direct"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "aegis-dns",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-platform"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "aegis-traffic-policy",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-policy"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "ipnet",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-provision"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-config",
  "aegis-contracts",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-session"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-agp",
  "aegis-buffer",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-storage"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "hex",
  "rusqlite",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-telemetry"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "flate2",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-traffic-policy"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "aegis-policy",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-transport-quic"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "aegis-identity",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-transport-ws"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-contracts",
  "bytes",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-tun"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "ipstack",
  "tokio",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-updater"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-vpn"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-tun",
  "route_manager",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "aegisctl"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-config",
  "aegis-contracts",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "aegisd"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "aegis-config",
  "aegis-contracts",
@@ -5491,7 +5491,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.8.0"
+version = "1.0.0"
 dependencies = [
  "serde_json",
 ]
