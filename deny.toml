@@ -44,7 +44,9 @@ deny = [
     # No dynamic plugin loading (02 §3 T0/T1 only). The GUI client's windowing
     # stack loads *system* graphics/display libraries (OpenGL, X11, Wayland)
     # through these wrappers only; aegisd and aegisctl do not link it.
-    { name = "libloading", wrappers = ["dlib", "glutin", "x11rb"] },
+    # tun-rs (desktop system VPN, ADR-0015) loads Wintun's wintun.dll, by
+    # absolute path, from the helper's administrator-only install folder.
+    { name = "libloading", wrappers = ["dlib", "glutin", "x11rb", "tun-rs"] },
     # OTLP is hand-encoded; the OTel SDK requires its own review (05 §1).
     { name = "opentelemetry" },
 ]

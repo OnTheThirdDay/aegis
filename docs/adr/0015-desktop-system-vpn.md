@@ -1,0 +1,35 @@
+# ADR-0015 — Desktop system VPN (Windows, macOS)
+
+Status: accepted (owner direction, 2026-10-28).
+
+## Context
+
+On a computer only apps that use the local proxy go through the gateway: the SOCKS5 and HTTP proxies, or the Windows system proxy for the apps that honour it. Command-line tools, many chat, voice and game clients, and every app's UDP and DNS bypass it. The Android app already captures everything with `VpnService` and a userspace TCP/IP stack (ADR-0011).
+
+Capturing traffic on a desktop needs administrator rights; the portable client deliberately doesn't. The owner chose the free routes over the paid Apple Developer Program: on macOS a root helper using `utun` (as Clash Verge, sing-box and OpenVPN clients do) rather than a NetworkExtension, which needs a Developer ID with the NetworkExtension entitlement; the app ships as an ad-hoc signed DMG.
+
+## Decision
+
+- **One packet path for phone and desktop.** The Android packet path moves, unchanged, into `aegis-tun`: a userspace TCP/IP stack (ipstack) that opens every TCP connection and UDP flow through the client node's local SOCKS proxy, fake-IP DNS (names are resolved by the gateway, `remote_required`), and the captured routes (everything but local networks). The Android app uses it as before.
+- **A privileged helper, installed once.** `aegis-vpn` is a Windows service (LocalSystem, Wintun) or a macOS launch daemon (root, utun). The app installs it from Settings with one administrator prompt (UAC via `Start-Process -Verb RunAs`, or `osascript … with administrator privileges`); the elevated process is the app's own executable with `--vpn-install`, which copies itself to an administrator-only location (`%ProgramFiles%\AegisNet\aegisnet-vpn.exe`, `/Library/PrivilegedHelperTools/net.aegisnet.vpn`) and registers it there, never from the user-writable folder the app runs from. **Remove VPN helper** undoes it.
+- **Only the installing user controls it.** Windows: a named pipe whose access list allows LocalSystem, Administrators and the installing user's SID, no remote clients, created first by the service. macOS: a Unix socket in `/var/run` whose peers are checked (`getpeereid`) against root and the installing user's uid. The protocol is one JSON object per line; requests can start the VPN into `127.0.0.1:<port>` with up to 8 server host names, report counters, or stop it. Nothing names a file, a program or a non-loopback address.
+- **The VPN lives as long as the app's connection.** Disconnect, quit or crash closes the control connection and the helper takes the VPN down.
+- **Starting it:**
+  1. the server's host names (tunnel, enrollment and QUIC addresses) are resolved while the system resolver is untouched; their public addresses get host routes through the current uplink, and the fake DNS answers those names with the real addresses (the client node itself resolves through the system resolver, which now ends at the VPN);
+  2. the interface is created (172.19.0.1/30, fdfe:dcba:9876::1/126, MTU 1500) with the captured routes, which disappear with it;
+  3. the system resolver points at the VPN: on Windows the adapter's own DNS server with interface metric 1; on macOS every network service's DNS servers, saved and restored with `networksetup`;
+  4. the packet path runs into the client node's SOCKS proxy.
+- **DNS leak protection (Windows).** Windows may send a lookup to every adapter's DNS server at once, so the router or ISP would see the names and a poisoned answer could win. While the VPN runs, Windows Filtering Platform filters at `ALE_AUTH_CONNECT` (IPv4 and IPv6) block port 53 (UDP and TCP) except through the VPN adapter and to loopback, in a sublayer of their own. They live in a dynamic WFP session tied to the VPN interface's device: Windows removes them when it closes, including when the helper crashes, so DNS can never be left blocked. macOS needs nothing similar: every network service's resolver is the VPN's.
+- **Crash safety.** Every change that outlives the interface (host routes, saved DNS servers) is written to a journal in the helper's administrator-only folder first; a restarted helper (both are restarted by the OS) undoes what the journal lists. The host routes follow the uplink when the network changes (checked every 3 s).
+- **Wintun** (wintun.net 0.14.1, SHA-256 pinned in the release workflow) is embedded unmodified in the Windows client and written with its licence next to the helper; its licence allows distribution with software that uses it through its API. Builds without it say so when installing.
+- **macOS packaging:** one universal `AegisNet.app` (ad-hoc signed) in `aegis-client-macos.dmg`. Inside an app bundle the client keeps its data in Application Support, not next to the executable.
+- The proxies and the Windows system proxy are unchanged; the system VPN is a separate setting, off by default.
+
+## Consequences
+
+- Every app's TCP, UDP and DNS go through the gateway while connected, local networks stay direct. Names resolve at the gateway; apps see 198.18.0.0/15 addresses, as on Android.
+- First use asks for administrator rights once (again to update or remove the helper). Gatekeeper asks once for the unsigned macOS app.
+- Not covered: per-app rules and a kill switch (the `system_vpn` profile section of the spec, still reported `unsupported`); IPv6-only servers (host routes are IPv4); local host names (`router.lan`) resolve through the gateway and fail.
+- DNS over HTTPS configured in a browser or in Windows goes to a public address, which the VPN captures: it is carried through the gateway, not leaked.
+- `libloading` is allowed as a dependency of `tun-rs` (deny.toml): it loads wintun.dll by absolute path from the helper's folder.
+- Tests: the helper core against a fake system (start order, journal, rollback after a failed start, recovery after a crash, routes following the uplink, refused requests), the control protocol, fake DNS pins, the app's bypass list. Clippy for Windows and macOS runs in CI. **Not yet exercised on a real Windows or macOS machine.**

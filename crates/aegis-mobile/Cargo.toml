@@ -22,10 +22,9 @@ panic = "warn"
 [dependencies]
 aegis-join = { workspace = true }
 aegis-node = { workspace = true }
+aegis-tun = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
-# Userspace TCP/IP stack over the VPN interface's packets.
-ipstack = "1.0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -264,10 +264,16 @@ fn violations(graph: &Graph) -> Vec<String> {
 
 /// Crates that must cross a platform boundary (ADR-0011): `deny` instead of
 /// `forbid`, so every unsafe item is allowed explicitly where it is.
-const UNSAFE_BOUNDARY: &[(&str, &str)] = &[(
-    "crates/aegis-mobile",
-    "JNI exports (#[no_mangle]) and the VPN interface's file descriptor",
-)];
+const UNSAFE_BOUNDARY: &[(&str, &str)] = &[
+    (
+        "crates/aegis-mobile",
+        "JNI exports (#[no_mangle]) and the VPN interface's file descriptor",
+    ),
+    (
+        "crates/aegis-vpn",
+        "the Windows control pipe's access list, the service entry point and the WFP DNS filters",
+    ),
+];
 
 fn unsafe_policy() -> Vec<String> {
     let mut out = Vec::new();

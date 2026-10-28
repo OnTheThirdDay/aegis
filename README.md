@@ -5,7 +5,7 @@ AegisNet is a security-first modular proxy engine written in Rust. It implements
 > **Status: prototype.** This build is not production-qualified.
 >
 > - Development tests pass; release gates have not run: Pi 4B hardware, real Cloudflare paths, soak, signed artifacts and independent review are all outstanding.
-> - System-VPN (M3/M4) native enforcement is **not implemented**. It is reported as `unsupported`.
+> - The spec's managed System-VPN modes (M3/M4: per-app rules, kill switch) are **not implemented** and are reported as `unsupported`. The desktop client has a plain system VPN for every app ([ADR-0015](docs/adr/0015-desktop-system-vpn.md)), not yet exercised on real machines.
 >
 > See [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) for the per-test-ID matrix.
 
@@ -46,7 +46,8 @@ The Integrations page lists the built-in integrations.
 
 - a local SOCKS5 proxy on `127.0.0.1:1080`;
 - an HTTP proxy on `127.0.0.1:8080`, which handles HTTPS and plain HTTP;
-- optionally, the Windows system proxy set while connected.
+- optionally, the Windows system proxy set while connected;
+- optionally (Windows, macOS), a **system VPN**: every app's TCP, UDP and DNS go through the gateway. It needs a small helper installed once from Settings, which asks for administrator rights ([ADR-0015](docs/adr/0015-desktop-system-vpn.md)).
 
 `aegisctl join/connect` is the same client for headless machines.
 

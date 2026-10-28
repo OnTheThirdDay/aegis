@@ -49,7 +49,7 @@ Status legend:
 | D-003 gateway egress | PASS (dev) | `aegis-policy::address`, `aegis-outbound-direct`. Per-user/network rate quotas are not implemented. |
 | D-004 DNS | PASS (dev) for M1 | `aegis-dns`: explicit resolvers, no fallback, IPv6 policy. Split DNS (M3/M4) is NOT IMPL. |
 | D-005 route engine | PASS (dev) | `aegis-policy::router`. |
-| D-006 – D-010 System-VPN native | NOT IMPL / BLOCKED | See the TC-V rows. Policy compilation (part of D-009) is implemented. |
+| D-006 – D-010 System-VPN native | NOT IMPL / BLOCKED | See the TC-V rows. Policy compilation (part of D-009) is implemented. A plain desktop system VPN (global mode, no per-app rules or kill switch) exists outside the managed profile section: [ADR-0015](adr/0015-desktop-system-vpn.md), dev tests only, not run on real machines. |
 | E-001 SQLite store | PASS (dev) | `aegis-storage`. Encrypted backups are NOT IMPL. |
 | E-002 auth/bootstrap | PASS (dev) | `aegis-management::auth`. MFA/passkeys (P1) are NOT IMPL. |
 | E-003 REST API | PARTIAL | All OpenAPI paths are implemented. There is no generated client and no automated OpenAPI schema-fixture validation. |
