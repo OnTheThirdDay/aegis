@@ -141,6 +141,20 @@ port_busy() {
   fi
 }
 
+# Whether image reference $1 ends in a release version tag (:1.2.3).
+is_release_tag() {
+  tag=${1##*:}
+  case "$1" in *:*) ;; *) return 1 ;; esac
+  case "$tag" in
+    *[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+  case "$tag" in
+    *.*.*.*) return 1 ;;
+    *.*.*) return 0 ;;
+  esac
+  return 1
+}
+
 # First free port of the candidates (the first one when none is free).
 pick_port() {
   for candidate in "$@"; do
@@ -297,8 +311,19 @@ docker_install() {
         IMAGE="ghcr.io/$LOWER_REPO:latest"
       fi
     fi
-    say "Pulling $IMAGE…"
-    docker pull -q "$IMAGE" >/dev/null || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
+    # A release tag (X.Y.Z) never changes, so one already on this machine
+    # (pulled before, or copied here from another server) is used without
+    # asking the registry. Moving tags (latest, staging) are pulled; if the
+    # registry can't be reached, a copy already here is used.
+    if is_release_tag "$IMAGE" && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+      say "Using $IMAGE (already on this machine)."
+    else
+      say "Pulling $IMAGE…"
+      if ! docker pull -q "$IMAGE" >/dev/null; then
+        docker image inspect "$IMAGE" >/dev/null 2>&1           || die "could not pull $IMAGE (no internet, a wrong --version, or a private image: docker login ghcr.io)"
+        say "Could not reach the registry; using the copy of $IMAGE already on this machine."
+      fi
+    fi
   fi
   docker volume create "$NAME-data" >/dev/null
   docker rm -f "$NAME" >/dev/null 2>&1 || true
