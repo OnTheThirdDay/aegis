@@ -160,6 +160,15 @@ jobs:
         run: |
           bash .github/scripts/apt-install.sh gcc-mingw-w64-x86-64
           rustup target add x86_64-pc-windows-gnu
+      - name: Wintun
+        # The system VPN's driver (wintun.net, unmodified), embedded in the
+        # Windows client, which installs it next to its helper.
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/wintun.zip" https://www.wintun.net/builds/wintun-0.14.1.zip
+          echo "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51  $RUNNER_TEMP/wintun.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/wintun.zip" -d "$RUNNER_TEMP"
+          echo "AEGIS_WINTUN_DIR=$RUNNER_TEMP/wintun" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           key: clients
@@ -194,13 +203,18 @@ jobs:
           persist-credentials: false
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           cargo build --locked --release --target aarch64-apple-darwin -p aegis-client
           cargo build --locked --release --target x86_64-apple-darwin -p aegis-client
           mkdir -p out
-          cp target/aarch64-apple-darwin/release/aegis-client out/aegis-client-macos-arm64
-          cp target/x86_64-apple-darwin/release/aegis-client out/aegis-client-macos-x86_64
+          # One universal AegisNet.app in a disk image.
+          bash .github/scripts/macos-dmg.sh "$VERSION" \
+            target/aarch64-apple-darwin/release/aegis-client \
+            target/x86_64-apple-darwin/release/aegis-client \
+            out/aegis-client-macos.dmg
       - uses: actions/upload-artifact@v7
         with:
           name: client-macos

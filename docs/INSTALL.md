@@ -173,12 +173,22 @@ An administrator signed in this way gets the whole console, except exporting the
 ## 5. Connect a device
 
 1. Download the client app from the console or the user portal (**Devices → Client apps**). It is portable: no installation and no admin rights needed.
-   - macOS builds are unsigned: the first time, right-click → Open, or run `xattr -d com.apple.quarantine aegis-client-macos-*`.
+   - macOS: open the `.dmg` and drag **AegisNet** to Applications. The app isn't signed with an Apple Developer ID, so the first time macOS refuses to open it: open **System Settings → Privacy & Security** and press **Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/AegisNet.app`).
 2. Open it, press **Paste** (or drop the `.aegis` file on the window), then **Join and connect**.
 3. Point apps at the local proxy:
    - **SOCKS5:** `127.0.0.1:1080`. In Firefox, also tick "Proxy DNS when using SOCKS v5".
    - **HTTP:** `127.0.0.1:8080`.
    - **Windows:** Settings → *Set as the Windows system proxy* does this for most apps.
+   - **Every app (Windows, macOS):** see *System VPN* below.
+
+**System VPN on a computer** (Windows 10/11, macOS 11 or later): every app's TCP, UDP and DNS go through your server, like on a phone; local networks stay direct.
+1. **Settings → Install VPN helper**, and approve the administrator prompt. This installs a small background helper once (a Windows service, or a macOS launch daemon). Only your user account (and administrators) can control it.
+2. Tick **System VPN: send every app's traffic through AegisNet while connected**, press **Save**.
+3. While connected, the window shows *System VPN is on*. Disconnecting or quitting the app turns it off.
+
+**Kill switch** (optional, under the System VPN setting): nothing gets out around the VPN. Disconnecting or quitting the app turns it off as usual; if the app or the VPN stops unexpectedly, the internet stays blocked (your local network and your server still work) until you connect again or press **Unblock internet** in the app. Restarting the computer always clears it.
+
+After updating the app, Settings may offer **Update VPN helper** (another administrator prompt). **Remove VPN helper** uninstalls it. Names are resolved by your server, so names that only exist on your local network (like `router.lan`) don't resolve while the VPN is on; addresses on your local network still work.
 
 Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl connect --dir DIR`.
 
@@ -189,7 +199,7 @@ Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl conn
 
 The phone app carries TCP and UDP, so calls, games and QUIC work through it too. With a server older than this version only TCP works, and apps fall back from QUIC to TCP by themselves.
 
-On a computer, apps that support SOCKS5 UDP (for example some games and messengers) can send UDP through `127.0.0.1:1080` as well; the HTTP proxy and the Windows system proxy are TCP only.
+On a computer, apps that support SOCKS5 UDP (for example some games and messengers) can send UDP through `127.0.0.1:1080` as well; the HTTP proxy and the Windows system proxy are TCP only. The system VPN carries UDP for every app.
 
 **Several servers:** a device can join more than one server, each with its own invitation, and connects to one at a time.
 - Desktop: open **Add a server** and join; the connection moves to the new server. Choose another one under **Server**. **Settings → Remove this server** removes the one shown.

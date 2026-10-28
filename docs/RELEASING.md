@@ -64,7 +64,7 @@ Test images are built only when you ask for one: a full build takes about 30 min
 
 Every job has a time limit (5 to 60 minutes), so a hang fails quickly instead of running for GitHub's default 6 hours. Usage so far: Settings → Billing and plans → Usage.
 
-macOS is compiled only for releases, so a macOS-only build problem shows up when releasing (the release then fails before anything is published). To check earlier, run `cargo check -p aegis-client` on a Mac.
+macOS is compiled only for releases (one universal `AegisNet.app` in `aegis-client-macos.dmg`, `.github/scripts/macos-dmg.sh`), so a macOS-only build problem shows up when releasing (the release then fails before anything is published). Every push does lint the system VPN helper (`aegis-vpn`) for macOS and Windows, since it is pure Rust; to check the whole client earlier, run `cargo check -p aegis-client` on a Mac.
 
 **Quirks to know:**
 

@@ -6,6 +6,11 @@
 //! remembers which name it stands for; a connection to that address is
 //! opened through the tunnel *by name*. `AAAA` and other types get an empty
 //! answer, which keeps apps on the IPv4 addresses this pool hands out.
+//!
+//! A few names can be pinned to their real addresses instead
+//! ([`FakeDns::pin`]): on a desktop the client node itself resolves the
+//! gateway through the system resolver, which the VPN answers, and must
+//! reach the real gateway, whose addresses stay off the VPN.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -29,6 +34,7 @@ pub struct FakeDns {
     by_name: HashMap<String, Ipv4Addr>,
     by_ip: HashMap<Ipv4Addr, String>,
     next: u32,
+    pinned: HashMap<String, Vec<Ipv4Addr>>,
 }
 
 impl Default for FakeDns {
@@ -37,6 +43,7 @@ impl Default for FakeDns {
             by_name: HashMap::new(),
             by_ip: HashMap::new(),
             next: FIRST,
+            pinned: HashMap::new(),
         }
     }
 }
@@ -70,12 +77,25 @@ impl FakeDns {
         ip
     }
 
+    /// Answer `name` with these real addresses from now on (an empty list
+    /// gives an empty answer).
+    pub fn pin(&mut self, name: &str, addrs: Vec<Ipv4Addr>) {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        self.pinned.insert(name, addrs);
+    }
+
     /// Answer one DNS query packet (UDP payload). `None` for packets that
     /// aren't a single standard query, which are dropped.
     pub fn answer(&mut self, query: &[u8]) -> Option<Vec<u8>> {
         let q = Question::parse(query)?;
-        let ip = (q.qtype == TYPE_A && q.qclass == CLASS_IN).then(|| self.address_for(&q.name));
-        Some(q.response(query, ip))
+        let ips = if q.qtype != TYPE_A || q.qclass != CLASS_IN {
+            Vec::new()
+        } else if let Some(real) = self.pinned.get(&q.name) {
+            real.clone()
+        } else {
+            vec![self.address_for(&q.name)]
+        };
+        Some(q.response(query, &ips))
     }
 }
 
@@ -135,19 +155,20 @@ impl Question {
         })
     }
 
-    /// The response: the query's ID, RD and question, and one `A` record
-    /// for `ip` (or no answer).
-    fn response(&self, query: &[u8], ip: Option<Ipv4Addr>) -> Vec<u8> {
-        let mut r = Vec::with_capacity(self.end + 16);
+    /// The response: the query's ID, RD and question, and an `A` record
+    /// for each of `ips` (at most 16).
+    fn response(&self, query: &[u8], ips: &[Ipv4Addr]) -> Vec<u8> {
+        let ips = &ips[..ips.len().min(16)];
+        let mut r = Vec::with_capacity(self.end + 16 * ips.len());
         r.extend_from_slice(&query[0..2]);
         let rd = query[2] & 0x01;
         // QR, RD copied, RA; NOERROR.
         r.extend_from_slice(&[0x80 | rd, 0x80]);
         r.extend_from_slice(&1u16.to_be_bytes());
-        r.extend_from_slice(&u16::from(ip.is_some()).to_be_bytes());
+        r.extend_from_slice(&(ips.len() as u16).to_be_bytes());
         r.extend_from_slice(&[0, 0, 0, 0]);
         r.extend_from_slice(&query[12..self.end]);
-        if let Some(ip) = ip {
+        for ip in ips {
             // Name: pointer to the question's name at offset 12.
             r.extend_from_slice(&[0xC0, 0x0C]);
             r.extend_from_slice(&TYPE_A.to_be_bytes());
@@ -214,6 +235,20 @@ mod tests {
             assert_eq!(r[3] & 0x0F, 0, "NOERROR");
         }
         assert!(dns.by_name.is_empty());
+    }
+
+    #[test]
+    fn pinned_names_get_their_real_addresses() {
+        let mut dns = FakeDns::default();
+        let real = vec![Ipv4Addr::new(104, 16, 1, 1), Ipv4Addr::new(104, 16, 2, 2)];
+        dns.pin("GW.Example.com.", real);
+        let r = dns.answer(&query(9, "gw.example.com", 1)).expect("answer");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 2, "two answers");
+        assert_eq!(&r[r.len() - 4..], &[104, 16, 2, 2]);
+        assert_eq!(&r[r.len() - 20..r.len() - 16], &[104, 16, 1, 1]);
+        assert!(dns.by_name.is_empty(), "no pool address used");
+        let r = dns.answer(&query(9, "gw.example.com", 28)).expect("answer");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "no AAAA");
     }
 
     #[test]

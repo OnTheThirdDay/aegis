@@ -1,0 +1,18 @@
+[package]
+name = "aegis-tun"
+description = "The VPN packet path shared by the phone and desktop VPNs: a userspace TCP/IP stack feeding the client node's local proxy, fake-IP DNS, captured routes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros", "sync"] }
+# Userspace TCP/IP stack over the VPN interface's packets.
+ipstack = "1.0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }

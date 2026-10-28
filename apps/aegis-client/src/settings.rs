@@ -2,8 +2,8 @@
 //!
 //! The app is portable: it keeps everything in `AegisNet-data` next to the
 //! executable when that folder is writable (USB stick, Downloads), and falls
-//! back to the per-user application data folder otherwise. `AEGIS_CLIENT_DATA`
-//! overrides both.
+//! back to the per-user application data folder otherwise (always for the
+//! macOS app bundle). `AEGIS_CLIENT_DATA` overrides both.
 
 use crate::sysproxy;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,11 @@ pub struct Settings {
     pub http_port: u16,
     /// Point the OS proxy at the local HTTP proxy while connected.
     pub system_proxy: bool,
+    /// Capture every app's traffic while connected (needs the VPN helper).
+    pub system_vpn: bool,
+    /// With the system VPN: nothing gets out around it, also if it stops
+    /// unexpectedly.
+    pub kill_switch: bool,
     pub auto_connect: bool,
     /// Previous OS proxy values, kept while ours are applied so a crash can
     /// be undone at the next start.
@@ -30,6 +35,8 @@ impl Default for Settings {
             socks_port: 1080,
             http_port: 8080,
             system_proxy: false,
+            system_vpn: false,
+            kill_switch: false,
             auto_connect: false,
             proxy_saved: None,
             path: PathBuf::new(),
@@ -76,9 +83,11 @@ pub fn data_dir() -> Result<PathBuf, String> {
             Err(format!("{} is not writable", p.display()))
         };
     }
+    // Not inside a macOS app bundle: an update replaces the bundle.
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf))
+        .filter(|d| !d.ends_with("Contents/MacOS"))
     {
         let portable = exe_dir.join("AegisNet-data");
         if writable(&portable) {

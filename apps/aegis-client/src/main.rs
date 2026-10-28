@@ -6,6 +6,9 @@
 //! * The device key is generated here and never leaves this device.
 //! * Local proxies: SOCKS5 and HTTP on 127.0.0.1; optionally set as the
 //!   Windows system proxy while connected (restored afterwards).
+//! * Optionally a system VPN for every app (Windows, macOS): a helper
+//!   installed once with administrator rights (`aegis-vpn`). The same
+//!   executable is that helper when started with its arguments.
 //! * No logs are written; errors are shown in the window only. For support,
 //!   Troubleshooting records connection events on demand: in memory, at
 //!   most an hour, then sent to the server or saved to a file.
@@ -323,7 +326,14 @@ impl App {
                         });
                     }
                 }
-                if s.system_proxy_active {
+                if s.vpn_active {
+                    ui.label(RichText::new("System VPN is on: every app on this computer goes through AegisNet.").color(GREEN));
+                    let c = &s.vpn_counters;
+                    ui.label(RichText::new(format!(
+                        "{} connections open ({} in total) · {} UDP flows · {} DNS lookups",
+                        c.tcp_open, c.tcp_total, c.udp_open, c.dns_queries
+                    )).small().weak());
+                } else if s.system_proxy_active {
                     ui.label(RichText::new("Windows system proxy is set: Edge, Chrome and most apps use it.").color(GREEN));
                 } else {
                     ui.label(RichText::new("Firefox: Settings > Network Settings > Manual proxy > SOCKS Host 127.0.0.1, port above, SOCKS v5, and tick \"Proxy DNS when using SOCKS v5\".").small().weak());
@@ -429,6 +439,14 @@ impl App {
                 if sysproxy::supported() {
                     ui.checkbox(&mut self.edited.system_proxy, "Set as the Windows system proxy while connected");
                 }
+                if aegis_vpn::supported() {
+                    ui.checkbox(&mut self.edited.system_vpn, "System VPN: send every app's traffic through AegisNet while connected");
+                    ui.add_enabled(
+                        self.edited.system_vpn,
+                        egui::Checkbox::new(&mut self.edited.kill_switch, "Kill switch: block internet access if the system VPN stops unexpectedly"),
+                    )
+                    .on_hover_text("Disconnecting or quitting turns it off. If the app or the VPN stops unexpectedly, only your local network and your server stay reachable until you connect again or unblock. Restarting the computer always clears it.");
+                }
                 ui.checkbox(&mut self.edited.auto_connect, "Connect automatically when the app starts");
                 let changed = self.edited != self.settings;
                 ui.horizontal(|ui| {
@@ -443,6 +461,9 @@ impl App {
                         self.edited = self.settings.clone();
                     }
                 });
+                if aegis_vpn::supported() {
+                    self.vpn_helper_view(ui, s);
+                }
                 if let (Some(id), Some(server)) = (&s.selected, &s.server) {
                     ui.separator();
                     if self.confirm_forget {
@@ -464,6 +485,58 @@ impl App {
                 ui.label(RichText::new(format!("Data folder: {}", self.data_dir.display())).small().weak());
                 ui.label(RichText::new(format!("AegisNet client {}", env!("CARGO_PKG_VERSION"))).small().weak());
             });
+    }
+}
+
+impl App {
+    fn vpn_helper_view(&mut self, ui: &mut egui::Ui, s: &engine::Snapshot) {
+        use aegis_vpn::client::HelperState;
+        ui.separator();
+        ui.label(RichText::new("System VPN helper").strong());
+        if s.vpn_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Waiting for administrator approval...");
+            });
+            return;
+        }
+        let (text, install, remove) = match &s.vpn_helper {
+            HelperState::Unsupported => return,
+            HelperState::NotInstalled => (
+                "The system VPN needs a small helper, installed once. Installing asks for administrator rights.".to_owned(),
+                Some("Install VPN helper"),
+                false,
+            ),
+            HelperState::Outdated { version } => (
+                format!("The installed helper ({version}) is too old for this app; update it to use the system VPN."),
+                Some("Update VPN helper"),
+                true,
+            ),
+            HelperState::Ready {
+                version,
+                current: false,
+                ..
+            } => (
+                format!("Installed (version {version}); this app can update it."),
+                Some("Update VPN helper"),
+                true,
+            ),
+            HelperState::Ready { .. } => ("Installed.".to_owned(), None, true),
+        };
+        ui.label(RichText::new(text).small());
+        ui.horizontal(|ui| {
+            if let Some(label) = install {
+                if ui.button(label).clicked() {
+                    self.engine.send(Command::InstallVpnHelper);
+                }
+            }
+            if remove && ui.button("Remove VPN helper").clicked() {
+                self.engine.send(Command::RemoveVpnHelper);
+            }
+        });
+        if let Some((ok, msg)) = &s.vpn_message {
+            ui.label(RichText::new(msg).color(if *ok { GREEN } else { RED }));
+        }
     }
 }
 
@@ -496,6 +569,23 @@ impl eframe::App for App {
             } else if let Some(i) = &s.info {
                 ui.label(RichText::new(i).color(GREEN));
             }
+            let blocked = matches!(
+                s.vpn_helper,
+                aegis_vpn::client::HelperState::Ready { blocked: true, .. }
+            );
+            if blocked && !s.vpn_active {
+                ui.group(|ui| {
+                    ui.label(RichText::new("The system VPN stopped unexpectedly, so the kill switch is blocking this computer's internet access. Your local network and your server are still reachable.").color(RED));
+                    ui.horizontal(|ui| {
+                        if s.status == Status::Disconnected && ui.button("Connect").clicked() {
+                            self.engine.send(Command::Connect);
+                        }
+                        if ui.button("Unblock internet").clicked() {
+                            self.engine.send(Command::Unblock);
+                        }
+                    });
+                });
+            }
             ui.add_space(6.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let enrolled = !s.servers.is_empty();
@@ -511,6 +601,7 @@ impl eframe::App for App {
         // Keep counters and the uptime fresh while connected.
         if matches!(s.status, Status::Connected | Status::Connecting)
             || s.joining
+            || s.vpn_busy
             || self.engine.diag.is_recording()
         {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -519,6 +610,11 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result {
+    // Started as the system VPN's helper or its installer.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = aegis_vpn::dispatch(&args) {
+        std::process::exit(code);
+    }
     let data_dir = match settings::data_dir() {
         Ok(d) => d,
         Err(e) => {

@@ -8,6 +8,8 @@ use crate::sysproxy;
 use aegis_join::{DeviceDir, JoinError, Ports, Servers};
 use aegis_telemetry::report::{Report, Role};
 use aegis_telemetry::{DiagnosticSink, Severity};
+use aegis_vpn::client::{HelperState, Session};
+use aegis_vpn::proto::Counters;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -58,6 +60,14 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub info: Option<String>,
     pub system_proxy_active: bool,
+    /// The system VPN's helper, whether the VPN is up, and its counters.
+    pub vpn_helper: HelperState,
+    pub vpn_active: bool,
+    pub vpn_counters: Counters,
+    /// Installing or removing the helper (waiting for the administrator).
+    pub vpn_busy: bool,
+    /// Outcome of the last helper install/removal: (success, message).
+    pub vpn_message: Option<(bool, String)>,
     /// Outcome of the last diagnostics send/save: (success, message).
     pub diag_message: Option<(bool, String)>,
     pub diag_sending: bool,
@@ -82,6 +92,11 @@ impl Default for Snapshot {
             error: None,
             info: None,
             system_proxy_active: false,
+            vpn_helper: HelperState::Unsupported,
+            vpn_active: false,
+            vpn_counters: Counters::default(),
+            vpn_busy: false,
+            vpn_message: None,
             diag_message: None,
             diag_sending: false,
         }
@@ -98,6 +113,11 @@ pub enum Command {
     /// Remove a server from this device.
     Forget(String),
     SaveSettings(Settings),
+    /// Install or update the system VPN's helper (administrator prompt).
+    InstallVpnHelper,
+    /// Release a kill switch that blocks traffic after the VPN stopped.
+    Unblock,
+    RemoveVpnHelper,
     /// Start an on-demand diagnostics recording for this many minutes.
     DiagStart(u64),
     /// Stop recording; with `true`, send the report to the server.
@@ -159,6 +179,7 @@ impl Engine {
             node: None,
             repaint,
             proxy_saved: None,
+            vpn: None,
             endpoint_failed: None,
         };
         runtime.spawn(worker.run(rx));
@@ -199,6 +220,8 @@ struct Worker {
     node: Option<aegis_node::NodeRuntime>,
     repaint: Box<dyn Fn() + Send + Sync>,
     proxy_saved: Option<sysproxy::Saved>,
+    /// The system VPN, while it runs.
+    vpn: Option<Session>,
     /// A changed server address that failed its check here, and when: it
     /// isn't tried again on every reconnect (see ENDPOINT_RETRY).
     endpoint_failed: Option<(String, Instant)>,
@@ -256,6 +279,7 @@ impl Worker {
             let _ = self.settings.save();
         }
         self.load_servers();
+        self.check_helper().await;
         if self.settings.auto_connect && self.device.is_some() {
             self.connect().await;
         }
@@ -276,7 +300,9 @@ impl Worker {
                             let reconnect = self.node.is_some()
                                 && (next.socks_port != self.settings.socks_port
                                     || next.http_port != self.settings.http_port
-                                    || next.system_proxy != self.settings.system_proxy);
+                                    || next.system_proxy != self.settings.system_proxy
+                                    || next.system_vpn != self.settings.system_vpn
+                                    || next.kill_switch != self.settings.kill_switch);
                             self.settings = Settings { proxy_saved: self.settings.proxy_saved.clone(), ..next };
                             if let Err(e) = self.settings.save() {
                                 self.update(|s| s.error = Some(format!("Could not save settings: {e}")));
@@ -286,6 +312,14 @@ impl Worker {
                                 self.connect().await;
                             }
                         }
+                        Command::InstallVpnHelper => self.install_helper().await,
+                        Command::Unblock => {
+                            if let Err(e) = aegis_vpn::client::release().await {
+                                self.update(|s| s.error = Some(e));
+                            }
+                            self.check_helper().await;
+                        }
+                        Command::RemoveVpnHelper => self.remove_helper().await,
                         Command::DiagStart(minutes) => self.diag_start(minutes),
                         Command::DiagStop(send) => {
                             self.diag.stop();
@@ -579,13 +613,112 @@ impl Worker {
                 }
             }
         }
+        if self.settings.system_vpn {
+            if let Some(socks) = socks {
+                self.start_vpn(socks.port()).await;
+            }
+        }
         self.refresh(true).await;
+    }
+
+    /// Bring the system VPN up for the running node; on failure the
+    /// connection stays up for apps that use the proxy.
+    async fn start_vpn(&mut self, socks_port: u16) {
+        if !aegis_vpn::supported() || self.vpn.is_some() {
+            return;
+        }
+        let bypass = self
+            .device
+            .as_ref()
+            .and_then(|d| d.load().ok())
+            .map(|d| bypass_hosts(&d))
+            .unwrap_or_default();
+        match Session::start(socks_port, bypass, self.settings.kill_switch).await {
+            Ok(session) => {
+                self.vpn = Some(session);
+                self.diag.note(Severity::Info, "client.vpn.started", &[]);
+                self.update(|s| {
+                    s.vpn_active = true;
+                    s.vpn_counters = Counters::default();
+                    if let HelperState::Ready { blocked, .. } = &mut s.vpn_helper {
+                        *blocked = false;
+                    }
+                });
+            }
+            Err(e) => {
+                self.diag
+                    .note(Severity::Warn, "client.vpn.failed", &[("error", &e)]);
+                self.update(|s| {
+                    s.vpn_active = false;
+                    s.error = Some(format!("System VPN: {e}"));
+                });
+            }
+        }
+    }
+
+    async fn stop_vpn(&mut self) {
+        if let Some(session) = self.vpn.take() {
+            session.stop().await;
+            self.diag.note(Severity::Info, "client.vpn.stopped", &[]);
+        }
+        self.update(|s| s.vpn_active = false);
+    }
+
+    async fn check_helper(&mut self) {
+        let state = aegis_vpn::client::state().await;
+        self.update(|s| s.vpn_helper = state);
+    }
+
+    async fn install_helper(&mut self) {
+        self.update(|s| {
+            s.vpn_busy = true;
+            s.vpn_message = None;
+        });
+        // An update replaces the running helper, which ends the VPN.
+        let had_vpn = self.vpn.is_some();
+        self.stop_vpn().await;
+        let result = aegis_vpn::client::install().await;
+        self.check_helper().await;
+        let message = match &result {
+            Ok(()) => (true, "VPN helper installed.".to_owned()),
+            Err(e) => (false, e.clone()),
+        };
+        self.update(|s| {
+            s.vpn_busy = false;
+            s.vpn_message = Some(message);
+        });
+        let socks = self.node.as_ref().and_then(|n| n.bound_addr("socks"));
+        if let Some(socks) = socks {
+            if self.settings.system_vpn && (had_vpn || result.is_ok()) {
+                self.start_vpn(socks.port()).await;
+            }
+        }
+    }
+
+    async fn remove_helper(&mut self) {
+        self.update(|s| {
+            s.vpn_busy = true;
+            s.vpn_message = None;
+        });
+        self.stop_vpn().await;
+        let result = aegis_vpn::client::uninstall().await;
+        self.check_helper().await;
+        let message = match result {
+            Ok(()) => (true, "VPN helper removed.".to_owned()),
+            Err(e) => (false, e),
+        };
+        self.update(|s| {
+            s.vpn_busy = false;
+            s.vpn_message = Some(message);
+        });
     }
 
     async fn disconnect(&mut self) {
         if self.node.is_some() {
             self.diag.note(Severity::Info, "client.disconnect", &[]);
         }
+        // Release the system's traffic before the proxy it goes to stops.
+        self.stop_vpn().await;
         if let Some(saved) = self.proxy_saved.take() {
             let _ = sysproxy::restore(&saved);
             self.settings.proxy_saved = None;
@@ -641,6 +774,27 @@ impl Worker {
 
     /// Refresh counters; with `probe`, verify the gateway end to end.
     async fn refresh(&mut self, probe: bool) {
+        let vpn = match &mut self.vpn {
+            Some(session) => Some(session.status().await),
+            None => None,
+        };
+        if let Some(vpn) = vpn {
+            match vpn {
+                Ok((true, counters)) => self.update(|s| s.vpn_counters = counters),
+                Ok((false, _)) | Err(_) => {
+                    self.vpn = None;
+                    self.diag.note(Severity::Warn, "client.vpn.lost", &[]);
+                    self.check_helper().await;
+                    self.update(|s| {
+                        s.vpn_active = false;
+                        s.error = Some(
+                            "The system VPN stopped. Disconnect and connect again to restart it."
+                                .into(),
+                        );
+                    });
+                }
+            }
+        }
         let Some(node) = &self.node else { return };
         let gauges = node.ctx.gauges();
         let m = node.ctx.metrics.snapshot(gauges);
@@ -710,6 +864,7 @@ impl Worker {
                                 "off"
                             },
                         ),
+                        ("system_vpn", if self.vpn.is_some() { "on" } else { "off" }),
                     ],
                 );
                 self.update(|s| s.diag_message = None);
@@ -790,11 +945,67 @@ impl Worker {
     }
 }
 
+/// The host of `url` or of a `host:port`, without the port (an IPv6
+/// literal keeps its brackets, which the helper refuses).
+fn host_only(s: &str) -> String {
+    let rest = s.split_once("://").map_or(s, |(_, r)| r);
+    let hostport = rest.split(['/', '?']).next().unwrap_or(rest);
+    if hostport.starts_with('[') {
+        return hostport.split(']').next().unwrap_or(hostport).to_owned() + "]";
+    }
+    match hostport.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host.to_owned(),
+        _ => hostport.to_owned(),
+    }
+}
+
+/// Where this device connects to its server outside the VPN: the tunnel,
+/// enrollment/renewal and direct QUIC addresses.
+fn bypass_hosts(device: &aegis_join::Device) -> Vec<String> {
+    let mut hosts: Vec<String> = [
+        Some(&device.url),
+        Some(&device.enroll_url),
+        device.quic.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|s| host_only(s))
+    .filter(|h| aegis_vpn::proto::valid_bypass(h))
+    .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 /// The end-to-end check, with the message the window shows on failure.
 async fn verify(socks: SocketAddr) -> Result<(), String> {
     if aegis_join::verify_tunnel(socks).await {
         Ok(())
     } else {
         Err("Cannot reach the server yet — retrying. Check the network, or ask the administrator whether this device was removed.".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_server_s_hosts_stay_off_the_vpn() {
+        assert_eq!(host_only("wss://gw.example.com:8443/agp"), "gw.example.com");
+        assert_eq!(host_only("https://gw.example.com/enroll"), "gw.example.com");
+        assert_eq!(host_only("203.0.113.9:8444"), "203.0.113.9");
+        assert_eq!(host_only("[2001:db8::1]:8444"), "[2001:db8::1]");
+        let device = aegis_join::Device {
+            name: "laptop".into(),
+            url: "wss://gw.example.com/agp".into(),
+            enroll_url: "https://gw.example.com/enroll".into(),
+            server_name: "gw".into(),
+            outer_server_name: None,
+            device_ca_sha256: String::new(),
+            enrolled_at: 0,
+            quic: Some("203.0.113.9:8444".into()),
+        };
+        assert_eq!(bypass_hosts(&device), vec!["203.0.113.9", "gw.example.com"]);
     }
 }

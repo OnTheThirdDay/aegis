@@ -16,17 +16,14 @@
 //! boundary allows it, item by item (`fd`, `android`).
 #![deny(unsafe_code)]
 
-mod dns;
 #[cfg(unix)]
 mod fd;
-mod packet;
-mod routes;
-mod socks;
 
 #[cfg(target_os = "android")]
 mod android;
 
 use aegis_join::{DeviceDir, JoinError, Ports, Servers};
+use aegis_tun::{dns, packet, routes};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -370,7 +367,13 @@ async fn session<D>(
         node.shutdown(Duration::from_secs(1)).await;
         return fail_with("the local proxy did not start".into());
     };
-    let packets = tokio::spawn(packet::run(device, socks, stats, stop.clone()));
+    let packets = tokio::spawn(packet::run(
+        device,
+        socks,
+        dns::FakeDns::default(),
+        stats,
+        stop.clone(),
+    ));
     let mut tick = tokio::time::interval(TICK);
     let mut ticks = 0u32;
     let mut renewal_checked = Instant::now();
