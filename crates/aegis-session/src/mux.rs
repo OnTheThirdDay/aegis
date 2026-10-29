@@ -1745,12 +1745,20 @@ fn queue_datagram(
         return Ok(());
     }
     let n = payload.len();
-    e.datagrams.push_back(payload);
+    e.datagrams.push_back(detached(&payload));
     if let Some(w) = e.read_waker.take() {
         w.wake();
     }
     st.dgram_rx_bytes += n;
     Ok(())
+}
+
+/// A received datagram in an allocation of its own size. The payload is a
+/// slice of the decoder's read buffer: queued as is, a 1-byte datagram would
+/// keep that whole buffer alive while only its length counts against the
+/// receive buffer.
+fn detached(payload: &Bytes) -> Bytes {
+    Bytes::copy_from_slice(payload)
 }
 
 fn on_half_close(shared: &Arc<Shared>, st: &mut State, id: u32) -> Result<(), SessionError> {
@@ -1884,7 +1892,9 @@ fn on_window_update(
 
 /// Assemble one batch: all queued control frames first, then datagrams (up
 /// to half the batch, so byte streams keep moving under UDP load), then DATA
-/// from ready streams round-robin with a one-frame quantum.
+/// from ready streams round-robin with a one-frame quantum. A ready stream
+/// gets at least one frame in every batch, even when a single datagram
+/// already filled it (64 KiB frames).
 fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result<(), SessionError> {
     while let Some(frame) = st.control.pop_front() {
         encode_frame(out, &frame)?;
@@ -1912,7 +1922,8 @@ fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result
     let cap = shared.send_frame_cap();
     let mut visited = 0usize;
     let rounds = st.ready.len();
-    while out.len() < WRITE_BATCH && visited < rounds.max(1) * 4 {
+    let mut served = false;
+    while (out.len() < WRITE_BATCH || !served) && visited < rounds.max(1) * 4 {
         let Some(id) = st.ready.pop_front() else {
             break;
         };
@@ -1951,6 +1962,7 @@ fn assemble_batch(shared: &Shared, st: &mut State, out: &mut BytesMut) -> Result
                 }
             }
             encode_frame(out, &Frame::new(FrameType::Data, id, chunk))?;
+            served = true;
             if let Some(w) = e.write_waker.take() {
                 w.wake();
             }
@@ -2163,5 +2175,19 @@ mod tests {
             ..SessionConfig::default()
         };
         assert_eq!(small.effective_max_streams(2 * 1024 * 1024), 4);
+    }
+
+    #[test]
+    fn queued_datagrams_never_pin_the_read_buffer() {
+        let read_buffer = Bytes::from(vec![7u8; 64 * 1024]);
+        let payload = read_buffer.slice(100..101);
+        let queued = detached(&payload);
+        assert_eq!(&queued[..], &payload[..]);
+        let start = read_buffer.as_ptr() as usize;
+        let at = queued.as_ptr() as usize;
+        assert!(
+            at < start || at >= start + read_buffer.len(),
+            "the queued datagram is a copy, not a slice of the buffer"
+        );
     }
 }

@@ -7,9 +7,9 @@ use crate::relay::{
     finish_flow, finish_mux, relay, ActiveGuard, DatagramUpstream, RelayOutcome, Upstream, UDP_IDLE,
 };
 use crate::{now_unix, LoadedIdentity, NodeContext};
-use aegis_buffer::Budget;
+use aegis_buffer::{Budget, Reservation};
 use aegis_config::{secret, InboundConfig, NodeConfig, OutboundConfig, OutboundKind};
-use aegis_contracts::observability::{Event, Observability, OperationResult};
+use aegis_contracts::observability::{Event, Observability, OperationResult, PoolClass};
 use aegis_contracts::reason::{OpenFailure, ReasonGroup, ResetReason};
 use aegis_contracts::Destination;
 use aegis_core::{Backoff, CircuitBreaker};
@@ -766,7 +766,7 @@ async fn udp_associate(
     }
     // Replies go to wherever the client's first datagram came from.
     let mut peer: Option<SocketAddr> = None;
-    let mut flows: HashMap<Destination, tokio::sync::mpsc::Sender<bytes::Bytes>> = HashMap::new();
+    let mut flows: HashMap<Destination, tokio::sync::mpsc::Sender<Queued>> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut probe = [0u8; 1];
     let mut shutdown = ctx.shutdown_signal();
@@ -793,7 +793,19 @@ async fn udp_associate(
         let Some((dest, data)) = aegis_inbound_socks::parse_udp(&buf[..n]) else {
             continue;
         };
-        let data = bytes::Bytes::copy_from_slice(data);
+        // Held against the process buffer budget while it waits for its
+        // flow (which may still be opening); without room it is lost, as
+        // UDP allows.
+        let Ok(held) = ctx
+            .budget
+            .try_reserve(data.len() as u64, PoolClass::Transmit)
+        else {
+            continue;
+        };
+        let data = Queued {
+            data: bytes::Bytes::copy_from_slice(data),
+            _held: held,
+        };
         if let Some(tx) = flows.get(&dest) {
             match tx.try_send(data) {
                 Ok(()) => continue,
@@ -816,6 +828,13 @@ async fn udp_associate(
     }
 }
 
+/// A datagram waiting for its flow, with the buffer-budget bytes it holds
+/// until it is sent or dropped.
+struct Queued {
+    data: bytes::Bytes,
+    _held: Reservation,
+}
+
 /// Start the flow task for `dest` in an association, unless it is full.
 fn start_flow(
     ctx: &Arc<NodeContext>,
@@ -823,8 +842,8 @@ fn start_flow(
     relay: &Arc<tokio::net::UdpSocket>,
     client: SocketAddr,
     dest: &Destination,
-    flows: &mut std::collections::HashMap<Destination, tokio::sync::mpsc::Sender<bytes::Bytes>>,
-) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
+    flows: &mut std::collections::HashMap<Destination, tokio::sync::mpsc::Sender<Queued>>,
+) -> Option<tokio::sync::mpsc::Sender<Queued>> {
     if flows.len() >= ASSOCIATION_FLOWS {
         return None;
     }
@@ -849,7 +868,7 @@ async fn udp_flow(
     relay: Arc<tokio::net::UdpSocket>,
     client: SocketAddr,
     dest: Destination,
-    mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    mut rx: tokio::sync::mpsc::Receiver<Queued>,
 ) {
     let upstream = match route_udp(&ctx, &dest, &inbound).await {
         Ok(u) => u,
@@ -870,7 +889,7 @@ async fn udp_flow(
             d = rx.recv() => match d {
                 Some(d) => {
                     deadline = tokio::time::Instant::now() + UDP_IDLE;
-                    if let Err(e) = upstream.send(&d).await {
+                    if let Err(e) = upstream.send(&d.data).await {
                         break RelayOutcome::Error(e.kind());
                     }
                 }

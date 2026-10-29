@@ -112,6 +112,7 @@ pub fn run(o: Options) -> Result<(), String> {
     prepare(&o.data);
     take_over(&docker)?;
     let mut u = Updater::new(&o, &docker);
+    u.recover();
     let mut next_check = Instant::now();
     let mut beat = Instant::now() - HEARTBEAT;
     loop {
@@ -172,6 +173,8 @@ pub(crate) struct Updater<'a, E: Engine> {
     state: &'static str,
     message: Option<String>,
     finished_at: Option<u64>,
+    /// The last run stopped in the middle of an upgrade ([`Updater::recover`]).
+    interrupted: bool,
 }
 
 impl<'a, E: Engine> Updater<'a, E> {
@@ -193,6 +196,70 @@ impl<'a, E: Engine> Updater<'a, E> {
             },
             message: last["message"].as_str().map(str::to_owned),
             finished_at: last["finished_at"].as_u64(),
+            interrupted: last["state"].as_str() == Some("upgrading"),
+        }
+    }
+
+    /// Finish or undo an upgrade the previous run was interrupted in (the
+    /// updater crashed or was restarted mid-way), before anything else:
+    /// - the new gateway runs and turns healthy: keep it, drop the previous;
+    /// - otherwise the previous one (`<name>-previous`) takes its name back
+    ///   and runs again;
+    /// - interrupted before the rename: the stopped gateway runs again.
+    pub(crate) fn recover(&mut self) {
+        if !std::mem::take(&mut self.interrupted) {
+            return;
+        }
+        let name = self.o.container.clone();
+        let previous = format!("{name}-previous");
+        let current = self.e.inspect_container(&name).ok().flatten();
+        let before = self.e.inspect_container(&previous).ok().flatten();
+        let running = |c: &Value| c["State"]["Running"] == json!(true);
+        match (current, before) {
+            (Some(c), Some(_)) if running(&c) && self.wait_healthy(&name).is_ok() => {
+                let _ = self.e.remove(&previous);
+                self.running = self.running_version(&name);
+                self.set(
+                    "upgraded",
+                    Some("An interrupted upgrade had finished; the new version runs.".into()),
+                );
+            }
+            (current, Some(_)) => {
+                if current.is_some() {
+                    let _ = self.e.remove(&name);
+                }
+                match self
+                    .e
+                    .rename(&previous, &name)
+                    .and_then(|()| self.e.start(&name))
+                {
+                    Ok(()) => self.set(
+                        "rolled_back",
+                        Some("An upgrade was interrupted; the previous version runs again.".into()),
+                    ),
+                    Err(e) => self.set(
+                        "failed",
+                        Some(format!(
+                            "An upgrade was interrupted and the previous version could not be started again ({e}): it is kept as {previous}."
+                        )),
+                    ),
+                }
+            }
+            (Some(c), None) if !running(&c) => match self.e.start(&name) {
+                Ok(()) => self.set(
+                    "failed",
+                    Some("An upgrade was interrupted before it changed anything; the gateway runs again.".into()),
+                ),
+                Err(e) => self.set(
+                    "failed",
+                    Some(format!("An upgrade was interrupted and {name} could not be started again ({e}).")),
+                ),
+            },
+            (Some(_), None) => self.set("idle", None),
+            (None, None) => self.set(
+                "failed",
+                Some(format!("An upgrade was interrupted and no container named {name} is left.")),
+            ),
         }
     }
 
@@ -341,8 +408,19 @@ impl<'a, E: Engine> Updater<'a, E> {
         let previous = format!("{name}-previous");
         let fail = |e: DockerError| Failure::Refused(e.to_string());
         self.e.remove(&previous).map_err(fail)?;
-        self.e.stop(&name).map_err(fail)?;
-        self.e.rename(&name, &previous).map_err(fail)?;
+        // Until the rename, the gateway is only stopped: any failure starts
+        // it again.
+        if let Err(e) = self
+            .e
+            .stop(&name)
+            .and_then(|()| self.e.rename(&name, &previous))
+        {
+            let restarted = match self.e.start(&name) {
+                Ok(()) => "the gateway was started again".to_owned(),
+                Err(e) => format!("starting the gateway again failed too ({e})"),
+            };
+            return Err(Failure::Refused(format!("{e}; {restarted}.")));
+        }
         let started = self
             .e
             .create(&name, &config)
@@ -473,6 +551,7 @@ mod tests {
         unhealthy: Vec<String>,
         registry: Option<String>, // version `latest` pulls
         log: RefCell<Vec<String>>,
+        fail_rename: bool,
     }
 
     impl Fake {
@@ -570,6 +649,9 @@ mod tests {
             Ok(())
         }
         fn rename(&self, name: &str, to: &str) -> Result<(), DockerError> {
+            if self.fail_rename {
+                return Err(DockerError("rename refused".into()));
+            }
             let c = self
                 .containers
                 .borrow_mut()
@@ -702,5 +784,130 @@ mod tests {
             );
         }
         assert!(fake.log.borrow().is_empty(), "no container was touched");
+    }
+
+    fn stopped(fake: &Fake, name: &str, image: &str) {
+        fake.containers
+            .borrow_mut()
+            .insert(name.into(), (image.into(), false));
+    }
+
+    fn interrupted(data: &std::path::Path) {
+        files::write_status(data, &json!({"state": "upgrading"})).expect("status");
+    }
+
+    #[test]
+    fn a_failed_rename_starts_the_gateway_again() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = Fake {
+            fail_rename: true,
+            ..Fake::default()
+        };
+        fake.image("sha256:old", "0.7.0");
+        fake.image(&format!("{REPO}:0.8.0"), "0.8.0");
+        fake.container("aegis", "sha256:old");
+        let o = options(tmp.path(), Source::Local);
+        let mut u = Updater::new(&o, &fake);
+        u.upgrade(Some(Version(0, 8, 0)));
+        assert_eq!(fake.running_image("aegis").as_deref(), Some("sha256:old"));
+        assert!(fake.containers.borrow()["aegis"].1, "running again");
+        let status = files::status(tmp.path()).expect("status");
+        assert_eq!(status["state"], "failed");
+        assert!(status["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("started again"));
+    }
+
+    #[test]
+    fn an_upgrade_interrupted_after_the_rename_is_undone() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = Fake::default();
+        fake.image("sha256:old", "0.7.0");
+        stopped(&fake, "aegis-previous", "sha256:old");
+        interrupted(tmp.path());
+        let o = options(tmp.path(), Source::Local);
+        let mut u = Updater::new(&o, &fake);
+        u.recover();
+        assert_eq!(fake.running_image("aegis").as_deref(), Some("sha256:old"));
+        assert!(fake.containers.borrow()["aegis"].1);
+        assert!(fake.running_image("aegis-previous").is_none());
+        assert_eq!(
+            files::status(tmp.path()).expect("status")["state"],
+            "rolled_back"
+        );
+        // Recovering once is enough: a later upgrade starts normally.
+        u.recover();
+        assert_eq!(
+            fake.log
+                .borrow()
+                .iter()
+                .filter(|l| l.starts_with("start"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_interrupted_unhealthy_replacement_gives_way_to_the_previous_gateway() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = Fake {
+            unhealthy: vec![format!("{REPO}:0.8.0")],
+            ..Fake::default()
+        };
+        fake.image("sha256:old", "0.7.0");
+        fake.image(&format!("{REPO}:0.8.0"), "0.8.0");
+        fake.container("aegis", &format!("{REPO}:0.8.0"));
+        stopped(&fake, "aegis-previous", "sha256:old");
+        interrupted(tmp.path());
+        let o = options(tmp.path(), Source::Local);
+        let mut u = Updater::new(&o, &fake);
+        u.recover();
+        assert_eq!(fake.running_image("aegis").as_deref(), Some("sha256:old"));
+        assert!(fake.containers.borrow()["aegis"].1);
+        assert_eq!(
+            files::status(tmp.path()).expect("status")["state"],
+            "rolled_back"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_healthy_replacement_is_kept() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = Fake::default();
+        fake.image("sha256:old", "0.7.0");
+        fake.image(&format!("{REPO}:0.8.0"), "0.8.0");
+        fake.container("aegis", &format!("{REPO}:0.8.0"));
+        stopped(&fake, "aegis-previous", "sha256:old");
+        interrupted(tmp.path());
+        let o = options(tmp.path(), Source::Local);
+        let mut u = Updater::new(&o, &fake);
+        u.recover();
+        assert_eq!(
+            fake.running_image("aegis").as_deref(),
+            Some(&*format!("{REPO}:0.8.0"))
+        );
+        assert!(fake.running_image("aegis-previous").is_none());
+        let status = files::status(tmp.path()).expect("status");
+        assert_eq!(status["state"], "upgraded");
+        assert_eq!(status["running"], "0.8.0");
+    }
+
+    #[test]
+    fn an_upgrade_interrupted_before_the_rename_starts_the_gateway_again() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = Fake::default();
+        fake.image("sha256:old", "0.7.0");
+        stopped(&fake, "aegis", "sha256:old");
+        interrupted(tmp.path());
+        let o = options(tmp.path(), Source::Local);
+        let mut u = Updater::new(&o, &fake);
+        u.recover();
+        assert!(fake.containers.borrow()["aegis"].1);
+        // Without an interrupted upgrade, a stopped gateway is left alone.
+        stopped(&fake, "aegis", "sha256:old");
+        let mut u = Updater::new(&o, &fake);
+        u.recover();
+        assert!(!fake.containers.borrow()["aegis"].1);
     }
 }

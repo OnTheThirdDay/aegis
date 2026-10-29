@@ -158,7 +158,12 @@ async fn relay_udp(
             r = socket.recv(&mut from_proxy) => match r {
                 Ok(n) => {
                     if let Some(data) = socks::decode_udp(&from_proxy[..n]) {
-                        if udp.write_all(data).await.is_err() {
+                        // One reply, one packet: the stack can't fragment, and
+                        // splitting it would deliver pieces as separate
+                        // datagrams. A reply that doesn't fit is lost whole.
+                        if data.len() > max_udp_payload(&udp) {
+                            stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        } else if udp.write(data).await.is_err() {
                             break;
                         }
                     }
@@ -173,6 +178,13 @@ async fn relay_udp(
         }
     }
     stats.udp_open.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// The largest UDP payload one packet to the app carries (IP and UDP
+/// headers within the MTU).
+fn max_udp_payload(udp: &IpStackUdpStream) -> usize {
+    let ip_header = if udp.peer_addr().is_ipv4() { 20 } else { 40 };
+    usize::from(MTU) - ip_header - 8
 }
 
 async fn serve_dns(mut udp: IpStackUdpStream, dns: Arc<Mutex<FakeDns>>, stats: Arc<Stats>) {
@@ -247,6 +259,14 @@ mod tests {
     /// A local "proxy" that grants UDP ASSOCIATE and echoes every datagram
     /// (header included) back; it reports each target it was asked for.
     async fn echo_proxy() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        proxy(|d| vec![d.to_vec()]).await
+    }
+
+    /// The same, answering each datagram (SOCKS header included) with
+    /// whatever `answer` returns.
+    async fn proxy(
+        answer: fn(&[u8]) -> Vec<Vec<u8>>,
+    ) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
@@ -275,7 +295,9 @@ mod tests {
                             r = relay.recv_from(&mut buf) => {
                                 let (n, from) = r.expect("recv");
                                 let _ = seen_tx.send(buf[..n].to_vec());
-                                relay.send_to(&buf[..n], from).await.expect("echo");
+                                for reply in answer(&buf[..n]) {
+                                    relay.send_to(&reply, from).await.expect("answer");
+                                }
                             }
                             _ = c.read(&mut probe) => return,
                         }
@@ -326,6 +348,58 @@ mod tests {
         assert!(packet.ends_with(b"quic initial"));
         assert_eq!(stats.udp_total.load(Ordering::Relaxed), 1);
         assert_eq!(stats.udp_open.load(Ordering::Relaxed), 1);
+        let _ = stop_tx.send(true);
+        let _ = path.await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_reaches_the_app_whole_or_not_at_all() {
+        // A 3,000-byte reply can't be one packet within the MTU: it is
+        // dropped, never split into datagrams of its own. The next one,
+        // which fits, arrives as one packet.
+        let (proxy, _seen) = proxy(|d| {
+            let header = &d[..10];
+            [vec![7u8; 3000], vec![8u8; 100]]
+                .into_iter()
+                .map(|payload| [header, &payload].concat())
+                .collect()
+        })
+        .await;
+        let (device, mut net) = tokio::io::duplex(1 << 16);
+        let stats = Arc::new(Stats::default());
+        let (stop_tx, stop) = watch::channel(false);
+        let path = tokio::spawn(run(
+            device,
+            proxy,
+            FakeDns::default(),
+            Arc::clone(&stats),
+            stop,
+        ));
+        let app = SocketAddrV4::new(Ipv4Addr::new(172, 19, 0, 1), 40001);
+        let server = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 443);
+        net.write_all(&udp_packet(app, server, b"query"))
+            .await
+            .expect("packet in");
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), net.read(&mut buf))
+            .await
+            .expect("packet out")
+            .expect("read");
+        let packet = &buf[..n];
+        assert_eq!(packet[9], 17, "UDP");
+        assert_eq!(
+            u16::from_be_bytes([packet[24], packet[25]]),
+            108,
+            "UDP length"
+        );
+        assert!(packet[28..].iter().all(|&b| b == 8));
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), net.read(&mut buf))
+                .await
+                .is_err(),
+            "nothing else reaches the app"
+        );
         let _ = stop_tx.send(true);
         let _ = path.await;
     }

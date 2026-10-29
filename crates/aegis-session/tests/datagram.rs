@@ -99,11 +99,12 @@ async fn tc_n07_datagrams_keep_their_boundaries() {
     }
     // Empty datagrams can't be framed: dropped, not an error.
     assert!(!flow.send(&[]).expect("empty"));
+    // Too large for the tunnel: that one is dropped, the flow carries on.
     let too_big = vec![0u8; 16 * 1024 + 1];
-    assert_eq!(
-        flow.send(&too_big).expect_err("oversize").kind(),
-        std::io::ErrorKind::InvalidInput
-    );
+    assert!(!flow.send(&too_big).expect("oversize dropped"));
+    assert!(flow.send(b"still here").expect("send"));
+    let back = within(flow.recv()).await.expect("echo");
+    assert_eq!(back.as_ref(), b"still here");
     // A byte stream still works on the same session.
     drop(flow);
     within(async {
@@ -261,16 +262,17 @@ impl Raw {
 
 /// A raw client offering `features` to a gateway that accepts UDP.
 async fn raw_client(features: Vec<u16>) -> (Raw, Session, Incoming) {
+    raw_client_with(features, cfg("gw-1", true), 16_384).await
+}
+
+async fn raw_client_with(
+    features: Vec<u16>,
+    gateway: SessionConfig,
+    max_frame_payload: u32,
+) -> (Raw, Session, Incoming) {
     let (a, b) = tokio::io::duplex(256 * 1024);
     let server = tokio::spawn(async move {
-        server_handshake(
-            b,
-            cfg("gw-1", true),
-            Budget::root(64 << 20),
-            obs(),
-            "client-1",
-        )
-        .await
+        server_handshake(b, gateway, Budget::root(64 << 20), obs(), "client-1").await
     });
     let mut raw = Raw {
         io: a,
@@ -284,7 +286,7 @@ async fn raw_client(features: Vec<u16>) -> (Raw, Session, Incoming) {
         max_streams: 16,
         initial_stream_window: 65_536,
         initial_session_window: 1 << 20,
-        max_frame_payload: 16_384,
+        max_frame_payload,
         features,
     };
     raw.send(Frame::new(
@@ -550,4 +552,45 @@ async fn stray_transport_datagrams_are_dropped_not_fatal() {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!server.is_closed() && !client.is_closed());
+}
+
+#[tokio::test]
+async fn a_full_batch_of_datagram_still_lets_stream_data_through() {
+    // 64 KiB frames: one IPv6-maximum datagram fills a write batch by
+    // itself. Stream data that is ready goes in the same batch, not after
+    // every queued datagram.
+    let gateway = SessionConfig {
+        max_frame_payload: 64 * 1024,
+        ..cfg("gw-1", true)
+    };
+    let (mut raw, _session, mut incoming) =
+        raw_client_with(vec![FEATURE_DATAGRAM], gateway, 64 * 1024).await;
+    raw.send(open(1, Network::Udp)).await;
+    raw.send(open(3, Network::Tcp)).await;
+    let flow = incoming
+        .next()
+        .await
+        .expect("udp")
+        .accept_datagram()
+        .expect("udp");
+    let mut stream = incoming.next().await.expect("tcp").accept().expect("tcp");
+    for _ in 0..2 {
+        assert_eq!(
+            raw.recv_significant().await.expect("ack").frame_type,
+            FrameType::OpenAck
+        );
+    }
+    // Queued together, before the writer runs (single-threaded runtime).
+    for _ in 0..3 {
+        assert!(flow.send(&vec![9u8; 65_527]).expect("send"));
+    }
+    stream.write_all(b"stream data").await.expect("write");
+    let first = raw.recv_significant().await.expect("frame");
+    assert_eq!(first.frame_type, FrameType::Datagram);
+    let second = raw.recv_significant().await.expect("frame");
+    assert_eq!(
+        second.frame_type,
+        FrameType::Data,
+        "stream data waited behind datagrams"
+    );
 }
