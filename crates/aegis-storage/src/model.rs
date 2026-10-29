@@ -1134,6 +1134,18 @@ pub fn list_owned_nodes(c: &Connection, owner: &str) -> Result<Vec<NodeRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Who owns each device that has an owner: device id -> the owner's
+/// username, `None` when that account no longer exists.
+pub fn node_owner_names(
+    c: &Connection,
+) -> Result<std::collections::HashMap<String, Option<String>>> {
+    let mut stmt = c.prepare(
+        "SELECT n.id, p.username FROM nodes n LEFT JOIN principals p ON p.id = n.owner_principal_id WHERE n.owner_principal_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Enrollment token creator (the device's future owner).
 pub fn enrollment_token_creator(c: &Connection, verifier: &str) -> Result<Option<String>> {
     Ok(c.query_row(

@@ -547,8 +547,13 @@ async function renderDevices() {
       setTimeout(() => view("devices"), 700);
     });
     const d = inDays(n.certificate_expires_at);
+    // Whose device: the account that created its invitation.
+    const owner = !n.owner ? el("span", { class: "muted" }, ["—"])
+      : n.owner.username == null ? el("span", { class: "muted" }, ["deleted account"])
+      : n.owner.username;
     return el("tr", {}, [
       el("td", {}, [el("strong", {}, [n.name])]),
+      ...(all ? [el("td", {}, [owner])] : []),
       el("td", {}, [pill(n.status)]),
       el("td", {}, [when(n.created_at)]),
       el("td", {}, [n.status === "revoked" ? "—" : d == null ? "—" : d + " days (auto-renews)"]),
@@ -557,7 +562,7 @@ async function renderDevices() {
   });
   v.append(card(all ? "All devices" : "My devices", [
     rows.length
-      ? el("table", {}, [el("thead", {}, [el("tr", {}, [el("th", {}, ["Name"]), el("th", {}, ["Status"]), el("th", {}, ["Enrolled"]), el("th", {}, ["Certificate"]), el("th", {}, [""])])]), el("tbody", {}, rows)])
+      ? el("table", {}, [el("thead", {}, [el("tr", {}, [el("th", {}, ["Name"]), ...(all ? [el("th", {}, ["Owner"])] : []), el("th", {}, ["Status"]), el("th", {}, ["Enrolled"]), el("th", {}, ["Certificate"]), el("th", {}, [""])])]), el("tbody", {}, rows)])
       : el("p", { class: "muted" }, ["No devices yet. Create an invitation above."]),
   ]));
 }

@@ -191,7 +191,11 @@ fn main() -> ExitCode {
         .store
         .clone()
         .unwrap_or_else(|| PathBuf::from(&cfg.management.config_store));
+    // At least two workers, also on a one-core server: device traffic keeps
+    // moving while another task is busy.
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().max(2));
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
     else {

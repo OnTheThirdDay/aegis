@@ -224,6 +224,10 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         let (s, v) = c.call(reqwest::Method::GET, "/devices", None).await;
         assert_eq!(s, 200);
         assert_eq!(v["items"][0]["name"], "laptop");
+        // Administrators see whose device it is.
+        let (s, v) = c.call(reqwest::Method::GET, "/devices?scope=all", None).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["items"][0]["owner"]["username"], "admin", "{v}");
 
         // Tunnel session: a loopback destination is refused *by the gateway
         // policy* (0x02), which proves inner mTLS + registry admission.
