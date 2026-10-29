@@ -54,6 +54,20 @@ impl From<rusqlite::Error> for StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Run blocking database work (waiting for the connection, a query, a busy
+/// database) without holding up the async runtime. On a worker of a
+/// multi-threaded runtime the worker first hands its queued tasks (tunnel
+/// traffic among them) to another thread; anywhere else (no runtime, a
+/// blocking thread, a single-threaded runtime) `f` just runs.
+fn off_runtime<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
     path: PathBuf,
@@ -133,17 +147,18 @@ impl Store {
     /// Run `f` inside one IMMEDIATE transaction: all of its writes commit
     /// atomically and durably, or none do.
     pub fn tx<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
-        let mut conn = self.lock();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let out = f(&tx)?;
-        tx.commit()?;
-        Ok(out)
+        off_runtime(|| {
+            let mut conn = self.lock();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let out = f(&tx)?;
+            tx.commit()?;
+            Ok(out)
+        })
     }
 
     /// Read-only access.
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.lock();
-        f(&conn)
+        off_runtime(|| f(&self.lock()))
     }
 
     /// Read-only access with a caller-defined error type.
@@ -151,14 +166,15 @@ impl Store {
         &self,
         f: impl FnOnce(&Connection) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
-        let conn = self.lock();
-        f(&conn)
+        off_runtime(|| f(&self.lock()))
     }
 
     /// Integrity check (TC-C04 corruption detection).
     pub fn integrity_check(&self) -> Result<()> {
-        let conn = self.lock();
-        let r: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let r: String = off_runtime(|| {
+            self.lock()
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        })?;
         if r == "ok" {
             Ok(())
         } else {
