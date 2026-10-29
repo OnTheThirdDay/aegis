@@ -57,7 +57,11 @@ The channel answers these as not implemented, and the UI treats that as "nothing
 ## Consequences
 
 - One UI and one core on Android and iOS. The iOS-specific code is two Swift files.
-- Signing (an App ID with the network extension capability and the App Group, a provisioning profile per target) and an Ad Hoc build come next. They need the Apple account.
+- **Signing (Ad Hoc):**
+  - Release builds sign manually with an Apple Distribution certificate and an Ad Hoc profile per target ("AegisBorne Ad Hoc App" and "AegisBorne Ad Hoc Tunnel").
+  - The release workflow recreates both profiles through the App Store Connect API on every build, so each build includes every registered iPhone, and exports `aegis-client-ios.ipa` (`ios/ExportOptions.plist`).
+  - Debug builds keep automatic signing.
+  - The secrets are listed in RELEASING.md.
 - **Not yet verified**, all on a real iPhone:
   - the VPN connecting;
   - the extension staying under the memory limit during a large download;
