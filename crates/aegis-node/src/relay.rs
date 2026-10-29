@@ -257,12 +257,10 @@ pub async fn relay_datagrams(
             r = socket.recv(&mut buf) => match r {
                 Ok(n) => {
                     deadline = tokio::time::Instant::now() + idle;
-                    // Larger than the tunnel carries: dropped, like any
-                    // datagram a path can't fit.
-                    if n <= flow.max_datagram() {
-                        if let Err(e) = flow.send(&buf[..n]) {
-                            return RelayOutcome::Error(e.kind());
-                        }
+                    // Larger than the tunnel carries: dropped (and counted)
+                    // by the flow, like any datagram a path can't fit.
+                    if let Err(e) = flow.send(&buf[..n]) {
+                        return RelayOutcome::Error(e.kind());
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
