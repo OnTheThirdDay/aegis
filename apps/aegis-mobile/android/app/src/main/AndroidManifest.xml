@@ -3,9 +3,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Removing the old app once AegisBorne took over (the user confirms). -->
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
+    <!-- Moving from AegisNet (net.aegis.app) to AegisBorne: only apps signed
+         with our key may hold it (Migration.kt). -->
+    <permission
+        android:name="borne.aegis.app.permission.MIGRATE"
+        android:protectionLevel="signature" />
 
     <application
-        android:label="AegisNet"
+        android:label="@string/app_name"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false">

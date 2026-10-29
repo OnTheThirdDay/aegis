@@ -407,7 +407,7 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         let (s, v) = c.call(reqwest::Method::POST, "/auth/2fa/setup", None).await;
         assert_eq!(s, 200, "{v}");
         let secret = aegis_management::totp::base32_decode(v["secret"].as_str().expect("secret")).expect("base32");
-        assert!(v["uri"].as_str().is_some_and(|u| u.starts_with("otpauth://totp/AegisNet:admin?")));
+        assert!(v["uri"].as_str().is_some_and(|u| u.starts_with("otpauth://totp/AegisBorne:admin?")));
         assert!(v["qr"].as_array().is_some_and(|rows| rows.len() >= 21));
         let now = aegis_management::totp::step_of(aegis_storage::now_unix());
         let code = |step: i64| format!("{:06}", aegis_management::totp::code_at(&secret, step as u64));

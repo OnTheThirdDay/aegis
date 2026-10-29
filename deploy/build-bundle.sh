@@ -3,9 +3,9 @@
 # .github/workflows/release.yml). Run on Linux/WSL from the repository:
 #
 #   sh deploy/build-bundle.sh [OUT_DIR]
-#   sudo sh OUT_DIR/aegisnet-gateway/install.sh --from OUT_DIR/aegisnet-gateway
+#   sudo sh OUT_DIR/aegisborne-gateway/install.sh --from OUT_DIR/aegisborne-gateway
 #
-# Produces OUT_DIR/aegisnet-gateway/ with the same layout as the release
+# Produces OUT_DIR/aegisborne-gateway/ with the same layout as the release
 # image context: bin/<arch>/{aegisd,aegisctl,cloudflared}, clients/,
 # Dockerfile and install.sh; the installer builds the image from it.
 # cloudflared is the latest release (or $CLOUDFLARED_VERSION), checked
@@ -21,7 +21,7 @@ case "$(uname -m)" in
   aarch64) ARCH=arm64 ;;
   *) echo "unsupported build architecture" >&2; exit 1 ;;
 esac
-DEST="$OUT/aegisnet-gateway"
+DEST="$OUT/aegisborne-gateway"
 
 cd "$REPO"
 cargo build --locked --release -p aegisd -p aegisctl

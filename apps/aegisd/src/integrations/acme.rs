@@ -2,7 +2,7 @@
 //!
 //! * HTTP-01: a challenge responder listens on the HTTP port only while an
 //!   order is pending and answers nothing but `/.well-known/acme-challenge/`.
-//! * DNS-01: an AegisNet-labelled TXT record is created through the
+//! * DNS-01: an AegisBorne-labelled TXT record is created through the
 //!   Cloudflare API and deleted afterwards (by id).
 //! * The issued certificate is validated (chain, name, key) before it is
 //!   published as an SNI alternate on the edge listener; the private edge

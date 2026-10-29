@@ -1,4 +1,4 @@
-//! `aegisd` — AegisNet service.
+//! `aegisd` — AegisBorne service.
 //!
 //! Privacy defaults (11 §3): no routine stdout/stderr logs. The only console
 //! output is a short, secret-free fatal startup code (plus one secret-free

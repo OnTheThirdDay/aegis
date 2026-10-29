@@ -1,4 +1,4 @@
-//! AegisNet portable client: paste an invitation, connect, browse.
+//! AegisBorne portable client: paste an invitation, connect, browse.
 //!
 //! * Several servers can be joined; one is connected at a time.
 //! * No installation and no administrator rights: data lives next to the
@@ -327,7 +327,7 @@ impl App {
                     }
                 }
                 if s.vpn_active {
-                    ui.label(RichText::new("System VPN is on: every app on this computer goes through AegisNet.").color(GREEN));
+                    ui.label(RichText::new("System VPN is on: every app on this computer goes through AegisBorne.").color(GREEN));
                     let c = &s.vpn_counters;
                     ui.label(RichText::new(format!(
                         "{} connections open ({} in total) · {} UDP flows · {} DNS lookups",
@@ -440,7 +440,7 @@ impl App {
                     ui.checkbox(&mut self.edited.system_proxy, "Set as the Windows system proxy while connected");
                 }
                 if aegis_vpn::supported() {
-                    ui.checkbox(&mut self.edited.system_vpn, "System VPN: send every app's traffic through AegisNet while connected");
+                    ui.checkbox(&mut self.edited.system_vpn, "System VPN: send every app's traffic through AegisBorne while connected");
                     ui.add_enabled(
                         self.edited.system_vpn,
                         egui::Checkbox::new(&mut self.edited.kill_switch, "Kill switch: block internet access if the system VPN stops unexpectedly"),
@@ -483,7 +483,7 @@ impl App {
                 }
                 ui.separator();
                 ui.label(RichText::new(format!("Data folder: {}", self.data_dir.display())).small().weak());
-                ui.label(RichText::new(format!("AegisNet client {}", env!("CARGO_PKG_VERSION"))).small().weak());
+                ui.label(RichText::new(format!("AegisBorne client {}", env!("CARGO_PKG_VERSION"))).small().weak());
             });
     }
 }
@@ -561,7 +561,7 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
-            ui.label(RichText::new("AegisNet").size(22.0).strong());
+            ui.label(RichText::new("AegisBorne").size(22.0).strong());
             ui.separator();
             self.status_line(ui, &s);
             if let Some(e) = &s.error {
@@ -630,13 +630,13 @@ fn main() -> eframe::Result {
         .filter(|t| t.starts_with("aegis1:"));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("AegisNet")
+            .with_title("AegisBorne")
             .with_inner_size([420.0, 560.0])
             .with_min_inner_size([360.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "AegisNet",
+        "AegisBorne",
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, data_dir, initial_invite)))),
     )

@@ -158,7 +158,7 @@ impl Report {
         to_otlp(std::slice::from_ref(self))
     }
 
-    /// Parse every AegisNet report in an OTLP/JSON logs document. Records
+    /// Parse every AegisBorne report in an OTLP/JSON logs document. Records
     /// from other scopes are ignored.
     pub fn from_otlp(doc: &Value) -> Result<Vec<Report>, &'static str> {
         let resources = doc
@@ -249,7 +249,7 @@ impl Report {
             });
         }
         if out.is_empty() {
-            return Err("the file holds no AegisNet diagnostic report");
+            return Err("the file holds no AegisBorne diagnostic report");
         }
         Ok(out)
     }

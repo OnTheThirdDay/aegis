@@ -1,8 +1,8 @@
-# AegisNet service for ordinary SOCKS/HTTP/WebSocket operation (no TUN).
+# AegisBorne service for ordinary SOCKS/HTTP/WebSocket operation (no TUN).
 # Requires a static "aegisnet" user owning /etc/aegisnet/secrets (0700).
 # Validate on each supported distribution before release (06 §5).
 [Unit]
-Description=AegisNet gateway/agent
+Description=AegisBorne gateway/agent
 After=network-online.target
 Wants=network-online.target
 

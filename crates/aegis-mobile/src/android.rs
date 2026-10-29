@@ -1,4 +1,4 @@
-//! JNI entry points for the Android app (`net.aegis.app.Native`).
+//! JNI entry points for the Android app (`borne.aegis.app.Native`).
 //! Each takes and returns strings; results are the JSON of the matching
 //! crate function.
 
@@ -19,7 +19,7 @@ fn ret(env: &mut JNIEnv, v: Value) -> jstring {
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_enroll(
+pub extern "system" fn Java_borne_aegis_app_Native_enroll(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
@@ -32,7 +32,7 @@ pub extern "system" fn Java_net_aegis_app_Native_enroll(
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_servers(
+pub extern "system" fn Java_borne_aegis_app_Native_servers(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
@@ -44,7 +44,7 @@ pub extern "system" fn Java_net_aegis_app_Native_servers(
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_select(
+pub extern "system" fn Java_borne_aegis_app_Native_select(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
@@ -57,7 +57,7 @@ pub extern "system" fn Java_net_aegis_app_Native_select(
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_forget(
+pub extern "system" fn Java_borne_aegis_app_Native_forget(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
@@ -70,7 +70,7 @@ pub extern "system" fn Java_net_aegis_app_Native_forget(
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_vpnConfig(
+pub extern "system" fn Java_borne_aegis_app_Native_vpnConfig(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -80,7 +80,7 @@ pub extern "system" fn Java_net_aegis_app_Native_vpnConfig(
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_start(
+pub extern "system" fn Java_borne_aegis_app_Native_start(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
@@ -93,14 +93,17 @@ pub extern "system" fn Java_net_aegis_app_Native_start(
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_stop(mut env: JNIEnv, _class: JClass) -> jstring {
+pub extern "system" fn Java_borne_aegis_app_Native_stop(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
     let v = crate::stop();
     ret(&mut env, v)
 }
 
 #[no_mangle]
 #[allow(unsafe_code)]
-pub extern "system" fn Java_net_aegis_app_Native_status(
+pub extern "system" fn Java_borne_aegis_app_Native_status(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {

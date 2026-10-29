@@ -1,6 +1,6 @@
-# AegisNet
+# AegisBorne
 
-AegisNet is a security-first modular proxy engine written in Rust. It implements the design package in [`aegis-spec/`](aegis-spec/README.md) (v0.3-draft) from its M1 core MVP up to a subset of M2 management.
+AegisBorne is a security-first modular proxy engine written in Rust. It implements the design package in [`aegis-spec/`](aegis-spec/README.md) (v0.3-draft) from its M1 core MVP up to a subset of M2 management.
 
 > **Status: prototype.** This build is not production-qualified.
 >
@@ -155,7 +155,7 @@ Where the spec left questions open (PKI, AGP control codec, client tunnel config
 
 ## Not promised
 
-AegisNet does not promise:
+AegisBorne does not promise:
 
 - undetectable traffic;
 - unrestricted or free CDN capacity;

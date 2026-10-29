@@ -72,7 +72,7 @@ pub fn parse_release(release: &Value, asset: &str) -> Result<Release, String> {
 
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .user_agent(concat!("aegisnet/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("aegisborne/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
         .build()

@@ -106,7 +106,7 @@ pub fn uri(username: &str, secret: &[u8]) -> String {
         })
         .collect();
     format!(
-        "otpauth://totp/AegisNet:{label}?secret={}&issuer=AegisNet&algorithm=SHA1&digits={DIGITS}&period={PERIOD}",
+        "otpauth://totp/AegisBorne:{label}?secret={}&issuer=AegisBorne&algorithm=SHA1&digits={DIGITS}&period={PERIOD}",
         base32(secret)
     )
 }

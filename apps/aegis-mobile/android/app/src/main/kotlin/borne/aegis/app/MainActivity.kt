@@ -1,7 +1,8 @@
-package net.aegis.app
+package borne.aegis.app
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
@@ -13,12 +14,12 @@ import org.json.JSONObject
 import java.util.concurrent.Executors
 
 /**
- * Hosts the Flutter UI and answers its calls on the `aegisnet/client`
+ * Hosts the Flutter UI and answers its calls on the `aegisborne/client`
  * channel. Results are the Rust core's JSON strings.
  */
 class MainActivity : FlutterActivity() {
     companion object {
-        private const val CHANNEL = "aegisnet/client"
+        private const val CHANNEL = "aegisborne/client"
         private const val VPN_CONSENT = 1
     }
 
@@ -37,8 +38,18 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun takeShared(intent: Intent?) {
-        if (intent?.action == Intent.ACTION_SEND) {
-            sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+        when (intent?.action) {
+            Intent.ACTION_SEND -> sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+            Migration.ACTION_INSTALL_STATUS -> installStatus(intent)
+        }
+    }
+
+    /** Installing AegisBorne: show the system's confirmation when asked. */
+    private fun installStatus(intent: Intent) {
+        if (intent.getIntExtra(PackageInstaller.EXTRA_STATUS, 0) == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            @Suppress("DEPRECATION")
+            val confirm = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT) ?: return
+            startActivity(confirm)
         }
     }
 
@@ -61,6 +72,23 @@ class MainActivity : FlutterActivity() {
                 "sharedText" -> {
                     result.success(sharedText)
                     sharedText = null
+                }
+                // Moving from AegisNet to AegisBorne (Migration.kt).
+                "migration" -> result.success(Migration.state(this))
+                "importLegacy" -> background(result) { Migration.import(this) }
+                "installBorne" -> {
+                    val message = try {
+                        Migration.installBorne(this)
+                    } catch (e: Exception) {
+                        e.message ?: e.toString()
+                    }
+                    val out = JSONObject().put("ok", true)
+                    if (message != null) out.put("message", message)
+                    result.success(out.toString())
+                }
+                "uninstallLegacy" -> {
+                    Migration.uninstallLegacy(this)
+                    result.success(JSONObject().put("ok", true).toString())
                 }
                 else -> result.notImplemented()
             }

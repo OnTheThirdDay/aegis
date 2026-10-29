@@ -1,4 +1,4 @@
-# AegisNet mobile app
+# AegisBorne mobile app
 
 Flutter UI over the Rust core in `crates/aegis-mobile` ([ADR-0011](../../docs/adr/0011-mobile-client.md)). Android first; iOS later on the same core.
 
@@ -16,15 +16,20 @@ Flutter UI over the Rust core in `crates/aegis-mobile` ([ADR-0011](../../docs/ad
 
    ```sh
    cd apps/aegis-mobile
-   flutter build apk --release --split-per-abi --target-platform android-arm64
+   flutter build apk --release --flavor borne --split-per-abi --target-platform android-arm64
    ```
+
+   Every Android build names a flavor (`flutter run --flavor borne` too):
+   - `borne`: AegisBorne, `borne.aegis.app`.
+   - `legacy`: the last update of the old app ID, AegisNet (`net.aegis.app`). It carries AegisBorne at `android/app/src/legacy/assets/aegisborne.apk` (copied in by the release workflow, not committed), installs it and hands its servers over. See `Migration.kt` and [ADR-0016](../../docs/adr/0016-rename-to-aegisborne.md).
 
    Release signing reads `android/key.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`) or the `AEGIS_ANDROID_*` environment variables; otherwise the debug key is used.
 
 ## Layout
 
-- `lib/`: the UI (`main.dart`) and the method channel `aegisnet/client` (`client.dart`).
+- `lib/`: the UI (`main.dart`) and the method channel `aegisborne/client` (`client.dart`).
 - `android/app/src/main/kotlin/net/aegis/app/`:
   - `MainActivity`: the channel and VPN consent;
   - `AegisVpnService`: the VPN interface and foreground service;
-  - `Native`: the JNI bindings.
+  - `Native`: the JNI bindings;
+  - `Migration`, `MigrationProvider`: moving from the old app to AegisBorne.

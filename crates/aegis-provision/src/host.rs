@@ -84,7 +84,7 @@ pub fn bootstrap(root: &Path, node_id: &str, inner_server_name: &str) -> Result<
         runtime_uid: uid,
         runtime_gid: gid,
     };
-    let root_ca = pki::generate_offline_root("AegisNet offline root")
+    let root_ca = pki::generate_offline_root("AegisBorne offline root")
         .map_err(|_| Error("root_generation_failed"))?;
     // Root escrow is separate from runtime mount. The online intermediate has
     // path length zero and one-year validity; leaves retain their 90-day cap.
@@ -92,7 +92,7 @@ pub fn bootstrap(root: &Path, node_id: &str, inner_server_name: &str) -> Result<
     secrets.put("root.pem", &root_ca.cert_pem, false)?;
     let issuer = pki::generate_intermediate(
         &root_ca,
-        "AegisNet device issuer",
+        "AegisBorne device issuer",
         Duration::from_secs(365 * 86400),
     )
     .map_err(|_| Error("issuer_generation_failed"))?;

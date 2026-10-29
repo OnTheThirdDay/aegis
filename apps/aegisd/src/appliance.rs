@@ -4,7 +4,7 @@
 //!
 //! * a device PKI (root + online issuer) for inner mTLS enrollment;
 //! * a separate web CA for the HTTPS console and the outer (edge) listener,
-//!   so web certificates can never authenticate as an AegisNet gateway;
+//!   so web certificates can never authenticate as an AegisBorne gateway;
 //! * the owner account `admin` with a random password that must be changed
 //!   at first sign-in. The password is written once to
 //!   `DIR/initial-admin-password` (0600) and removed after it is changed;
@@ -381,7 +381,7 @@ pub fn rotate_issuer_with(secrets: &SecretStore, root_key_pem: &str) -> Result<C
             .to_string(),
         key_pem: root_key_pem.to_owned(),
     };
-    let issuer = pki::generate_intermediate(&root, "AegisNet device issuer", ISSUER_LIFETIME)
+    let issuer = pki::generate_intermediate(&root, "AegisBorne device issuer", ISSUER_LIFETIME)
         .map_err(|_| err("E_ISSUER_GENERATION"))?;
     let chain = format!("{}{}", issuer.cert_pem, root.cert_pem);
     publish_pair(
@@ -530,9 +530,9 @@ pub fn init(dir: &Path, opts: &InitOptions) -> Result<PathBuf, String> {
 
     // Device PKI: root (lab mode: kept on this host, exportable/removable
     // from the console) and a path-length-zero online issuer.
-    let root =
-        pki::generate_offline_root("AegisNet device root").map_err(|_| err("E_ROOT_GENERATION"))?;
-    let issuer = pki::generate_intermediate(&root, "AegisNet device issuer", ISSUER_LIFETIME)
+    let root = pki::generate_offline_root("AegisBorne device root")
+        .map_err(|_| err("E_ROOT_GENERATION"))?;
+    let issuer = pki::generate_intermediate(&root, "AegisBorne device issuer", ISSUER_LIFETIME)
         .map_err(|_| err("E_ISSUER_GENERATION"))?;
     put(&secrets, "device-root.pem", &root.cert_pem)?;
     put(&secrets, ROOT_KEY, &root.key_pem)?;
@@ -551,7 +551,7 @@ pub fn init(dir: &Path, opts: &InitOptions) -> Result<PathBuf, String> {
     issue_gateway_identity(&secrets, &online_issuer)?;
 
     // Web PKI for the console and the outer listener.
-    let web = pki::generate_ca("AegisNet web CA", pki::DEFAULT_CA_VALIDITY)
+    let web = pki::generate_ca("AegisBorne web CA", pki::DEFAULT_CA_VALIDITY)
         .map_err(|_| err("E_WEB_CA_GENERATION"))?;
     put(&secrets, "web-ca.pem", &web.cert_pem)?;
     put(&secrets, "web-ca-key.pem", &web.key_pem)?;

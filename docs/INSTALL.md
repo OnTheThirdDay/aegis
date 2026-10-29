@@ -1,4 +1,4 @@
-# Installing, setting up and upgrading an AegisNet server
+# Installing, setting up and upgrading an AegisBorne server
 
 This guide is for anyone setting up a gateway on a new server. Normal use takes the steps in order:
 
@@ -30,7 +30,7 @@ On macOS, install Docker Desktop and make sure it's running. Enable *Start Docke
 
 **Ports:** you don't need to check them. The installer uses these defaults and, when one is already taken (for example by nginx in a v2ray + nginx setup), picks a free one instead and shows it in its summary. Existing v2ray, nginx and cloudflared services are never modified.
 
-| Port | Used by AegisNet for | If taken | Option to set it |
+| Port | Used by AegisBorne for | If taken | Option to set it |
 |---|---|---|---|
 | 8443 | the HTTPS web console | 8453, 8463, 9443 | `--console-port N` |
 | 443 | devices connecting directly | 8444, 8454, 9444 | `--port N` |
@@ -145,7 +145,7 @@ An administrator signed in this way gets the whole console, except exporting the
    2. In Connectivity → Cloudflare Tunnel, paste the token and press **Continue**. Pick the domain, enter a subdomain nobody uses yet (for example `aegis`), press **Preview changes**, then **Create tunnel and connect**.
    3. After about a minute the status becomes **active**. Devices then connect to `wss://<subdomain>.<domain>/agp`. No inbound port needs to be open, and port 443/8444 can stay closed in the firewall.
 
-   AegisNet creates its *own* tunnel and one DNS record labelled as AegisNet's. Existing tunnels (for example v2ray's) and DNS records are not touched. The token is used once and not stored unless you tick "Remember the token".
+   AegisBorne creates its *own* tunnel and one DNS record labelled as AegisBorne's. Existing tunnels (for example v2ray's) and DNS records are not touched. The token is used once and not stored unless you tick "Remember the token".
 
    **Option B: direct connection** (LAN, or a public server without Cloudflare)
 
@@ -173,7 +173,7 @@ An administrator signed in this way gets the whole console, except exporting the
 ## 5. Connect a device
 
 1. Download the client app from the console or the user portal (**Devices → Client apps**). It is portable: no installation and no admin rights needed.
-   - macOS: open the `.dmg` and drag **AegisNet** to Applications. The app isn't signed with an Apple Developer ID, so the first time macOS refuses to open it: open **System Settings → Privacy & Security** and press **Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/AegisNet.app`).
+   - macOS: open the `.dmg` and drag **AegisBorne** to Applications. The app isn't signed with an Apple Developer ID, so the first time macOS refuses to open it: open **System Settings → Privacy & Security** and press **Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/AegisBorne.app`).
 2. Open it, press **Paste** (or drop the `.aegis` file on the window), then **Join and connect**.
 3. Point apps at the local proxy:
    - **SOCKS5:** `127.0.0.1:1080`. In Firefox, also tick "Proxy DNS when using SOCKS v5".
@@ -183,7 +183,7 @@ An administrator signed in this way gets the whole console, except exporting the
 
 **System VPN on a computer** (Windows 10/11, macOS 11 or later): every app's TCP, UDP and DNS go through your server, like on a phone; local networks stay direct.
 1. **Settings → Install VPN helper**, and approve the administrator prompt. This installs a small background helper once (a Windows service, or a macOS launch daemon). Only your user account (and administrators) can control it.
-2. Tick **System VPN: send every app's traffic through AegisNet while connected**, press **Save**.
+2. Tick **System VPN: send every app's traffic through AegisBorne while connected**, press **Save**.
 3. While connected, the window shows *System VPN is on*. Disconnecting or quitting the app turns it off.
 
 **Kill switch** (optional, under the System VPN setting): nothing gets out around the VPN. Disconnecting or quitting the app turns it off as usual; if the app or the VPN stops unexpectedly, the internet stays blocked (your local network and your server still work) until you connect again or press **Unblock internet** in the app. Restarting the computer always clears it.
@@ -193,8 +193,8 @@ After updating the app, Settings may offer **Update VPN helper** (another admini
 Headless machines: `aegisctl join --dir DIR < invite.aegis`, then `aegisctl connect --dir DIR`.
 
 **Android phones** (Android 8 or later):
-1. On the phone, open the console or the user portal, then **Devices → Client apps → AegisNet client for Android**. Allow your browser to install apps when Android asks; this is a one-time setting.
-2. Send yourself the invitation (for example by chat or mail). Share it to **AegisNet**, or copy it and press **Paste** in the app. Then press **Join**.
+1. On the phone, open the console or the user portal, then **Devices → Client apps → AegisBorne client for Android**. Allow your browser to install apps when Android asks; this is a one-time setting.
+2. Send yourself the invitation (for example by chat or mail). Share it to **AegisBorne**, or copy it and press **Paste** in the app. Then press **Join**.
 3. Press the power button and accept Android's VPN request. While connected, apps on the phone reach the internet through your server; local networks stay direct.
 
 The phone app carries TCP and UDP, so calls, games and QUIC work through it too. With a server older than this version only TCP works, and apps fall back from QUIC to TCP by themselves.
@@ -271,7 +271,7 @@ docker exec aegis aegisctl cloudflared auto-update off   # or on
 
 Use your `--name` instead of `aegis` if you installed with one. Upgrading the gateway (above) also brings the connector that was current when the image was built.
 
-A cloudflared you run yourself, outside AegisNet (for example on another machine), isn't managed by the gateway. Update it the way you installed it: your package manager (`apt`/`dnf`, Cloudflare's repository at pkg.cloudflare.com), `brew upgrade cloudflared` on macOS, or a newer `cloudflare/cloudflared` image tag for Docker. Then restart its service.
+A cloudflared you run yourself, outside AegisBorne (for example on another machine), isn't managed by the gateway. Update it the way you installed it: your package manager (`apt`/`dnf`, Cloudflare's repository at pkg.cloudflare.com), `brew upgrade cloudflared` on macOS, or a newer `cloudflare/cloudflared` image tag for Docker. Then restart its service.
 
 ## Optional: direct QUIC for games and calls
 
@@ -334,7 +334,7 @@ sudo sh install.sh --uninstall            # keeps the data (Docker volume aegis-
 sudo sh install.sh --uninstall --purge    # also deletes all data, keys and settings
 ```
 
-Removing AegisNet does not delete its Cloudflare tunnel. To remove the tunnel and its DNS record, disconnect it in **Connectivity** before uninstalling.
+Removing AegisBorne does not delete its Cloudflare tunnel. To remove the tunnel and its DNS record, disconnect it in **Connectivity** before uninstalling.
 
 ## Troubleshooting
 

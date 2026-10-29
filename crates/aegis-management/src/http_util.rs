@@ -93,7 +93,7 @@ fn title(status: StatusCode) -> &'static str {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let p = Problem {
-            kind: format!("https://aegisnet.invalid/problems/{}", self.code),
+            kind: format!("https://aegisborne.invalid/problems/{}", self.code),
             title: title(self.status).into(),
             status: self.status.as_u16(),
             detail: self.detail,

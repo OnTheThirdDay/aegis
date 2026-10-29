@@ -1,6 +1,6 @@
 [package]
 name = "aegisd"
-description = "AegisNet gateway/agent service."
+description = "AegisBorne gateway/agent service."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -13,7 +13,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
-pub const PIPE: &str = r"\\.\pipe\aegisnet-vpn";
+pub const PIPE: &str = r"\\.\pipe\aegisborne-vpn";
 const ERROR_PIPE_BUSY: i32 = 231;
 
 /// A security descriptor, kept for the life of the process.

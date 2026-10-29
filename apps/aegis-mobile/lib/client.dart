@@ -107,13 +107,39 @@ class Status {
   final String? transport;
 }
 
+/// Moving from the old Android app (AegisNet, `net.aegis.app`) to AegisBorne
+/// (android/.../Migration.kt).
+class Migration {
+  Migration({this.legacy = false, this.moved = false, this.otherInstalled = false});
+
+  factory Migration.fromJson(Map<String, dynamic> j) => Migration(
+        legacy: j['legacy'] == true,
+        moved: j['moved'] == true,
+        otherInstalled: j['other_installed'] == true,
+      );
+
+  /// This is the old app.
+  final bool legacy;
+
+  /// The old app: AegisBorne took its servers.
+  final bool moved;
+
+  /// The other app (AegisBorne in the old app, and the reverse) is installed.
+  final bool otherInstalled;
+}
+
+/// What taking the old app's servers found: how many it added, and the old
+/// app's state (`absent`, `outdated`: too old to hand them over,
+/// `untrusted`: not signed by us, `done`: taken before, `ok`).
+typedef Imported = ({int count, String legacy});
+
 DateTime? _time(Object? unix) =>
     unix is num ? DateTime.fromMillisecondsSinceEpoch(unix.toInt() * 1000) : null;
 
 /// The platform side (Android: MainActivity + AegisVpnService over the
 /// Rust core). Results arrive as the core's JSON.
 class Client {
-  static const _channel = MethodChannel('aegisnet/client');
+  static const _channel = MethodChannel('aegisborne/client');
 
   Future<Map<String, dynamic>> _call(String method, [Map<String, Object?>? args]) async {
     final raw = await _channel.invokeMethod<String>(method, args);
@@ -146,4 +172,29 @@ class Client {
 
   /// An invitation shared to the app from another app, once.
   Future<String?> sharedText() => _channel.invokeMethod<String>('sharedText');
+
+  /// Where the move to AegisBorne stands (nothing to move on iOS, or when
+  /// the platform can't tell).
+  Future<Migration> migration() async {
+    try {
+      return Migration.fromJson(await _call('migration'));
+    } on MissingPluginException {
+      return Migration();
+    } on ClientError {
+      return Migration();
+    }
+  }
+
+  /// AegisBorne: take the old app's servers, once.
+  Future<Imported> importLegacy() async {
+    final j = await _call('importLegacy');
+    return (count: (j['imported'] as num?)?.toInt() ?? 0, legacy: (j['legacy'] as String?) ?? 'absent');
+  }
+
+  /// The old app: install the AegisBorne it carries, or open it. Returns a
+  /// message when the user has something to do first.
+  Future<String?> installBorne() async => (await _call('installBorne'))['message'] as String?;
+
+  /// Ask Android to uninstall the old app (the user confirms).
+  Future<void> uninstallLegacy() => _call('uninstallLegacy');
 }

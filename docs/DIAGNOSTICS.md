@@ -1,6 +1,6 @@
 # Diagnosing problems
 
-When a device can't connect, or sites don't load through AegisNet, record what the gateway and the device see while the problem happens. The console then explains what went wrong and what to do.
+When a device can't connect, or sites don't load through AegisBorne, record what the gateway and the device see while the problem happens. The console then explains what went wrong and what to do.
 
 Diagnostics are **off** until someone turns them on, and they turn themselves off again. Nothing is written to disk.
 
@@ -13,7 +13,7 @@ Diagnostics are **off** until someone turns them on, and they turn themselves of
 
 **On the device (its user):**
 
-3. Open the AegisNet app → **Troubleshooting**.
+3. Open the AegisBorne app → **Troubleshooting**.
 4. Choose a duration and press **Start recording**.
 5. Reproduce the problem: connect, open the sites or apps that fail.
 6. Press **Stop and send**. If you don't, the app sends the report by itself when its recording ends.

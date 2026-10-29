@@ -1,8 +1,8 @@
 # Implementation status and test traceability
 
-Evidence base: developer runs on WSL2 Ubuntu 22.04 x86_64, Rust 1.97.1, 2026-10-28.
+Evidence base: developer runs on WSL2 Ubuntu 22.04 x86_64, Rust 1.97.1, 2026-10-29.
 
-- `cargo test --workspace`: 316 tests, all passing. The concurrency-sensitive suites (session, node, core, management) passed 15 consecutive loops with no failures on 2026-10-25.
+- `cargo test --workspace`: 321 tests, all passing. The concurrency-sensitive suites (session, node, core, management) passed 15 consecutive loops with no failures on 2026-10-25.
 - `cargo clippy --workspace --all-targets -D warnings`: clean; the desktop VPN helper also for the Windows and macOS targets.
 - `cargo check --workspace --target x86_64-pc-windows-gnu`: clean.
 - `xtask arch-check`: clean, including its self-test. `cargo deny check`: no errors.

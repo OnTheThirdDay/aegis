@@ -935,7 +935,7 @@ impl Worker {
         };
         let path = self
             .data_dir
-            .join(format!("aegisnet-diagnostics-{}.otlp.json", now()));
+            .join(format!("aegisborne-diagnostics-{}.otlp.json", now()));
         let body = serde_json::to_vec_pretty(&report.to_otlp()).unwrap_or_default();
         let message = match std::fs::write(&path, body) {
             Ok(()) => (true, format!("Saved to {}", path.display())),

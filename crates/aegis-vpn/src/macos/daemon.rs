@@ -10,7 +10,7 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 
 /// Journal and other state, readable by root only.
-const STATE_DIR: &str = "/Library/Application Support/AegisNet";
+pub(super) const STATE_DIR: &str = "/Library/Application Support/AegisBorne";
 
 pub fn run(allow: &str) -> Result<(), String> {
     let allowed: u32 = allow.parse().map_err(|_| "invalid user".to_owned())?;

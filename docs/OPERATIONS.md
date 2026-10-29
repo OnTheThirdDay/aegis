@@ -52,7 +52,7 @@ aegisctl api POST /nodes/enrollment --data '{"role":"agent"}'     # prints a one
 On the client, the private key never leaves the client:
 
 ```sh
-aegisctl pki csr --node-id laptop-1 --out /etc/aegisnet-client/secrets/identity
+aegisctl pki csr --node-id laptop-1 --out /etc/aegisborne-client/secrets/identity
 ```
 
 Copy `csr.pem` to the gateway, then on the gateway:

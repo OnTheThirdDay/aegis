@@ -1,4 +1,4 @@
-package net.aegis.app
+package borne.aegis.app
 
 import android.content.Context
 import java.io.File
