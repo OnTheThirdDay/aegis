@@ -1,4 +1,4 @@
-# Rootless AegisNet gateway image (06 §4). No TUN, no NET_ADMIN.
+# Rootless AegisBorne gateway image (06 §4). No TUN, no NET_ADMIN.
 #
 # Supply-chain note: pin both base images to reviewed immutable digests
 # (FROM image@sha256:...) before producing release artifacts. Tags below are

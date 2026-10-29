@@ -217,10 +217,10 @@ fn cmd_pki(o: &Opts) -> Result<(), String> {
                 return Err("refusing to overwrite an existing CA key".into());
             }
             let ca = if o.get("hardened").is_some() {
-                pki::generate_offline_root(o.get("name").unwrap_or("aegisnet-offline-root"))
+                pki::generate_offline_root(o.get("name").unwrap_or("aegisborne-offline-root"))
             } else {
                 pki::generate_ca(
-                    o.get("name").unwrap_or("aegisnet-local-ca"),
+                    o.get("name").unwrap_or("aegisborne-local-ca"),
                     pki::DEFAULT_CA_VALIDITY,
                 )
             }

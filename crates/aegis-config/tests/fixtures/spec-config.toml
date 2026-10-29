@@ -1,4 +1,4 @@
-# Proposed AegisNet configuration. Illustrative; implementation does not yet exist.
+# Proposed AegisBorne configuration. Illustrative; implementation does not yet exist.
 # Same-host processes only. Use config.container.toml with compose.yaml.
 schema_version = "0.1"
 node_id = "pi-gateway-01"           # operator label: NEVER emitted as raw metric label

@@ -20,7 +20,20 @@ const WINTUN: Option<(&[u8], &[u8])> = Some((
 #[cfg(not(has_wintun))]
 const WINTUN: Option<(&[u8], &[u8])> = None;
 
-const EXE: &str = "aegisnet-vpn.exe";
+const EXE: &str = "aegisborne-vpn.exe";
+/// What the app consists of besides the helper, and the journal of changes
+/// to undo after a crash (with the kill switch's record).
+const FILES: [&str; 4] = [
+    "wintun.dll",
+    "wintun-LICENSE.txt",
+    "vpn-journal.json",
+    "vpn-journal.kill.json",
+];
+
+/// The helper as versions from before the rename to AegisBorne installed it.
+const OLD_SERVICE: &str = "AegisNetVPN";
+const OLD_DIR: &str = "AegisNet";
+const OLD_EXE: &str = "aegisnet-vpn.exe";
 
 fn manager() -> Result<ServiceManager, String> {
     ServiceManager::local_computer(
@@ -62,13 +75,46 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     retry(|| std::fs::write(path, bytes))
 }
 
+/// Remove the helper of a version from before the rename. Its journal moves
+/// to `dir` first, so the new helper undoes what the old one left behind.
+/// Like any update of the helper, this releases its kill switch.
+fn remove_previous(manager: &ServiceManager, dir: &Path) {
+    if let Ok(service) = manager.open_service(
+        OLD_SERVICE,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+    ) {
+        let _ = service.stop();
+        wait_for(&service, ServiceState::Stopped);
+        let _ = service.delete();
+    }
+    let Some(old) = dir.parent().map(|p| p.join(OLD_DIR)) else {
+        return;
+    };
+    if !old.is_dir() {
+        return;
+    }
+    // Same filter keys as this version's.
+    let _ = super::wfp::remove_kill_switch();
+    let (from, to) = (old.join("vpn-journal.json"), dir.join("vpn-journal.json"));
+    if from.exists() && !to.exists() {
+        let _ = retry(|| std::fs::rename(&from, &to));
+    }
+    for name in std::iter::once(OLD_EXE).chain(FILES) {
+        let path = old.join(name);
+        if path.exists() {
+            let _ = retry(|| std::fs::remove_file(&path));
+        }
+    }
+    let _ = std::fs::remove_dir(&old);
+}
+
 /// Install (or update) the helper for the user `sid`, and start it.
 pub fn install(sid: &str) -> Result<(), String> {
     if !valid_sid(sid) {
         return Err("invalid user".into());
     }
     let (wintun, license) = WINTUN.ok_or(
-        "This build of AegisNet doesn't include the Wintun driver; download the release build to use the system VPN.",
+        "This build of AegisBorne doesn't include the Wintun driver; download the release build to use the system VPN.",
     )?;
     let manager = manager()?;
     let access = ServiceAccess::QUERY_STATUS
@@ -83,6 +129,7 @@ pub fn install(sid: &str) -> Result<(), String> {
     }
     let dir = install_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    remove_previous(&manager, &dir);
     let exe = dir.join(EXE);
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     retry(|| std::fs::copy(&me, &exe).map(|_| ()))
@@ -92,7 +139,7 @@ pub fn install(sid: &str) -> Result<(), String> {
     let _ = write_if_changed(&dir.join("wintun-LICENSE.txt"), license);
     let info = ServiceInfo {
         name: OsString::from(SERVICE),
-        display_name: OsString::from("AegisNet VPN helper"),
+        display_name: OsString::from("AegisBorne VPN helper"),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -114,7 +161,7 @@ pub fn install(sid: &str) -> Result<(), String> {
             .map_err(|e| format!("Could not create the service: {e}"))?,
     };
     let _ = service.set_description(
-        "Runs the AegisNet system VPN for the AegisNet app. Remove it from the app's settings.",
+        "Runs the AegisBorne system VPN for the AegisBorne app. Remove it from the app's settings.",
     );
     let restart = ServiceAction {
         action_type: ServiceActionType::Restart,
@@ -147,15 +194,10 @@ pub fn uninstall() -> Result<(), String> {
             .map_err(|e| format!("Could not remove the service: {e}"))?;
     }
     let dir = install_dir();
+    remove_previous(&manager, &dir);
     // A kill switch the helper left blocking goes with it.
     let _ = super::wfp::remove_kill_switch();
-    for name in [
-        EXE,
-        "wintun.dll",
-        "wintun-LICENSE.txt",
-        "vpn-journal.json",
-        "vpn-journal.kill.json",
-    ] {
+    for name in std::iter::once(EXE).chain(FILES) {
         let path = dir.join(name);
         if path.exists() {
             retry(|| std::fs::remove_file(&path))

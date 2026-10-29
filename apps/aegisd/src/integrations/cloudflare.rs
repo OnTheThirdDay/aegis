@@ -76,7 +76,7 @@ fn provider_error(e: Error) -> (u16, String) {
     (status, explain(e.0))
 }
 
-/// Version of the tunnel routes AegisNet writes; 2 adds the user portal.
+/// Version of the tunnel routes AegisBorne writes; 2 adds the user portal.
 const ROUTES_VERSION: u64 = 2;
 
 /// Human-readable, secret-free explanation of a provider/saga error code.
@@ -87,11 +87,11 @@ pub fn explain(code: &str) -> String {
         "cloudflare_rate_limited_retry_later" => "Cloudflare is rate limiting requests; try again in a minute",
         "cloudflare_network_or_tls_failure" => "Could not reach api.cloudflare.com from the server",
         "cloudflare_temporarily_unavailable" => "Cloudflare's API is temporarily unavailable",
-        "dns_record_not_owned" => "A DNS record for this name already exists and was not created by AegisNet; choose another name or remove it yourself",
+        "dns_record_not_owned" => "A DNS record for this name already exists and was not created by AegisBorne; choose another name or remove it yourself",
         "hostname_outside_free_edge_certificate_scope" => "Use the domain itself or a single-level subdomain (Cloudflare's free certificate covers *.domain only)",
         "cloudflare_zone_account_mismatch" => "The domain is not active in that Cloudflare account",
-        "tunnel_create_outcome_unknown_requires_ownership_review" => "A tunnel with this AegisNet name already exists; remove it in Cloudflare or disconnect first",
-        "tunnel_ingress_drift_requires_review" => "The tunnel's routes were changed outside AegisNet",
+        "tunnel_create_outcome_unknown_requires_ownership_review" => "A tunnel with this AegisBorne name already exists; remove it in Cloudflare or disconnect first",
+        "tunnel_ingress_drift_requires_review" => "The tunnel's routes were changed outside AegisBorne",
         "cloudflare_connector_not_healthy" => "The connector did not report healthy to Cloudflare in time",
         "connector_not_ready" => "The connector could not connect to Cloudflare from this server (outbound UDP 7844 or TCP 443 may be blocked)",
         "data_path_not_verified" => "The end-to-end test through Cloudflare failed",
@@ -183,7 +183,7 @@ impl CloudflareIntegration {
         let base = json!({
             "id": ID,
             "name": "Cloudflare Tunnel",
-            "description": "Reach this gateway from anywhere through your Cloudflare domain — AegisNet creates the tunnel, DNS record and connector. No port forwarding needed.",
+            "description": "Reach this gateway from anywhere through your Cloudflare domain — AegisBorne creates the tunnel, DNS record and connector. No port forwarding needed.",
             "available": self.unavailable().is_none(),
             "unavailable_reason": self.unavailable(),
         });
@@ -528,10 +528,10 @@ impl CloudflareIntegration {
         Ok(json!({
             "plan_id": plan.id,
             "changes": [
-                if reused { format!("Reuse the AegisNet tunnel aegis-{} (owned by this server)", plan.desired.deployment_id) }
+                if reused { format!("Reuse the AegisBorne tunnel aegis-{} (owned by this server)", plan.desired.deployment_id) }
                 else { format!("Create a Cloudflare Tunnel named aegis-{}", plan.desired.deployment_id) },
                 format!("Route https://{hostname}/agp, /enroll and /renew to this gateway only (the console is never published)"),
-                format!("Create a proxied DNS record {hostname} → <tunnel>.cfargotunnel.com, labelled as AegisNet-owned"),
+                format!("Create a proxied DNS record {hostname} → <tunnel>.cfargotunnel.com, labelled as AegisBorne-owned"),
                 match self.connector.store().best() {
                     Ok(b) => format!("Run the Cloudflare connector (cloudflared {}) inside this server, kept up to date", b.build.version),
                     Err(_) => "Run the Cloudflare connector (cloudflared) inside this server, kept up to date".to_owned(),

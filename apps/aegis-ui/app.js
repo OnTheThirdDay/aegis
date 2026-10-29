@@ -1,5 +1,5 @@
 // @ts-check
-// AegisNet web console. Dependency-free; served by the gateway under a strict
+// AegisBorne web console. Dependency-free; served by the gateway under a strict
 // CSP (no inline script or style, no remote assets). All dynamic text is
 // inserted with textContent, never innerHTML.
 "use strict";
@@ -315,7 +315,7 @@ function showLogin(why) {
   });
   v.append(form);
   if (PORTAL) {
-    v.append(el("p", { class: "muted small narrow" }, ["This is the AegisNet user portal: add your devices, remove old ones and download the app. Administrators sign in with two-factor authentication."]));
+    v.append(el("p", { class: "muted small narrow" }, ["This is the AegisBorne user portal: add your devices, remove old ones and download the app. Administrators sign in with two-factor authentication."]));
   } else {
     v.append(bootstrapCard());
   }
@@ -416,7 +416,7 @@ async function renderOverview() {
     step(!!c.server_address_set, "Tell devices how to reach this server",
       conn.public_host ? "Devices connect to " + conn.public_host + (conn.public_port && conn.public_port !== 443 ? ":" + conn.public_port : "") + (conn.mode && conn.mode !== "direct" ? " via " + conn.mode : "") : "Set the server address, or connect a Cloudflare Tunnel for access from anywhere.",
       "connectivity", "Set up connectivity"),
-    step((c.devices_enrolled || 0) > 0, "Add your first device", (c.devices_enrolled || 0) + " device(s) enrolled. Create an invitation and paste it into the AegisNet client app.", "devices", "Invite a device"),
+    step((c.devices_enrolled || 0) > 0, "Add your first device", (c.devices_enrolled || 0) + " device(s) enrolled. Create an invitation and paste it into the AegisBorne client app.", "devices", "Invite a device"),
   ]);
   if (info.runtime && info.runtime.certificates && info.runtime.certificates.issuer_renewal_due) {
     const go = button("Renew the device issuer", "small");
@@ -591,7 +591,7 @@ function inviteCard() {
       code,
       el("div", { class: "row" }, [copyBtn, dl, done]),
       el("ol", { class: "steps" }, [
-        el("li", {}, ["Install and open the AegisNet client app on the device (downloads below)."]),
+        el("li", {}, ["Install and open the AegisBorne client app on the device (downloads below)."]),
         el("li", {}, ["Choose ", el("em", {}, ["Add server"]), " and paste this code (or open the .aegis file)."]),
         el("li", {}, ["Click ", el("em", {}, ["Connect"]), ". The device creates its own key; the code cannot be reused."]),
       ]),
@@ -908,7 +908,7 @@ function cloudflareCard(cf, conn) {
   const body = el("div");
   const head = el("div", { class: "row spread" }, [el("span", {}, ["Status: ", pill(cf.state || "inactive")]), cf.public_url ? el("span", { class: "mono" }, [cf.public_url]) : null]);
   const c = card("Option 2 — Cloudflare Tunnel (access from anywhere, no port forwarding)", [
-    el("p", { class: "muted" }, ["Uses your Cloudflare account and domain. AegisNet creates the tunnel, the DNS record and runs the connector itself — no dashboard steps. Your router needs no open ports. Cloudflare sees encrypted device traffic only; device authentication stays end-to-end."]),
+    el("p", { class: "muted" }, ["Uses your Cloudflare account and domain. AegisBorne creates the tunnel, the DNS record and runs the connector itself — no dashboard steps. Your router needs no open ports. Cloudflare sees encrypted device traffic only; device authentication stays end-to-end."]),
     head,
     cf.error ? el("p", { class: "err-text" }, ["Last error: " + cf.error]) : null,
     cf.warning ? el("p", { class: "warn-text" }, [cf.warning]) : null,
@@ -948,14 +948,14 @@ function cloudflareCard(cf, conn) {
     const off = button("Disconnect Cloudflare", "danger");
     busy(off, async () => {
       if (!token.value) throw new Error("Paste the API token: removing the tunnel and DNS record needs it.");
-      if (!confirm("Remove the AegisNet tunnel" + (keepDns.checked ? "" : " and its DNS record") + " from Cloudflare? Devices using " + (cf.hostname || "it") + " lose access until you choose another option.")) return;
+      if (!confirm("Remove the AegisBorne tunnel" + (keepDns.checked ? "" : " and its DNS record") + " from Cloudflare? Devices using " + (cf.hostname || "it") + " lose access until you choose another option.")) return;
       await api("POST", "/integrations/cloudflare/disable", { body: { token: token.value, keep_dns: keepDns.checked } });
       token.value = "";
       notice("Cloudflare removal started.");
       await renderConnectivity();
     });
     body.append(field("API token (only needed to retry or disconnect)", token), tokenHelp,
-      el("label", { class: "check" }, [keepDns, " Keep the DNS record (only resources AegisNet created are ever removed)"]),
+      el("label", { class: "check" }, [keepDns, " Keep the DNS record (only resources AegisBorne created are ever removed)"]),
       el("div", { class: "row" }, [restart, retry, off]));
     return c;
   }
@@ -994,7 +994,7 @@ function cloudflareCard(cf, conn) {
         await renderConnectivity();
       });
       preview.replaceChildren(el("div", { class: "plan" }, [
-        el("h3", {}, ["AegisNet will:"]),
+        el("h3", {}, ["AegisBorne will:"]),
         el("ul", {}, (p.changes || []).map((/** @type {string} */ x) => el("li", {}, [x]))),
         p.warnings && p.warnings.length ? el("ul", { class: "warn-list" }, p.warnings.map((/** @type {string} */ x) => el("li", {}, [x]))) : null,
         el("label", { class: "check" }, [store, " Remember the token on this server (only needed for DNS-validated Let's Encrypt renewals)"]),
@@ -1234,7 +1234,7 @@ async function renderDiagnostics() {
     el("h3", {}, ["How to diagnose a device"]),
     el("ol", { class: "steps" }, [
       el("li", {}, ["Start recording here."]),
-      el("li", {}, ["On the device, open the AegisNet app → Troubleshooting → Start recording."]),
+      el("li", {}, ["On the device, open the AegisBorne app → Troubleshooting → Start recording."]),
       el("li", {}, ["Reproduce the problem, then press Stop and send in the app (it also sends by itself when its recording ends)."]),
       el("li", {}, ["Read the analysis below. A device that can't reach this server can Save to file instead; import that file here."]),
     ]),
@@ -1284,7 +1284,7 @@ async function renderDiagnostics() {
     busy(exp, async () => {
       const resp = await fetch(BASE + "/api/v1/diagnostics/otlp", { credentials: "same-origin" });
       if (!resp.ok) throw new Error("Nothing to download yet.");
-      download("aegisnet-diagnostics.otlp.json", await resp.text(), "application/json");
+      download("aegisborne-diagnostics.otlp.json", await resp.text(), "application/json");
     });
     v.append(card("Analysis", [...items, el("div", { class: "row" }, [exp])]));
   }
@@ -1320,7 +1320,7 @@ async function renderAccount() {
     busy(dl, async () => {
       const resp = await fetch(BASE + "/api/v1/system/web-ca.pem", { credentials: "same-origin" });
       if (!resp.ok) throw new Error("Download failed.");
-      download("aegisnet-web-ca.pem", await resp.text(), "application/x-pem-file");
+      download("aegisborne-web-ca.pem", await resp.text(), "application/x-pem-file");
     });
     v.append(card("Trust this console in your browser (optional)", [
       el("p", { class: "muted" }, ["The console uses a certificate from this server's own web CA, so browsers warn the first time. To remove the warning, install this CA as trusted on your computer — only do this if you trust this server's operators."]),
@@ -1448,7 +1448,7 @@ async function deviceCaCard() {
         const e = await resp.json().catch(() => ({}));
         throw new Error(e.detail || friendly(e.aegis_error_code || String(resp.status)));
       }
-      download("aegisnet-device-root-key.pem", await resp.text(), "application/x-pem-file");
+      download("aegisborne-device-root-key.pem", await resp.text(), "application/x-pem-file");
       pw.value = "";
       notice("Root key downloaded. Store it somewhere safe and offline, then remove it from the server below.");
     });

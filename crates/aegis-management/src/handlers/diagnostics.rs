@@ -176,7 +176,7 @@ pub async fn otlp(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
             (header::CONTENT_TYPE, "application/json"),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=\"aegisnet-diagnostics.otlp.json\"",
+                "attachment; filename=\"aegisborne-diagnostics.otlp.json\"",
             ),
         ],
         body,

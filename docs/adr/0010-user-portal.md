@@ -43,7 +43,7 @@ The device port with Cloudflare Tunnel can also be any of those ports, not just 
 **Cloudflare routes**
 
 - New tunnels route `^/(agp|enroll|renew|portal(/.*)?)$`.
-- A tunnel whose routes are exactly AegisNet's earlier set is recognised as its own: setup and re-verification update it, rather than reporting drift. Anything else is still drift.
+- A tunnel whose routes are exactly AegisBorne's earlier set is recognised as its own: setup and re-verification update it, rather than reporting drift. Anything else is still drift.
 - Existing active tunnels are updated when re-verified with the token; the console offers **Update routes for the user portal**.
 
 ## Consequences

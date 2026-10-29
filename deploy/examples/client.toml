@@ -7,10 +7,10 @@ role = "client"
 
 [management]
 bind = "127.0.0.1:9081"
-config_store = "/var/lib/aegisnet-client/state.db"
+config_store = "/var/lib/aegisborne-client/state.db"
 
 [secrets]
-dir = "/etc/aegisnet-client/secrets"
+dir = "/etc/aegisborne-client/secrets"
 
 [identity]
 peer_auth = "mutual_tls_1_3"

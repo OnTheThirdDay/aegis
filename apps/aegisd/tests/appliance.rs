@@ -229,6 +229,71 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         assert_eq!(s, 200, "{v}");
         assert_eq!(v["items"][0]["owner"]["username"], "admin", "{v}");
 
+        // App updates: the gateway offers only builds with a signed
+        // description next to them, and serves them to enrolled devices in
+        // pieces; the device resumes a partial download and checks the hash.
+        let downloads = tmp.path().join("downloads");
+        std::fs::create_dir_all(&downloads).expect("downloads");
+        let chunk = aegis_join::update::CHUNK;
+        let build: Vec<u8> = (0..chunk * 2 + 123).map(|i| (i % 251) as u8).collect();
+        let sha = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&build))
+        };
+        std::fs::write(downloads.join("aegis-client-linux-x86_64"), &build).expect("build");
+        std::fs::write(downloads.join("aegis-client-windows-x86_64.exe"), b"unsigned").expect("unsigned");
+        let offered = aegis_join::update::Update {
+            platform: "linux-x86_64".into(),
+            version: "9.9.9".into(),
+            file: "aegis-client-linux-x86_64".into(),
+            size: build.len() as u64,
+            sha256: sha,
+            signature: "c2lnbmVk".into(),
+        };
+        std::fs::write(
+            downloads.join("aegis-client-linux-x86_64.update"),
+            serde_json::to_vec(&offered).expect("json"),
+        )
+        .expect("update");
+        let mgmt = running.mgmt.as_ref().expect("management");
+        *mgmt.downloads_dir.lock().expect("lock") = Some(downloads.clone());
+        // Not signed by the release key: the device ignores the offer.
+        assert_eq!(
+            aegis_join::update::check(&device_dir, "linux-x86_64", "1.0.0").await.expect("check"),
+            None
+        );
+        // Nothing for a platform without a signed build.
+        let dest = tmp.path().join("update.bin");
+        let mut unsigned = offered.clone();
+        unsigned.file = "aegis-client-windows-x86_64.exe".into();
+        unsigned.size = 8;
+        assert!(
+            aegis_join::update::download(&device_dir, &unsigned, &dest, |_, _| {}).await.is_err(),
+            "only signed builds are served"
+        );
+        // A partial download resumes.
+        std::fs::write(dest.with_extension("part"), &build[..chunk as usize]).expect("part");
+        let pieces = std::sync::atomic::AtomicU32::new(0);
+        aegis_join::update::download(&device_dir, &offered, &dest, |_, _| {
+            pieces.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await
+        .expect("download");
+        assert_eq!(std::fs::read(&dest).expect("downloaded"), build);
+        assert_eq!(pieces.into_inner(), 2, "resumed after the first piece");
+        // A build that doesn't match its description is discarded.
+        let mut wrong = offered.clone();
+        wrong.sha256 = "0".repeat(64);
+        let _ = std::fs::remove_file(&dest);
+        assert!(aegis_join::update::download(&device_dir, &wrong, &dest, |_, _| {}).await.is_err());
+        assert!(!dest.exists() && !dest.with_extension("part").exists());
+        let (s, v) = c.call(reqwest::Method::GET, "/system/downloads", None).await;
+        assert_eq!(s, 200, "{v}");
+        assert!(
+            v["items"].as_array().expect("items").iter().all(|i| !i["name"].as_str().unwrap_or("").ends_with(".update")),
+            "descriptions aren't listed as downloads: {v}"
+        );
+
         // Tunnel session: a loopback destination is refused *by the gateway
         // policy* (0x02), which proves inner mTLS + registry admission.
         let client = start_client(&dev_dir).await;
@@ -407,7 +472,7 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         let (s, v) = c.call(reqwest::Method::POST, "/auth/2fa/setup", None).await;
         assert_eq!(s, 200, "{v}");
         let secret = aegis_management::totp::base32_decode(v["secret"].as_str().expect("secret")).expect("base32");
-        assert!(v["uri"].as_str().is_some_and(|u| u.starts_with("otpauth://totp/AegisNet:admin?")));
+        assert!(v["uri"].as_str().is_some_and(|u| u.starts_with("otpauth://totp/AegisBorne:admin?")));
         assert!(v["qr"].as_array().is_some_and(|rows| rows.len() >= 21));
         let now = aegis_management::totp::step_of(aegis_storage::now_unix());
         let code = |step: i64| format!("{:06}", aegis_management::totp::code_at(&secret, step as u64));

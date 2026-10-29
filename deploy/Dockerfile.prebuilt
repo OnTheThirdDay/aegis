@@ -1,4 +1,4 @@
-# AegisNet appliance image from prebuilt binaries — built by the release
+# AegisBorne appliance image from prebuilt binaries — built by the release
 # workflow (.github/workflows/release.yml) for linux/amd64 and linux/arm64,
 # or locally from `deploy/build-bundle.sh` output.
 #
@@ -45,5 +45,5 @@ EXPOSE 8443 8444 8444/udp 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/usr/local/bin/aegisctl", "--socket", "/var/lib/aegisnet/aegisd.sock", "health"]
 ENTRYPOINT ["/usr/local/bin/aegisd"]
-LABEL org.opencontainers.image.title="AegisNet gateway" \
+LABEL org.opencontainers.image.title="AegisBorne gateway" \
       org.opencontainers.image.source="https://github.com/OnTheThirdDay/aegis"

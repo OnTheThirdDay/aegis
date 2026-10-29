@@ -13,7 +13,7 @@ Users want the gateway on their phones. A local proxy, as on desktop, is of litt
 - **Flutter UI, shared by Android and iOS** (owner choice). It covers joining, connecting, status and removing the server.
 - **A Rust core** (`crates/aegis-mobile`) reuses the desktop client: `aegis-join` for enrollment, renewal and following address changes, and the client node for the local SOCKS proxy and the AGP tunnel. The app calls it through a small JSON-in/JSON-out API.
 - **Platform glue:**
-  - On Android, a Kotlin `VpnService` and `MainActivity` that serves the Flutter method channel `aegisnet/client`. Kotlin calls the core over JNI.
+  - On Android, a Kotlin `VpnService` and `MainActivity` that serves the Flutter method channel `aegisborne/client`. Kotlin calls the core over JNI.
   - On iOS (later), a Swift packet tunnel calls the same core through a C ABI.
 
 **Packet path (VPN mode, owner choice)**
@@ -30,7 +30,7 @@ Users want the gateway on their phones. A local proxy, as on desktop, is of litt
 
 **Android specifics**
 
-- Application ID `net.aegis.app` (owner choice; also the iOS bundle ID); minSdk 26 (Android 8).
+- The app is named **AegisBorne**, with application ID `borne.aegis.app`, which is also the iOS bundle ID (owner choice, 2026-10-29; v1.0.0 shipped as `net.aegis.app`, a separate app whose phones must join again). minSdk 26 (Android 8).
 - Builds for arm64-v8a (phones) and x86_64 (emulator); NDK r28 links with 16 KB page alignment.
 - Foreground service type `systemExempted` (VPN apps); always-on VPN is supported.
 - Invitations can be pasted or shared to the app from another app.
@@ -46,6 +46,7 @@ Users want the gateway on their phones. A local proxy, as on desktop, is of litt
 
 - The release workflow builds `aegis-client-android-arm64.apk`. It ships in the GitHub release and in the image's downloads, offered under **Devices → Client apps** and on the user portal with the APK media type.
 - Release APKs are signed with a key kept in repository secrets (see RELEASING.md). Without it, a build is signed with a throwaway key and later builds won't install over it.
+- The app was renamed to AegisBorne with a new app ID; phones of the old app move with the AegisNet update it ships alongside ([ADR-0016](0016-rename-to-aegisborne.md)).
 - Google Play can come later. It needs its own VPN declarations and review.
 
 **Unsafe code**

@@ -355,22 +355,32 @@ fn note_failure(ctx: &ManagementContext, request: &str, result: &Result<Value, A
     }
 }
 
-fn respond(result: Result<Value, ApiError>, ok: u16) -> (u16, Vec<u8>) {
+const JSON: &str = "application/json";
+
+/// An edge reply: status, content type, body.
+pub type EdgeReply = (u16, &'static str, Vec<u8>);
+
+fn respond(result: Result<Value, ApiError>, ok: u16) -> EdgeReply {
     match result {
-        Ok(v) => (ok, serde_json::to_vec(&v).unwrap_or_default()),
-        Err(e) => (
-            e.status.as_u16(),
-            serde_json::to_vec(&json!({
-                "aegis_error_code": e.code,
-                "detail": e.detail,
-            }))
-            .unwrap_or_default(),
-        ),
+        Ok(v) => (ok, JSON, serde_json::to_vec(&v).unwrap_or_default()),
+        Err(e) => failed(&e),
     }
 }
 
+fn failed(e: &ApiError) -> EdgeReply {
+    (
+        e.status.as_u16(),
+        JSON,
+        serde_json::to_vec(&json!({
+            "aegis_error_code": e.code,
+            "detail": e.detail,
+        }))
+        .unwrap_or_default(),
+    )
+}
+
 /// Data-plane edge entry: `POST /enroll` with a JSON [`RedeemBody`].
-pub async fn edge_enroll(ctx: Arc<ManagementContext>, body: Vec<u8>) -> (u16, Vec<u8>) {
+pub async fn edge_enroll(ctx: Arc<ManagementContext>, body: Vec<u8>) -> EdgeReply {
     let parsed = serde_json::from_slice::<RedeemBody>(&body)
         .map_err(|_| ApiError::bad_request("invalid_body"));
     let result = match parsed {
@@ -402,12 +412,146 @@ async fn endpoint_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
     .await
 }
 
+/// Download piece size; devices ask for exactly this much at a time
+/// (`aegis_join::update::CHUNK`).
+const UPDATE_CHUNK: u64 = 1024 * 1024;
+
+/// The client builds this gateway offers as app updates: those with a
+/// description signed by the release workflow next to them (`FILE.update`,
+/// ADR-0017). Devices check the signature; the gateway only serves them.
+fn signed_builds(ctx: &ManagementContext) -> Vec<(Value, std::path::PathBuf)> {
+    let dir = ctx
+        .downloads_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(entries) = dir.as_ref().and_then(|d| std::fs::read_dir(d).ok()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("update") {
+            continue;
+        }
+        let Some(v) = std::fs::metadata(&path)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= 4096)
+            .and_then(|_| std::fs::read(&path).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        else {
+            continue;
+        };
+        let build = path.with_extension("");
+        let same_file = build.file_name().and_then(|n| n.to_str()) == v["file"].as_str();
+        let size_ok = std::fs::symlink_metadata(&build)
+            .is_ok_and(|m| m.is_file() && Some(m.len()) == v["size"].as_u64());
+        if same_file && size_ok {
+            out.push((v, build));
+        }
+    }
+    out
+}
+
+/// `X.Y.Z` for picking the latest of several builds for one platform; a
+/// release sorts after its pre-releases.
+fn version_key(v: &Value) -> (Vec<u64>, bool) {
+    let s = v["version"].as_str().unwrap_or("");
+    let (core, release) = match s.split_once('-') {
+        Some((c, _)) => (c, false),
+        None => (s, true),
+    };
+    (
+        core.split('.').map(|p| p.parse().unwrap_or(0)).collect(),
+        release,
+    )
+}
+
+fn device_certificate(body: &Value) -> Result<String, ApiError> {
+    body.get("certificate_pem")
+        .and_then(Value::as_str)
+        .filter(|p| p.len() <= 16 * 1024)
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::bad_request("invalid_body"))
+}
+
+/// The latest app build for the device's platform (`update_query`), or
+/// null. Like the endpoint query: not secret, certificate checked, no rate
+/// limit spent.
+async fn update_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
+    let certificate_pem = device_certificate(&body)?;
+    let platform = body["update_query"]["platform"]
+        .as_str()
+        .filter(|p| !p.is_empty() && p.len() <= 32)
+        .ok_or_else(|| ApiError::bad_request("invalid_body"))?
+        .to_owned();
+    let anchor = device_trust_anchor(ctx)?;
+    let c = ctx.clone();
+    blocking(move || {
+        authenticate_device(&c, &anchor, &certificate_pem, 0)?;
+        let latest = signed_builds(&c)
+            .into_iter()
+            .map(|(v, _)| v)
+            .filter(|v| v["platform"].as_str() == Some(platform.as_str()))
+            .max_by_key(version_key);
+        Ok(json!({ "update": latest }))
+    })
+    .await
+}
+
+/// One piece of a signed app build (`update_download`: file and offset).
+async fn update_download(ctx: &Ctx, body: Value) -> Result<Vec<u8>, ApiError> {
+    use std::io::{Read, Seek};
+    let certificate_pem = device_certificate(&body)?;
+    let request = &body["update_download"];
+    let (Some(file), Some(offset)) = (request["file"].as_str(), request["offset"].as_u64()) else {
+        return Err(ApiError::bad_request("invalid_body"));
+    };
+    let file = file.to_owned();
+    let anchor = device_trust_anchor(ctx)?;
+    let c = ctx.clone();
+    blocking(move || {
+        authenticate_device(&c, &anchor, &certificate_pem, 0)?;
+        let (v, path) = signed_builds(&c)
+            .into_iter()
+            .find(|(v, _)| v["file"].as_str() == Some(file.as_str()))
+            .ok_or_else(|| ApiError::bad_request("unknown_update"))?;
+        let size = v["size"].as_u64().unwrap_or(0);
+        if offset >= size {
+            return Err(ApiError::bad_request("invalid_offset"));
+        }
+        let mut piece = vec![0u8; (size - offset).min(UPDATE_CHUNK) as usize];
+        let mut f =
+            std::fs::File::open(&path).map_err(|_| ApiError::bad_request("unknown_update"))?;
+        f.seek(std::io::SeekFrom::Start(offset))
+            .and_then(|_| f.read_exact(&mut piece))
+            .map_err(|_| ApiError::bad_request("unknown_update"))?;
+        Ok(piece)
+    })
+    .await
+}
+
 /// Data-plane edge entry for device-authenticated requests on `POST /renew`:
 /// certificate + same-key CSR (renewal), a signed diagnostic report
-/// (`diagnostic_report_gz`) or an endpoint query (`endpoint_query`). They
-/// share this path so existing tunnel ingress rules keep matching.
-pub async fn edge_renew(ctx: Arc<ManagementContext>, body: Vec<u8>) -> (u16, Vec<u8>) {
-    let (request, result) = match serde_json::from_slice::<Value>(&body) {
+/// (`diagnostic_report_gz`), an endpoint query (`endpoint_query`), or an app
+/// update query or download (`update_query`, `update_download`). They share
+/// this path so existing tunnel ingress rules keep matching.
+pub async fn edge_renew(ctx: Arc<ManagementContext>, body: Vec<u8>) -> EdgeReply {
+    let parsed = serde_json::from_slice::<Value>(&body);
+    if let Ok(v) = &parsed {
+        if v.get("update_download").is_some() {
+            return match update_download(&ctx, v.clone()).await {
+                Ok(piece) => (200, "application/octet-stream", piece),
+                Err(e) => {
+                    let reply = failed(&e);
+                    note_failure(&ctx, "update_download", &Err::<Value, _>(e));
+                    reply
+                }
+            };
+        }
+    }
+    let (request, result) = match parsed {
+        Ok(v) if v.get("update_query").is_some() => ("update_query", update_query(&ctx, v).await),
         Ok(v) if v.get("diagnostic_report_gz").is_some() => (
             "diagnostic_report",
             super::diagnostics::device_report(&ctx, v).await,

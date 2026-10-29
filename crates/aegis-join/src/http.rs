@@ -91,6 +91,17 @@ fn tls_config(edge: &Edge) -> Result<Arc<rustls::ClientConfig>, JoinError> {
 
 /// POST `body` as JSON; returns `(status, body)`.
 pub async fn post_json(url: &str, edge: &Edge, body: &Value) -> Result<(u16, Vec<u8>), JoinError> {
+    post_json_up_to(url, edge, body, MAX_RESPONSE).await
+}
+
+/// [`post_json`] accepting a response of up to `max` bytes (update
+/// downloads come in larger pieces).
+pub async fn post_json_up_to(
+    url: &str,
+    edge: &Edge,
+    body: &Value,
+    max: usize,
+) -> Result<(u16, Vec<u8>), JoinError> {
     let target = parse(url)?;
     let name = edge
         .outer_server_name
@@ -140,7 +151,7 @@ pub async fn post_json(url: &str, edge: &Edge, body: &Value) -> Result<(u16, Vec
                 Ok(0) => break,
                 Ok(n) => {
                     response.extend_from_slice(&chunk[..n]);
-                    if response.len() > MAX_RESPONSE {
+                    if response.len() > max {
                         return Err(JoinError::Network("response too large".into()));
                     }
                     if complete(&response) {

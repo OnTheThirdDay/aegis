@@ -62,7 +62,7 @@ pub fn generate_ca(common_name: &str, lifetime: Duration) -> Result<CaBundle, Id
     let mut params = CertificateParams::new(Vec::<String>::new())?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, common_name);
-    dn.push(DnType::OrganizationName, "AegisNet local CA");
+    dn.push(DnType::OrganizationName, "AegisBorne local CA");
     params.distinguished_name = dn;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![
@@ -368,7 +368,7 @@ pub const MAX_WEB_VALIDITY: Duration = Duration::from_secs(397 * 24 * 3600);
 
 /// TLS server certificate for the HTTPS console or the outer (edge) listener.
 /// Issue it from a dedicated web CA, never the device CA: it carries no node
-/// identity URI and must not be able to authenticate as an AegisNet gateway.
+/// identity URI and must not be able to authenticate as an AegisBorne gateway.
 pub fn issue_web_server(
     ca: &CaBundle,
     dns_names: &[String],

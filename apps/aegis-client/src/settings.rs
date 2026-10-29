@@ -1,6 +1,6 @@
 //! Portable data location and user settings.
 //!
-//! The app is portable: it keeps everything in `AegisNet-data` next to the
+//! The app is portable: it keeps everything in `AegisBorne-data` next to the
 //! executable when that folder is writable (USB stick, Downloads), and falls
 //! back to the per-user application data folder otherwise (always for the
 //! macOS app bundle). `AEGIS_CLIENT_DATA` overrides both.
@@ -63,6 +63,14 @@ impl Settings {
     }
 }
 
+/// The data of a version from before the rename to AegisBorne moves to its
+/// new name, once (when only the old folder exists).
+fn adopt_old(old: &Path, new: &Path) {
+    if old.is_dir() && !new.exists() {
+        let _ = std::fs::rename(old, new);
+    }
+}
+
 fn writable(dir: &Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
@@ -89,7 +97,8 @@ pub fn data_dir() -> Result<PathBuf, String> {
         .and_then(|e| e.parent().map(Path::to_path_buf))
         .filter(|d| !d.ends_with("Contents/MacOS"))
     {
-        let portable = exe_dir.join("AegisNet-data");
+        let portable = exe_dir.join("AegisBorne-data");
+        adopt_old(&exe_dir.join("AegisNet-data"), &portable);
         if writable(&portable) {
             return Ok(portable);
         }
@@ -103,10 +112,32 @@ pub fn data_dir() -> Result<PathBuf, String> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
     };
-    let dir = base.ok_or("no home directory")?.join("AegisNet");
+    let base = base.ok_or("no home directory")?;
+    let dir = base.join("AegisBorne");
+    adopt_old(&base.join("AegisNet"), &dir);
     if writable(&dir) {
         Ok(dir)
     } else {
         Err(format!("{} is not writable", dir.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_from_before_the_rename_moves_once() {
+        let root = std::env::temp_dir().join(format!("aegis-rename-{}", std::process::id()));
+        let (old, new) = (root.join("AegisNet"), root.join("AegisBorne"));
+        std::fs::create_dir_all(&old).expect("old");
+        std::fs::write(old.join("settings.json"), "{}").expect("settings");
+        adopt_old(&old, &new);
+        assert!(new.join("settings.json").exists() && !old.exists());
+        // An old folder that reappears never replaces the new one.
+        std::fs::create_dir_all(&old).expect("old again");
+        adopt_old(&old, &new);
+        assert!(new.join("settings.json").exists() && old.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

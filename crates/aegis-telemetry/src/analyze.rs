@@ -425,7 +425,7 @@ pub fn analyze(gateway: Option<&Report>, devices: &[Report]) -> Analysis {
             "no_device_report",
             "No device has sent a report",
             "Problems seen only on a device (it can't connect, pages don't load) need the device's own recording.",
-            "On the device, open the AegisNet app, Troubleshooting > Start recording, reproduce the problem, then press Stop and send. A device that can't reach the server can Save to file instead; import that file here.",
+            "On the device, open the AegisBorne app, Troubleshooting > Start recording, reproduce the problem, then press Stop and send. A device that can't reach the server can Save to file instead; import that file here.",
             vec![],
         ));
     }

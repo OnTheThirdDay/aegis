@@ -7,6 +7,9 @@ import 'client.dart';
 
 void main() => runApp(const AegisApp());
 
+/// The old Android app (flavor `legacy`, `net.aegis.app`) keeps its name.
+final appName = appFlavor == 'legacy' ? 'AegisNet' : 'AegisBorne';
+
 class AegisApp extends StatelessWidget {
   const AegisApp({super.key});
 
@@ -14,7 +17,7 @@ class AegisApp extends StatelessWidget {
   Widget build(BuildContext context) {
     const seed = Color(0xFF2F6F73);
     return MaterialApp(
-      title: 'AegisNet',
+      title: appName,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: seed, useMaterial3: true),
       darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
@@ -36,6 +39,16 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
   final client = Client();
   Servers? servers;
   String? shared;
+  Migration move = Migration();
+
+  /// A newer app the selected server offers.
+  AppUpdate? update;
+
+  /// AegisBorne: servers just taken from the old app, and whether that app
+  /// is too old to hand them over.
+  int moved = 0;
+  bool legacyOutdated = false;
+  bool importTried = false;
 
   @override
   void initState() {
@@ -56,13 +69,73 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
   }
 
   Future<void> _load() async {
-    final s = await client.servers();
+    final m = await client.migration();
+    var s = await client.servers();
+    if (!m.legacy && m.otherInstalled && s.isEmpty && !importTried) {
+      importTried = true;
+      try {
+        final r = await client.importLegacy();
+        if (r.count > 0) {
+          moved = r.count;
+          s = await client.servers();
+        }
+        legacyOutdated = r.legacy == 'outdated';
+      } on ClientError {
+        // Join with an invitation instead.
+      }
+    }
     final text = await client.sharedText();
     if (!mounted) return;
     setState(() {
+      move = m;
       servers = s;
+      if (s.isEmpty) update = null;
       if (text != null && text.trim().isNotEmpty) shared = text;
     });
+    unawaited(_checkUpdate());
+  }
+
+  /// Above the join and home screens while both apps are in play.
+  Widget? _notice() {
+    if (move.legacy) {
+      return MoveNotice(
+        text: 'AegisNet is now AegisBorne. Move to the new app: your servers come along, '
+            'with nothing to join again.',
+        action: move.otherInstalled ? 'Open AegisBorne' : 'Move to AegisBorne',
+        onPressed: _installBorne,
+      );
+    }
+    if (!move.otherInstalled) return null;
+    final none = servers?.isEmpty ?? true;
+    if (none) {
+      return legacyOutdated
+          ? const MoveNotice(
+              text: 'To bring your servers over from the AegisNet app, install the AegisNet update '
+                  'from your server\'s download page, then open AegisBorne again. '
+                  'Or join with a new invitation below.',
+            )
+          : null;
+    }
+    return MoveNotice(
+      text: moved > 0
+          ? 'Moved ${moved == 1 ? 'your server' : 'your $moved servers'} from AegisNet. '
+              'You can uninstall the old app now.'
+          : 'The old AegisNet app is still installed. AegisBorne replaces it.',
+      action: 'Uninstall AegisNet',
+      onPressed: () => client.uninstallLegacy(),
+    );
+  }
+
+  Future<void> _installBorne() async {
+    String? message;
+    try {
+      message = await client.installBorne();
+    } on ClientError catch (e) {
+      message = e.message;
+    }
+    if (message != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    }
   }
 
   @override
@@ -71,10 +144,14 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
     if (s == null) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
+    if (move.legacy && move.moved) {
+      return MovedScreen(onOpen: _installBorne, onUninstall: () => client.uninstallLegacy());
+    }
     if (s.isEmpty) {
       return JoinScreen(
         client: client,
         initial: shared,
+        notice: _notice(),
         onJoined: (_) {
           shared = null;
           _load();
@@ -85,17 +162,41 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
       client: client,
       servers: s,
       shared: shared,
+      notice: _notice(),
+      update: update,
       onSharedTaken: () => shared = null,
       onChanged: _load,
     );
   }
+
+  /// Ask the selected server for a newer app (the core reuses its answer
+  /// for a few hours). Not the old app: it moves to AegisBorne instead.
+  Future<void> _checkUpdate() async {
+    if (move.legacy || (servers?.isEmpty ?? true)) return;
+    try {
+      final u = await client.checkUpdate();
+      if (mounted) setState(() => update = u);
+    } on ClientError {
+      // Unreachable server: asked again on the next start or resume.
+    }
+  }
 }
 
 class JoinScreen extends StatefulWidget {
-  const JoinScreen({super.key, required this.client, required this.onJoined, this.initial, this.another = false});
+  const JoinScreen({
+    super.key,
+    required this.client,
+    required this.onJoined,
+    this.initial,
+    this.another = false,
+    this.notice,
+  });
 
   final Client client;
   final String? initial;
+
+  /// Above everything (moving between the old app and AegisBorne).
+  final Widget? notice;
   final void Function(ServerInfo) onJoined;
 
   /// Joining an additional server (opened from the home screen).
@@ -140,11 +241,12 @@ class _JoinScreenState extends State<JoinScreen> {
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
     return Scaffold(
-      appBar: AppBar(title: Text(widget.another ? 'Add a server' : 'AegisNet')),
+      appBar: AppBar(title: Text(widget.another ? 'Add a server' : appName)),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
+            if (widget.notice != null) ...[widget.notice!, const SizedBox(height: 16)],
             if (!widget.another) ...[
               Text('Join a server', style: t.headlineSmall),
               const SizedBox(height: 8),
@@ -206,10 +308,15 @@ class HomeScreen extends StatefulWidget {
     required this.onChanged,
     required this.onSharedTaken,
     this.shared,
+    this.notice,
+    this.update,
   });
 
   final Client client;
   final Servers servers;
+
+  /// A newer app the server offers.
+  final AppUpdate? update;
 
   /// Reload the server list.
   final Future<void> Function() onChanged;
@@ -217,6 +324,9 @@ class HomeScreen extends StatefulWidget {
   /// An invitation shared to the app: offered as another server.
   final String? shared;
   final VoidCallback onSharedTaken;
+
+  /// Above everything (moving between the old app and AegisBorne).
+  final Widget? notice;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -227,6 +337,52 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Timer? timer;
   bool busy = false;
   String? error;
+
+  /// Downloading an update, until the system installer takes over.
+  bool updating = false;
+
+  /// A newer app from the server: offered, never installed unasked.
+  Widget _updateCard(AppUpdate u) {
+    final scheme = Theme.of(context).colorScheme;
+    final (done, total) = (status.updateDone, status.updateTotal);
+    return Card(
+      color: scheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '$appName ${u.version} is available (you have ${u.current}).',
+              style: TextStyle(color: scheme.onPrimaryContainer),
+            ),
+            const SizedBox(height: 10),
+            if (updating && done != null && total != null && total > 0)
+              LinearProgressIndicator(value: done / total)
+            else
+              FilledButton(onPressed: updating ? null : _installUpdate, child: const Text('Update')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _installUpdate() async {
+    setState(() {
+      updating = true;
+      error = null;
+    });
+    try {
+      final message = await widget.client.installUpdate();
+      if (message != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      }
+    } on ClientError catch (e) {
+      if (mounted) setState(() => error = e.message);
+    } finally {
+      if (mounted) setState(() => updating = false);
+    }
+  }
 
   @override
   void initState() {
@@ -425,7 +581,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final several = widget.servers.list.length > 1;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('AegisNet'),
+        title: Text(appName),
         actions: [
           PopupMenuButton<String>(
             enabled: !busy,
@@ -444,6 +600,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
+            if (widget.notice != null) widget.notice!,
+            if (widget.update != null) _updateCard(widget.update!),
             const SizedBox(height: 12),
             Center(
               child: SizedBox.square(
@@ -516,6 +674,69 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               'Tap the server to switch to another one or add one.',
               style: t.bodySmall,
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Moving between the old app and AegisBorne: what to do, and a button.
+class MoveNotice extends StatelessWidget {
+  const MoveNotice({super.key, required this.text, this.action, this.onPressed});
+
+  final String text;
+  final String? action;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      color: scheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(text, style: TextStyle(color: scheme.onPrimaryContainer)),
+            if (action != null) ...[
+              const SizedBox(height: 10),
+              FilledButton(onPressed: onPressed, child: Text(action!)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The old app once AegisBorne took its servers.
+class MovedScreen extends StatelessWidget {
+  const MovedScreen({super.key, required this.onOpen, required this.onUninstall});
+
+  final VoidCallback onOpen;
+  final VoidCallback onUninstall;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    return Scaffold(
+      appBar: AppBar(title: Text(appName)),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            Text('Moved to AegisBorne', style: t.headlineSmall),
+            const SizedBox(height: 8),
+            Text(
+              'Your servers are in the AegisBorne app now. Connect from there, and uninstall this app.',
+              style: t.bodyMedium,
+            ),
+            const SizedBox(height: 20),
+            FilledButton(onPressed: onOpen, child: const Text('Open AegisBorne')),
+            const SizedBox(height: 8),
+            OutlinedButton(onPressed: onUninstall, child: const Text('Uninstall AegisNet')),
           ],
         ),
       ),

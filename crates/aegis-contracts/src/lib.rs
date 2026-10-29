@@ -1,4 +1,4 @@
-//! Platform-neutral contracts shared by every AegisNet module.
+//! Platform-neutral contracts shared by every AegisBorne module.
 //!
 //! This crate deliberately depends only on `serde` (A-002): no async runtime,
 //! no HTTP stack and no management types. Everything here is either plain data

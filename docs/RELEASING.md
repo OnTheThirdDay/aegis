@@ -64,7 +64,7 @@ Test images are built only when you ask for one: a full build takes about 30 min
 
 Every job has a time limit (5 to 60 minutes), so a hang fails quickly instead of running for GitHub's default 6 hours. Usage so far: Settings → Billing and plans → Usage.
 
-macOS is compiled only for releases (one universal `AegisNet.app` in `aegis-client-macos.dmg`, `.github/scripts/macos-dmg.sh`), so a macOS-only build problem shows up when releasing (the release then fails before anything is published). Every push does lint the system VPN helper (`aegis-vpn`) for macOS and Windows, since it is pure Rust; to check the whole client earlier, run `cargo check -p aegis-client` on a Mac.
+macOS is compiled only for releases (one universal `AegisBorne.app` in `aegis-client-macos.dmg`, `.github/scripts/macos-dmg.sh`), so a macOS-only build problem shows up when releasing (the release then fails before anything is published). Every push does lint the system VPN helper (`aegis-vpn`) for macOS and Windows, since it is pure Rust; to check the whole client earlier, run `cargo check -p aegis-client` on a Mac.
 
 **Quirks to know:**
 
@@ -84,7 +84,7 @@ macOS is compiled only for releases (one universal `AegisNet.app` in `aegis-clie
   ```sh
   openssl rand -base64 24 | tr -d '\r\n' > password.txt
   openssl req -x509 -newkey rsa:4096 -sha256 -days 10950 -nodes \
-    -keyout key.pem -out cert.pem -subj "/CN=AegisNet"
+    -keyout key.pem -out cert.pem -subj "/CN=AegisBorne"
   openssl pkcs12 -export -inkey key.pem -in cert.pem -name aegis \
     -out aegis-android.p12 -passout file:password.txt
   rm key.pem
@@ -92,6 +92,16 @@ macOS is compiled only for releases (one universal `AegisNet.app` in `aegis-clie
   ```
 
   Add these repository secrets: `AEGIS_ANDROID_KEYSTORE_B64`, `AEGIS_ANDROID_KEY_ALIAS` (`aegis`), and the contents of `password.txt` as both `AEGIS_ANDROID_KEYSTORE_PASSWORD` and `AEGIS_ANDROID_KEY_PASSWORD` (a PKCS#12 file has one password). Without them, builds still succeed but warn: each APK is signed with a throwaway key and won't install over the previous one.
+
+  With the key, a release also builds `aegisnet-update-android-arm64.apk`: the last update of the old Android app (AegisNet, `net.aegis.app`). It installs over AegisNet, carries AegisBorne and moves the phone's servers to it ([ADR-0016](adr/0016-rename-to-aegisborne.md)). Without the key it is skipped, since it couldn't install over AegisNet.
+- **Update-signing key:** releases sign their client builds so the apps accept them as updates from a gateway ([ADR-0017](adr/0017-app-updates.md)). The apps carry the public key (`RELEASE_KEY` in `crates/aegis-join/src/update.rs`); keep the private key with a backup outside GitHub. If it's lost, a new key needs app releases carrying its public key, installed by hand once.
+
+  ```sh
+  openssl genpkey -algorithm ed25519 -out update-signing-key.pem
+  openssl pkey -in update-signing-key.pem -pubout -outform DER | tail -c 32 | base64   # RELEASE_KEY
+  ```
+
+  Add the repository secret `AEGIS_UPDATE_SIGNING_KEY` with the contents of `update-signing-key.pem`. Without it, releases still build but warn, and their apps aren't offered as updates.
 - **Local hook:** run `git config core.hooksPath .githooks` once per clone. It blocks direct pushes to `main` and `staging`; `--no-verify` overrides it deliberately.
 - **Branch protection:** rulesets need a paid plan for private repositories. Until then, the main gate in release.yml, `branch-policy` and the hook enforce the flow. With rulesets available:
   - **`main`:** block force pushes and deletion; require a pull request with merge commits only; require the `branch-policy` check.
@@ -116,7 +126,7 @@ sudo sh install.sh            # add --tunnel-only on a public server
 - **Offline or development installs** without the registry:
   ```sh
   sh deploy/build-bundle.sh DIR
-  sudo sh DIR/aegisnet-gateway/install.sh --from DIR/aegisnet-gateway
+  sudo sh DIR/aegisborne-gateway/install.sh --from DIR/aegisborne-gateway
   ```
 
 The full server guide (first-time setup, servers that already run nginx or v2ray, console access on a public server, upgrades) is [INSTALL.md](INSTALL.md).

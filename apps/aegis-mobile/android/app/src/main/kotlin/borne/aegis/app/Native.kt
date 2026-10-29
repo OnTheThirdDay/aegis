@@ -1,4 +1,4 @@
-package net.aegis.app
+package borne.aegis.app
 
 import android.content.Context
 import java.io.File
@@ -28,4 +28,8 @@ object Native {
     external fun start(dir: String, fd: Int): String
     external fun stop(): String
     external fun status(): String
+    /** `{"version": v | null}`: a newer app the server offers (cached for hours). Blocks. */
+    external fun checkUpdate(dir: String): String
+    /** Download the offered update into [into]; `{"path"}`. Blocks. */
+    external fun downloadUpdate(dir: String, into: String): String
 }

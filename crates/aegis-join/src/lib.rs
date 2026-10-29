@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod http;
+pub mod update;
 
 use aegis_identity::pki;
 use base64::Engine;

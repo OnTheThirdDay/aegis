@@ -14,11 +14,11 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::{Command, Stdio};
 
-pub const SOCKET: &str = "/var/run/aegisnet-vpn.sock";
-pub const LABEL: &str = "net.aegisnet.vpn";
+pub const SOCKET: &str = "/var/run/aegisborne-vpn.sock";
+pub const LABEL: &str = "borne.aegis.vpn";
 /// The kill switch's pf anchor: the stock `/etc/pf.conf` evaluates every
 /// anchor under `com.apple/`, so nothing else on the system changes.
-pub const ANCHOR: &str = "com.apple/aegisnet";
+pub const ANCHOR: &str = "com.apple/aegisborne";
 /// The utun interface's own and peer addresses.
 const LOCAL: Ipv4Addr = Ipv4Addr::new(172, 19, 0, 1);
 const PEER: Ipv4Addr = Ipv4Addr::new(172, 19, 0, 2);

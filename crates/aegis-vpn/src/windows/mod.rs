@@ -18,21 +18,21 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-pub const SERVICE: &str = "AegisNetVPN";
-const ADAPTER: &str = "AegisNet";
+pub const SERVICE: &str = "AegisBorneVPN";
+const ADAPTER: &str = "AegisBorne";
 /// A fixed adapter identity: Windows keeps recognising the same network
-/// instead of adding "AegisNet 2", "AegisNet 3"...
+/// instead of adding "AegisBorne 2", "AegisBorne 3"...
 const ADAPTER_GUID: u128 = 0x6165_6769_736e_6574_2d76_706e_0000_0001;
 /// Run a console program without flashing a window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// `%ProgramFiles%\AegisNet`: the helper, Wintun and the journal. Only
+/// `%ProgramFiles%\AegisBorne`: the helper, Wintun and the journal. Only
 /// administrators can write there.
 pub fn install_dir() -> PathBuf {
     let base = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    base.join("AegisNet")
+    base.join("AegisBorne")
 }
 
 pub fn hidden(program: &str) -> Command {
@@ -126,7 +126,7 @@ impl System for Windows {
         let build = || {
             tun_rs::DeviceBuilder::new()
                 .name(ADAPTER)
-                .description("AegisNet VPN")
+                .description("AegisBorne VPN")
                 .device_guid(ADAPTER_GUID)
                 .wintun_file(wintun.clone())
                 .ipv4(Ipv4Addr::new(172, 19, 0, 1), 30u8, None)
