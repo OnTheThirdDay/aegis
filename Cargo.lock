@@ -206,6 +206,7 @@ dependencies = [
 name = "aegis-mobile"
 version = "1.0.0"
 dependencies = [
+ "aegis-config",
  "aegis-join",
  "aegis-node",
  "aegis-tun",

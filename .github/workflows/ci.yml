@@ -14,7 +14,9 @@
 #   * fuzzing and the large property budget run weekly (and on demand);
 #   * pull requests only run branch-policy, and only into main;
 #   * macOS is built only by release.yml for releases on main (the helper
-#     crate is pure Rust, so it is linted for macOS here without an SDK).
+#     crate is pure Rust, so it is linted for macOS here without an SDK);
+#   * the iOS app is built unsigned on macOS for code pushes (free macOS
+#     minutes since the repository is public), proving it compiles and links.
 #
 # Reference implementation only: protected environments, Pi/CF lab runners
 # and signing are NOT configured here and remain BLOCKED until provisioned.
@@ -105,6 +107,37 @@ jobs:
           "$tools/cargo-deny" --locked check advisories bans licenses sources
           "$tools/cargo-audit" audit --deny warnings
           "$tools/cargo-audit" audit --deny warnings --file fuzz/Cargo.lock
+
+  ios:
+    # The iOS app: the Rust core as an xcframework, the Swift app and its
+    # packet tunnel, the Flutter UI. Unsigned: it compiles and links, but
+    # can't be installed (ADR-0018).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      FLUTTER_VERSION: 3.44.4
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Toolchains
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          git clone -q --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+      - name: Rust core
+        run: TARGETS=aarch64-apple-ios bash apps/aegis-mobile/scripts/build-rust-ios.sh
+      - name: App (unsigned)
+        working-directory: apps/aegis-mobile
+        run: |
+          set -euo pipefail
+          flutter --disable-analytics >/dev/null
+          flutter build ios --release --no-codesign
 
   weekly:
     # Fuzzing (07 §11) and the large property budget. Weekly, or on demand

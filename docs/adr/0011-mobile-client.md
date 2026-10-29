@@ -58,4 +58,4 @@ Users want the gateway on their phones. A local proxy, as on desktop, is of litt
 
 - Phones get a real VPN with the gateway's identity pinning, policy and renewal unchanged. The packet path is new code, covered by host unit tests: fake DNS, routes and the SOCKS hop. End to end it was verified on an Android 15 emulator with 16 KB pages: enrollment, VPN consent, `nc` and Chrome (HTTPS) through a local gateway, and disconnect.
 - UDP applications work through the VPN when the gateway supports UDP flows (ADR-0012).
-- iOS needs a Network Extension target (packet tunnel) and an Apple developer account for signing. The Rust core and Flutter UI carry over.
+- iOS needs a Network Extension target (packet tunnel) and an Apple developer account for signing. The Rust core and Flutter UI carry over ([ADR-0018](0018-ios-app.md)).
