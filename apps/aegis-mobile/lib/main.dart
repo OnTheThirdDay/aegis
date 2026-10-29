@@ -41,6 +41,9 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
   String? shared;
   Migration move = Migration();
 
+  /// A newer app the selected server offers.
+  AppUpdate? update;
+
   /// AegisBorne: servers just taken from the old app, and whether that app
   /// is too old to hand them over.
   int moved = 0;
@@ -86,8 +89,10 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
     setState(() {
       move = m;
       servers = s;
+      if (s.isEmpty) update = null;
       if (text != null && text.trim().isNotEmpty) shared = text;
     });
+    unawaited(_checkUpdate());
   }
 
   /// Above the join and home screens while both apps are in play.
@@ -158,9 +163,22 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
       servers: s,
       shared: shared,
       notice: _notice(),
+      update: update,
       onSharedTaken: () => shared = null,
       onChanged: _load,
     );
+  }
+
+  /// Ask the selected server for a newer app (the core reuses its answer
+  /// for a few hours). Not the old app: it moves to AegisBorne instead.
+  Future<void> _checkUpdate() async {
+    if (move.legacy || (servers?.isEmpty ?? true)) return;
+    try {
+      final u = await client.checkUpdate();
+      if (mounted) setState(() => update = u);
+    } on ClientError {
+      // Unreachable server: asked again on the next start or resume.
+    }
   }
 }
 
@@ -291,10 +309,14 @@ class HomeScreen extends StatefulWidget {
     required this.onSharedTaken,
     this.shared,
     this.notice,
+    this.update,
   });
 
   final Client client;
   final Servers servers;
+
+  /// A newer app the server offers.
+  final AppUpdate? update;
 
   /// Reload the server list.
   final Future<void> Function() onChanged;
@@ -315,6 +337,52 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Timer? timer;
   bool busy = false;
   String? error;
+
+  /// Downloading an update, until the system installer takes over.
+  bool updating = false;
+
+  /// A newer app from the server: offered, never installed unasked.
+  Widget _updateCard(AppUpdate u) {
+    final scheme = Theme.of(context).colorScheme;
+    final (done, total) = (status.updateDone, status.updateTotal);
+    return Card(
+      color: scheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '$appName ${u.version} is available (you have ${u.current}).',
+              style: TextStyle(color: scheme.onPrimaryContainer),
+            ),
+            const SizedBox(height: 10),
+            if (updating && done != null && total != null && total > 0)
+              LinearProgressIndicator(value: done / total)
+            else
+              FilledButton(onPressed: updating ? null : _installUpdate, child: const Text('Update')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _installUpdate() async {
+    setState(() {
+      updating = true;
+      error = null;
+    });
+    try {
+      final message = await widget.client.installUpdate();
+      if (message != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+      }
+    } on ClientError catch (e) {
+      if (mounted) setState(() => error = e.message);
+    } finally {
+      if (mounted) setState(() => updating = false);
+    }
+  }
 
   @override
   void initState() {
@@ -533,6 +601,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           padding: const EdgeInsets.all(20),
           children: [
             if (widget.notice != null) widget.notice!,
+            if (widget.update != null) _updateCard(widget.update!),
             const SizedBox(height: 12),
             Center(
               child: SizedBox.square(

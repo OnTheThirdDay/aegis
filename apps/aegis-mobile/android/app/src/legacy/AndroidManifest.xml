@@ -1,7 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- The old app (net.aegis.app): installs the AegisBorne APK it carries
          and hands its servers over (Migration.kt). -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <application>
         <!-- Exported for AegisBorne; MigrationProvider checks the caller's
              package, signature and permission on every call. -->

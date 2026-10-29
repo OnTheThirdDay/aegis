@@ -325,10 +325,21 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
           TAG: ${{ needs.plan.outputs.tag }}
+          AEGIS_UPDATE_SIGNING_KEY: ${{ secrets.AEGIS_UPDATE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           cp deploy/Dockerfile.prebuilt context/Dockerfile
           chmod 0755 context/bin/*/* context/clients/*
+          # Releases sign their client builds as app updates, which the
+          # gateway offers its devices (ADR-0017). Staging builds reuse the
+          # release's version number, so they are never offered.
+          if [ "$CHANNEL" = release ]; then
+            if [ -n "$AEGIS_UPDATE_SIGNING_KEY" ]; then
+              bash .github/scripts/sign-updates.sh context/clients "$VERSION"
+            else
+              echo "::warning::AEGIS_UPDATE_SIGNING_KEY is not set: this release's apps won't be offered as updates"
+            fi
+          fi
           # The image's installer installs this image's tag by default.
           if [ "$CHANNEL" = release ]; then tag=$VERSION; else tag=$TAG; fi
           sed -e "s|^RELEASE_IMAGE=\"@IMAGE@\"|RELEASE_IMAGE=\"$IMAGE:$tag\"|" \

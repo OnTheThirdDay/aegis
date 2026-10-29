@@ -110,3 +110,28 @@ pub extern "system" fn Java_borne_aegis_app_Native_status(
     let v = crate::status();
     ret(&mut env, v)
 }
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_checkUpdate(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+) -> jstring {
+    let dir = arg(&mut env, &dir);
+    let v = crate::check_update(&dir);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_downloadUpdate(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+    into: JString,
+) -> jstring {
+    let (dir, into) = (arg(&mut env, &dir), arg(&mut env, &into));
+    let v = crate::download_update(&dir, &into);
+    ret(&mut env, v)
+}

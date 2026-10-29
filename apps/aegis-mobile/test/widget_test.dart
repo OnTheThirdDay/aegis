@@ -11,6 +11,7 @@ List<String> mockCore(
   String migration = '{"ok":true,"legacy":false,"moved":false,"other_installed":false}',
   String? afterImport,
   String importResult = '{"ok":true,"imported":0,"legacy":"absent"}',
+  String updateResult = '{"ok":true,"version":null,"current":"1.0.0"}',
 }) {
   final calls = <String>[];
   var list = servers;
@@ -31,6 +32,10 @@ List<String> mockCore(
           if (afterImport != null) list = afterImport;
           return importResult;
         case 'uninstallLegacy':
+          return '{"ok":true}';
+        case 'checkUpdate':
+          return updateResult;
+        case 'installUpdate':
           return '{"ok":true}';
       }
       return '{"ok":false,"error":"unexpected"}';
@@ -124,5 +129,35 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Moved to AegisBorne'), findsOneWidget);
     expect(find.text('Open AegisBorne'), findsOneWidget);
+  });
+
+  testWidgets('a newer app the server offers is shown, and installed only when asked', (tester) async {
+    final calls = mockCore(twoServers, updateResult: '{"ok":true,"version":"1.1.0","current":"1.0.0"}');
+    await tester.pumpWidget(const AegisApp());
+    await tester.pumpAndSettle();
+    expect(find.text('AegisBorne 1.1.0 is available (you have 1.0.0).'), findsOneWidget);
+    expect(calls, isNot(contains('installUpdate')));
+    await tester.tap(find.text('Update'));
+    await tester.pump();
+    expect(calls, contains('installUpdate'));
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('no update card without an offer, and none in the old app', (tester) async {
+    mockCore(twoServers);
+    await tester.pumpWidget(const AegisApp());
+    await tester.pumpAndSettle();
+    expect(find.text('Update'), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+
+    final calls = mockCore(
+      twoServers,
+      migration: '{"ok":true,"legacy":true,"moved":false,"other_installed":false}',
+      updateResult: '{"ok":true,"version":"1.1.0","current":"1.0.0"}',
+    );
+    await tester.pumpWidget(const AegisApp());
+    await tester.pumpAndSettle();
+    expect(calls, isNot(contains('checkUpdate')));
+    await tester.pumpWidget(const SizedBox());
   });
 }

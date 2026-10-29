@@ -154,6 +154,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "httparse",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

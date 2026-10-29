@@ -90,7 +90,9 @@ pub enum EdgeRequest {
     Renew,
 }
 
-pub type EdgeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = (u16, Vec<u8>)> + Send>>;
+/// A device request's reply: status, content type, body.
+pub type EdgeFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (u16, &'static str, Vec<u8>)> + Send>>;
 pub type EdgeHook = Arc<dyn Fn(EdgeRequest, Vec<u8>) -> EdgeFuture + Send + Sync>;
 
 /// A byte stream handed over by the edge.

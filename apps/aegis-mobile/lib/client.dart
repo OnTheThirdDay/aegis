@@ -68,6 +68,8 @@ class Status {
     this.connections = 0,
     this.udpFlows = 0,
     this.transport,
+    this.updateDone,
+    this.updateTotal,
   });
 
   factory Status.fromJson(Map<String, dynamic> j) => Status(
@@ -86,6 +88,8 @@ class Status {
         connections: (j['connections'] as num?)?.toInt() ?? 0,
         udpFlows: (j['udp_flows'] as num?)?.toInt() ?? 0,
         transport: j['transport'] as String?,
+        updateDone: (j['update_done'] as num?)?.toInt(),
+        updateTotal: (j['update_total'] as num?)?.toInt(),
       );
 
   final ConnectionState state;
@@ -105,6 +109,18 @@ class Status {
 
   /// What carries the tunnel: `quic` (direct UDP) or `websocket`.
   final String? transport;
+
+  /// An app update downloading: bytes done and total.
+  final int? updateDone;
+  final int? updateTotal;
+}
+
+/// A newer version of the app that the server offers, signed by the
+/// release workflow (ADR-0017), and the version installed.
+class AppUpdate {
+  AppUpdate(this.version, this.current);
+  final String version;
+  final String current;
 }
 
 /// Moving from the old Android app (AegisNet, `net.aegis.app`) to AegisBorne
@@ -194,6 +210,23 @@ class Client {
   /// The old app: install the AegisBorne it carries, or open it. Returns a
   /// message when the user has something to do first.
   Future<String?> installBorne() async => (await _call('installBorne'))['message'] as String?;
+
+  /// A newer app the selected server offers (checked every few hours), or
+  /// null. Not on iOS yet.
+  Future<AppUpdate?> checkUpdate() async {
+    try {
+      final j = await _call('checkUpdate');
+      final v = j['version'] as String?;
+      return v == null ? null : AppUpdate(v, (j['current'] as String?) ?? '');
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Download the offered update and hand it to the system installer,
+  /// which asks the user. Returns a message when the user has something to
+  /// do first.
+  Future<String?> installUpdate() async => (await _call('installUpdate'))['message'] as String?;
 
   /// Ask Android to uninstall the old app (the user confirms).
   Future<void> uninstallLegacy() => _call('uninstallLegacy');

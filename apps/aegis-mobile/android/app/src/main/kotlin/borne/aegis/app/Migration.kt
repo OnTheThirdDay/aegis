@@ -1,13 +1,10 @@
 package borne.aegis.app
 
-import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
-import android.provider.Settings
 import org.json.JSONObject
 import java.io.File
 
@@ -29,7 +26,6 @@ object Migration {
     const val AUTHORITY = "net.aegis.app.migration"
     const val PERMISSION = "borne.aegis.app.permission.MIGRATE"
     const val EXPORT = "export"
-    const val ACTION_INSTALL_STATUS = "borne.aegis.app.INSTALL_STATUS"
 
     /** The AegisBorne APK inside the legacy build (added by CI). */
     private const val BUNDLED_APK = "aegisborne.apk"
@@ -96,39 +92,12 @@ object Migration {
             context.startActivity(open)
             return null
         }
-        val pm = context.packageManager
-        if (!pm.canRequestPackageInstalls()) {
-            context.startActivity(
-                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
-            )
-            return "Allow AegisNet to install apps, then press Move to AegisBorne again."
-        }
         val apk = try {
             context.assets.open(BUNDLED_APK)
         } catch (_: java.io.IOException) {
             return "This build doesn't include AegisBorne. Download it from your server instead."
         }
-        val installer = pm.packageInstaller
-        val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
-        params.setAppPackageName(BORNE)
-        val id = installer.createSession(params)
-        installer.openSession(id).use { session ->
-            apk.use { input ->
-                session.openWrite("aegisborne", 0, -1).use { output ->
-                    input.copyTo(output)
-                    session.fsync(output)
-                }
-            }
-            // The result comes back to MainActivity, which shows the
-            // system's confirmation when it asks for one.
-            val status = Intent(context, MainActivity::class.java).setAction(ACTION_INSTALL_STATUS)
-            val pending = PendingIntent.getActivity(
-                context, id, status,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-            )
-            session.commit(pending.intentSender)
-        }
-        return null
+        return Installer.install(context, apk, BORNE, "AegisNet")
     }
 
     // ---- AegisBorne: take the servers ----

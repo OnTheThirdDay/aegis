@@ -16,11 +16,12 @@
 #![forbid(unsafe_code)]
 
 mod engine;
+mod selfupdate;
 mod settings;
 mod sysproxy;
 
 use eframe::egui::{self, Color32, RichText};
-use engine::{Command, Engine, Status};
+use engine::{Command, Engine, Status, UpdateState};
 use settings::Settings;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -540,6 +541,77 @@ impl App {
     }
 }
 
+impl App {
+    /// A newer version from the server: offered, never installed unasked.
+    fn update_view(&mut self, ui: &mut egui::Ui, s: &engine::Snapshot) {
+        let current = env!("CARGO_PKG_VERSION");
+        match &s.update {
+            UpdateState::None => {}
+            UpdateState::Available(version) => {
+                ui.group(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "AegisBorne {version} is available (you have {current})."
+                        ))
+                        .color(BLUE),
+                    );
+                    if ui.button("Update").clicked() {
+                        self.engine.send(Command::InstallUpdate);
+                    }
+                });
+            }
+            UpdateState::Downloading {
+                version,
+                done,
+                total,
+            } => {
+                ui.group(|ui| {
+                    ui.label(format!("Downloading AegisBorne {version}…"));
+                    let part = if *total > 0 {
+                        *done as f32 / *total as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(egui::ProgressBar::new(part).show_percentage());
+                });
+            }
+            UpdateState::Ready { version, start } => {
+                ui.group(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "AegisBorne {version} is installed. Restart the app to use it."
+                        ))
+                        .color(GREEN),
+                    );
+                    if ui.button("Restart now").clicked() {
+                        // Disconnects and restores system settings first.
+                        self.engine.shutdown();
+                        match selfupdate::relaunch(start) {
+                            Ok(()) => std::process::exit(0),
+                            Err(e) => {
+                                self.paste_error = Some(format!(
+                                    "Could not restart: {e}. Start the app again yourself."
+                                ))
+                            }
+                        }
+                    }
+                });
+            }
+            UpdateState::Failed { version, message } => {
+                ui.group(|ui| {
+                    ui.label(
+                        RichText::new(format!("Updating to {version} failed: {message}"))
+                            .color(RED),
+                    );
+                    if ui.button("Try again").clicked() {
+                        self.engine.send(Command::InstallUpdate);
+                    }
+                });
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let s = self.engine.snapshot();
@@ -569,6 +641,7 @@ impl eframe::App for App {
             } else if let Some(i) = &s.info {
                 ui.label(RichText::new(i).color(GREEN));
             }
+            self.update_view(ui, &s);
             let blocked = matches!(
                 s.vpn_helper,
                 aegis_vpn::client::HelperState::Ready { blocked: true, .. }
@@ -602,6 +675,7 @@ impl eframe::App for App {
         if matches!(s.status, Status::Connected | Status::Connecting)
             || s.joining
             || s.vpn_busy
+            || matches!(s.update, UpdateState::Downloading { .. })
             || self.engine.diag.is_recording()
         {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -615,6 +689,7 @@ fn main() -> eframe::Result {
     if let Some(code) = aegis_vpn::dispatch(&args) {
         std::process::exit(code);
     }
+    selfupdate::cleanup();
     let data_dir = match settings::data_dir() {
         Ok(d) => d,
         Err(e) => {

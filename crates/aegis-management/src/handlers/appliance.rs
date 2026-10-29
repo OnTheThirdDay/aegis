@@ -639,7 +639,12 @@ pub async fn downloads(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult 
             let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
                 continue;
             };
-            if !download_name_ok(&name) || !meta.is_file() || meta.len() > MAX_DOWNLOAD_BYTES {
+            // FILE.update: the signed description of an app update (ADR-0017).
+            if !download_name_ok(&name)
+                || name.ends_with(".update")
+                || !meta.is_file()
+                || meta.len() > MAX_DOWNLOAD_BYTES
+            {
                 continue;
             }
             let cached = c

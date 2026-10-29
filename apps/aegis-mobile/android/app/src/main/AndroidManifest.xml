@@ -3,6 +3,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Installing app updates the server offers, and AegisBorne from the
+         old app (Installer.kt; the user confirms each). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- Removing the old app once AegisBorne took over (the user confirms). -->
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
 
