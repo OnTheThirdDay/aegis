@@ -1,13 +1,15 @@
 [package]
 name = "aegis-mobile"
-description = "Mobile client core: enrollment, the client node and the VPN packet path (Android VpnService; later the iOS packet tunnel)."
+description = "Mobile client core: enrollment, the client node and the VPN packet path (Android VpnService, iOS packet tunnel)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [lib]
-# cdylib: loaded by the Android app (JNI); rlib: host tests.
+# cdylib: loaded by the Android app (JNI); rlib: host tests. The iOS build
+# makes a static library (scripts/build-rust-ios.sh) with the C interface in
+# ffi.rs.
 crate-type = ["cdylib", "rlib"]
 
 # The workspace forbids unsafe code; this crate needs it at the platform
@@ -20,6 +22,7 @@ unwrap_used = "warn"
 panic = "warn"
 
 [dependencies]
+aegis-config = { workspace = true }
 aegis-join = { workspace = true }
 aegis-node = { workspace = true }
 aegis-tun = { workspace = true }

@@ -1,0 +1,4 @@
+module AegisCore {
+    header "aegis_core.h"
+    export *
+}

@@ -1,6 +1,6 @@
 # AegisBorne mobile app
 
-Flutter UI over the Rust core in `crates/aegis-mobile` ([ADR-0011](../../docs/adr/0011-mobile-client.md)). Android first; iOS later on the same core.
+Flutter UI over the Rust core in `crates/aegis-mobile` ([ADR-0011](../../docs/adr/0011-mobile-client.md)), on Android and iOS ([ADR-0018](../../docs/adr/0018-ios-app.md)).
 
 ## Build (Android)
 
@@ -25,6 +25,18 @@ Flutter UI over the Rust core in `crates/aegis-mobile` ([ADR-0011](../../docs/ad
 
    Release signing reads `android/key.properties` (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`) or the `AEGIS_ANDROID_*` environment variables; otherwise the debug key is used.
 
+## Build (iOS)
+
+On macOS with Xcode and Rust (`rustup target add aarch64-apple-ios aarch64-apple-ios-sim`):
+
+```sh
+bash apps/aegis-mobile/scripts/build-rust-ios.sh   # ios/AegisCore.xcframework
+cd apps/aegis-mobile
+flutter build ios --release --no-codesign
+```
+
+Signed builds need the App IDs `borne.aegis.app` and `borne.aegis.app.tunnel` with the Network Extension capability and the App Group `group.borne.aegis.app` ([ADR-0018](../../docs/adr/0018-ios-app.md)).
+
 ## Layout
 
 - `lib/`: the UI (`main.dart`) and the method channel `aegisborne/client` (`client.dart`).
@@ -32,4 +44,8 @@ Flutter UI over the Rust core in `crates/aegis-mobile` ([ADR-0011](../../docs/ad
   - `MainActivity`: the channel and VPN consent;
   - `AegisVpnService`: the VPN interface and foreground service;
   - `Native`: the JNI bindings;
-  - `Migration`, `MigrationProvider`: moving from the old app to AegisBorne.
+  - `Migration`, `MigrationProvider`: moving from the old app to AegisBorne;
+  - `Installer`: installing APKs (AegisBorne from the old app, app updates).
+- `ios/Runner/AegisChannel.swift`: the channel on iOS, and starting the tunnel.
+- `ios/AegisTunnel/PacketTunnelProvider.swift`: the VPN (packet tunnel extension).
+- `ios/AegisCore/include/`: the Rust core's C interface.
