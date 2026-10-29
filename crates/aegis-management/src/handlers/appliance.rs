@@ -593,6 +593,8 @@ fn download_label(name: &str) -> String {
     }
     let os = if n.contains("android") || n.ends_with(".apk") {
         "Android"
+    } else if n.ends_with(".ipa") {
+        "iOS"
     } else if n.contains("windows") || n.ends_with(".exe") {
         "Windows"
     } else if n.contains("macos") || n.contains("darwin") {

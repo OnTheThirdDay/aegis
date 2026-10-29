@@ -102,6 +102,23 @@ macOS is compiled only for releases (one universal `AegisBorne.app` in `aegis-cl
   ```
 
   Add the repository secret `AEGIS_UPDATE_SIGNING_KEY` with the contents of `update-signing-key.pem`. Without it, releases still build but warn, and their apps aren't offered as updates.
+- **iOS (Ad Hoc, ADR-0018):** an Apple Developer Program team (`2ANDRZ4DY3`, in the Xcode project and `ios/ExportOptions.plist`) with:
+  - the App IDs `borne.aegis.app` and `borne.aegis.app.tunnel`, both with Network Extensions and App Groups (`group.borne.aegis.app`);
+  - an App Store Connect API key with the Admin role;
+  - an Apple Distribution certificate (made through that key; its private key never leaves the machine that made it);
+  - at least one registered iPhone.
+
+  Repository secrets:
+
+  | Secret | Value |
+  |---|---|
+  | `APPLE_API_KEY_ID` | the key's id |
+  | `APPLE_API_ISSUER_ID` | the issuer id (App Store Connect → Users and Access → Integrations) |
+  | `APPLE_API_KEY_P8` | the contents of `AuthKey_<id>.p8` |
+  | `APPLE_DIST_P12_B64` | `base64 -w0 distribution.p12` |
+  | `APPLE_DIST_P12_PASSWORD` | the `.p12` password |
+
+  Each build makes fresh Ad Hoc profiles (`.github/scripts/ios-profiles.py`) listing every registered iPhone, and the release's `aegis-client-ios.ipa` installs on those only. Register a friend's iPhone with its UDID (on the iPhone, Safari → udid.tech) in the developer portal (Devices → +) or with the same key: `ios-profiles.py add-device NAME UDID`. The next build includes it. Without the secrets, or with no iPhone registered, the iOS job reports why and the rest of the release goes ahead.
 - **Local hook:** run `git config core.hooksPath .githooks` once per clone. It blocks direct pushes to `main` and `staging`; `--no-verify` overrides it deliberately.
 - **Branch protection:** rulesets need a paid plan for private repositories. Until then, the main gate in release.yml, `branch-policy` and the hook enforce the flow. With rulesets available:
   - **`main`:** block force pushes and deletion; require a pull request with merge commits only; require the `branch-policy` check.
