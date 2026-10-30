@@ -196,6 +196,7 @@ pub async fn launch(
         app.integrations.resume();
         tokio::spawn(services::maintenance_loop(Arc::clone(&app)));
         tokio::spawn(services::diagnostics_loop(Arc::clone(&app)));
+        tokio::spawn(services::ios_loop(Arc::clone(&app)));
         running.appliance = Some(app);
     }
     running.console = Some(bound);

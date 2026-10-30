@@ -117,8 +117,11 @@ macOS is compiled only for releases (one universal `AegisBorne.app` in `aegis-cl
   | `APPLE_API_KEY_P8` | the contents of `AuthKey_<id>.p8` |
   | `APPLE_DIST_P12_B64` | `base64 -w0 distribution.p12` |
   | `APPLE_DIST_P12_PASSWORD` | the `.p12` password |
+  | `AEGIS_IOS_APP_KEY` | 32 random bytes, base64 (`head -c 32 /dev/urandom \| base64`): the app is published only encrypted with it ([ADR-0019](adr/0019-iphone-app-distribution.md)) |
 
   Each build makes fresh Ad Hoc profiles (`.github/scripts/ios-profiles.py`) listing every registered iPhone, and the release's `aegis-client-ios.ipa` installs on those only. Register a friend's iPhone with its UDID (on the iPhone, Safari → udid.tech) in the developer portal (Devices → +) or with the same key: `ios-profiles.py add-device NAME UDID`. The next build includes it. Without the secrets, or with no iPhone registered, the iOS job reports why and the rest of the release goes ahead.
+
+  Friends' iPhones are normally added from the gateways ([ADR-0019](adr/0019-iphone-app-distribution.md)): in each gateway's console, **Integrations → iPhone app**, enter the repository, a fine-grained GitHub token for this repository only (Contents: read and write) and the `AEGIS_IOS_APP_KEY`. Users then press **Register this iPhone** in the portal, you approve it in the console, and the `ios-device` workflow registers the iPhone and re-signs the current app; every gateway fetches it within 10 minutes. The same workflow can be run by hand (Actions → iOS device) with a name and UDID.
 - **Local hook:** run `git config core.hooksPath .githooks` once per clone. It blocks direct pushes to `main` and `staging`; `--no-verify` overrides it deliberately.
 - **Branch protection:** rulesets need a paid plan for private repositories. Until then, the main gate in release.yml, `branch-policy` and the hook enforce the flow. With rulesets available:
   - **`main`:** block force pushes and deletion; require a pull request with merge commits only; require the `branch-policy` check.

@@ -641,9 +641,11 @@ pub async fn downloads(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult 
             let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
                 continue;
             };
-            // FILE.update: the signed description of an app update (ADR-0017).
+            // FILE.update: the signed description of an app update (ADR-0017);
+            // .enc: the iPhone app, served through the portal (ADR-0019).
             if !download_name_ok(&name)
                 || name.ends_with(".update")
+                || name.ends_with(".enc")
                 || !meta.is_file()
                 || meta.len() > MAX_DOWNLOAD_BYTES
             {
@@ -750,14 +752,14 @@ fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
 const FILE_CHUNK: usize = 64 * 1024;
 
 /// A response body read from a file of known length, one chunk at a time.
-struct FileBody {
+pub(crate) struct FileBody {
     file: tokio::fs::File,
     remaining: u64,
     buf: Box<[u8]>,
 }
 
 impl FileBody {
-    fn new(file: tokio::fs::File, len: u64) -> Self {
+    pub(crate) fn new(file: tokio::fs::File, len: u64) -> Self {
         FileBody {
             file,
             remaining: len,

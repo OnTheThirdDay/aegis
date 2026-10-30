@@ -229,6 +229,86 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         assert_eq!(s, 200, "{v}");
         assert_eq!(v["items"][0]["owner"]["username"], "admin", "{v}");
 
+        // The iPhone app (ADR-0019): not set up, so the portal offers it to
+        // nobody; a registration profile's link still records an iPhone
+        // for approval, once.
+        let (s, v) = c.call(reqwest::Method::GET, "/ios", None).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["enabled"], false, "{v}");
+        let session = format!("aegis_session={}", c.cookie.clone().expect("session"));
+        let profile = c
+            .http
+            .get(format!("{}/api/v1/ios/register.mobileconfig", c.base))
+            .header("cookie", &session)
+            .send()
+            .await
+            .expect("profile");
+        assert_eq!(profile.status(), 200);
+        assert_eq!(profile.headers()["content-type"], "application/x-apple-aspen-config");
+        let text = profile.text().await.expect("profile text");
+        assert!(text.contains("<string>Profile Service</string>"));
+        let callback = text
+            .split("<string>")
+            .find(|s| s.contains("/api/v1/ios/udid/"))
+            .and_then(|s| s.split("</string>").next())
+            .expect("callback link");
+        let token = callback.rsplit('/').next().expect("token").to_owned();
+        // What iOS posts back: a plist inside a signature.
+        let mut posted = b"\x30\x80signed".to_vec();
+        posted.extend_from_slice(
+            br#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>DEVICE_NAME</key><string>Test iPhone</string><key>PRODUCT</key><string>iPhone15,2</string><key>UDID</key><string>00008030-001A35E40C3A802E</string><key>VERSION</key><string>22A3354</string></dict></plist>"#,
+        );
+        let ios = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(web_ca.as_bytes()).expect("ca"))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let back = |r: reqwest::Response| {
+            assert_eq!(r.status(), 301);
+            r.headers()["location"].to_str().expect("location").to_owned()
+        };
+        let first = ios
+            .post(format!("{}/api/v1/ios/udid/{token}", c.base))
+            .body(posted.clone())
+            .send()
+            .await
+            .expect("callback");
+        assert!(back(first).ends_with("#ios-registered"));
+        let again = ios
+            .post(format!("{}/api/v1/ios/udid/{token}", c.base))
+            .body(posted)
+            .send()
+            .await
+            .expect("callback");
+        assert!(back(again).ends_with("#ios-expired"), "a link registers once");
+        let (s, v) = c.call(reqwest::Method::GET, "/integrations", None).await;
+        assert_eq!(s, 200, "{v}");
+        let iphone = v["integrations"]
+            .as_array()
+            .and_then(|l| l.iter().find(|i| i["id"] == "ios"))
+            .expect("iPhone app integration")
+            .clone();
+        assert_eq!(iphone["state"], "off");
+        let request = &iphone["requests"][0];
+        assert_eq!(request["udid"], "00008030-001A35E40C3A802E");
+        assert_eq!(request["name"], "Test iPhone");
+        assert_eq!(request["username"], "admin");
+        assert_eq!(request["state"], "pending");
+        // Approving needs GitHub settings; removing works.
+        let id = request["id"].clone();
+        let (s, _) = c
+            .call(reqwest::Method::POST, "/integrations/ios/approve", Some(json!({"id": id})))
+            .await;
+        assert_eq!(s, 409, "not set up: nothing is sent");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/integrations/ios/reject", Some(json!({"id": id})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        let (_, v) = c.call(reqwest::Method::GET, "/ios", None).await;
+        assert_eq!(v["requests"], json!([]), "{v}");
+
         // App updates: the gateway offers only builds with a signed
         // description next to them, and serves them to enrolled devices in
         // pieces; the device resumes a partial download and checks the hash.
