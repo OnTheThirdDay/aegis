@@ -314,6 +314,24 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
         assert_eq!(s, 200, "{v}");
         let (_, v) = c.call(reqwest::Method::GET, "/ios", None).await;
         assert_eq!(v["requests"], json!([]), "{v}");
+        // Reaching GitHub through another gateway: joining it with one of
+        // its invitations (here this gateway's own), then stopping again.
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/devices/invite", Some(json!({"name": "gw-upstream", "expires_in_hours": 1})))
+            .await;
+        assert_eq!(s, 201, "{v}");
+        let code = v["code"].as_str().expect("code").to_owned();
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/integrations/ios/configure", Some(json!({"via": code})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["status"]["via"]["name"], "gw-upstream", "{v}");
+        assert!(v["status"]["via"]["server"].as_str().is_some_and(|s| s.starts_with("127.0.0.1")), "{v}");
+        let (s, v) = c
+            .call(reqwest::Method::POST, "/integrations/ios/configure", Some(json!({"via": ""})))
+            .await;
+        assert_eq!(s, 200, "{v}");
+        assert!(v["status"]["via"].is_null(), "{v}");
 
         // App updates: the gateway offers only builds with a signed
         // description next to them, and serves them to enrolled devices in
@@ -727,8 +745,14 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
 
         // Revoke: new sessions/streams are refused.
         let (_, v) = c.call(reqwest::Method::GET, "/devices", None).await;
-        let id = v["items"][0]["id"].as_str().expect("id").to_owned();
-        let etag = v["items"][0]["etag"].as_str().expect("etag").to_owned();
+        // The laptop (other devices joined above, e.g. a gateway's own).
+        let laptop = v["items"]
+            .as_array()
+            .and_then(|l| l.iter().find(|d| d["name"] == "laptop"))
+            .expect("laptop device")
+            .clone();
+        let id = laptop["id"].as_str().expect("id").to_owned();
+        let etag = laptop["etag"].as_str().expect("etag").to_owned();
         let resp = c
             .http
             .post(format!("{}/api/v1/devices/{id}/revoke", c.base))

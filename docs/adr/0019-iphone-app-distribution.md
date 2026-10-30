@@ -29,8 +29,14 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 **Each gateway (`integrations/ios.rs`, console: Integrations → iPhone app)**
 
 - **Settings:** the repository, a GitHub token (fine-grained, that repository only, Contents read and write) and the app key. The token and key go in the gateway's secret store.
-- **Fetching:** every 10 minutes, and on demand, the gateway checks the latest release's asset. When it changed (a new release or a re-signed build), it downloads it, decrypts it and keeps it as `ios/app.ipa`.
+- **Fetching:** every 10 minutes, and on demand, the gateway checks the latest release's asset. When it changed (a new release or a re-signed build), it downloads it, decrypts it and keeps it as `ios/app.ipa`. Fetching always runs in the background: the console never waits on GitHub, which can be slow or blocked, and calls to GitHub's API that the console does wait on (approving) give up after 20 seconds.
+- **Through another gateway (optional):** a gateway that can't reach GitHub directly (GitHub's downloads are blocked in places, such as mainland China) reaches it through one of the owner's other gateways.
+  - It joins that gateway as a device, with an invitation created there (pasted under **Reach GitHub through another gateway**).
+  - Its GitHub requests then go through a built-in client: a local HTTP proxy into the tunnel, started when first needed. Nothing else of its traffic changes.
+  - Its device identity there renews like any device's, and appears on that gateway's Devices page, where it can be revoked. **Stop using it** removes it from this side.
+  - Friends' iPhones never contact GitHub either way: they reach only their gateway.
 - **Requests:** users' iPhone requests, which the administrator approves (this starts the workflow) or removes. Up to 500 are kept; the same iPhone keeps one request.
+- **Automatic approval (optional, per gateway):** an iPhone is approved as soon as it registers, while its user has fewer than N approved iPhones (2 unless set, 1–10). Beyond that, requests wait for the administrator. This guards the team's 100 iPhones a year against anyone who can sign in to the portal.
 
 **The user portal (Devices → iPhone app; `handlers/ios.rs`)**
 
@@ -41,6 +47,7 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 - **Install:**
   - An `itms-services://` link to a manifest. iOS fetches the manifest and the app itself, without the user's session, so both links carry a token valid for an hour.
   - The links use the portal's public address, which needs a publicly trusted certificate (Cloudflare Tunnel or Let's Encrypt).
+- **Older iPhones:** the portal's pages work in Safari on iOS 12 (the iPhone 6's last): a `replaceChildren` fallback, no `?.`, a clipboard fallback. Registering works there too; the app itself needs iOS 16.
 - **Portal routes:** these are its only additions. The token-carrying routes need no session; everything else needs a signed-in user.
 
 ## Consequences

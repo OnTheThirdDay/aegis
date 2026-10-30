@@ -123,7 +123,7 @@ impl Integrations {
                     let ios = ios.ok_or((503, "appliance_unavailable".to_owned()))?;
                     match a {
                         "configure" => ios.configure(&actor, body).await,
-                        "fetch" => ios.fetch().await,
+                        "fetch" => ios.fetch(),
                         "approve" => ios.approve(&actor, &body).await,
                         "reject" => ios.reject(&actor, &body),
                         // From the user portal (the management API checks who).

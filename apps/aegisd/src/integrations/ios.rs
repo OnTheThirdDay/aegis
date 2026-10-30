@@ -12,6 +12,11 @@
 //!   approves the request here, which starts the repository's `ios-device`
 //!   workflow (repository dispatch). Neither the Apple key nor the signing
 //!   certificate is on the gateway.
+//! - A gateway that can't reach GitHub (its downloads are blocked in places)
+//!   can reach it through another gateway: it joins that gateway as a device,
+//!   with an invitation from it, and its GitHub requests go through a client
+//!   of its own (a local HTTP proxy into the tunnel). Nothing else of its
+//!   traffic changes.
 
 use crate::services::Appliance;
 use aegis_storage::now_unix;
@@ -19,7 +24,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 pub const ID: &str = "ios";
@@ -35,6 +41,9 @@ const AAD: &[u8] = b"aegisborne-ipa/1";
 const MAX_BYTES: u64 = 400 * 1024 * 1024;
 /// Requests kept (pending, approved or failed).
 const MAX_REQUESTS: usize = 500;
+/// GitHub's API, while the console waits (under the gateway's 30-second
+/// idle limit): reading the latest release, starting the workflow.
+const API_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn err(status: u16, code: impl Into<String>) -> (u16, String) {
     (status, code.into())
@@ -44,6 +53,31 @@ fn err(status: u16, code: impl Into<String>) -> (u16, String) {
 struct Settings {
     /// `owner/name` of the repository whose releases carry the app.
     repository: Option<String>,
+    /// Approve users' iPhones as soon as they register, up to
+    /// `auto_per_user` approved iPhones each; beyond that they wait.
+    #[serde(default)]
+    auto_approve: bool,
+    #[serde(default)]
+    auto_per_user: Option<u32>,
+}
+
+/// iPhones a user gets approved automatically, unless set otherwise.
+const AUTO_PER_USER: u32 = 2;
+
+impl Settings {
+    fn per_user(&self) -> u32 {
+        self.auto_per_user.unwrap_or(AUTO_PER_USER)
+    }
+}
+
+/// Whether `user`'s new request may be approved automatically: below the
+/// number of iPhones each user gets without the administrator.
+fn auto_allowed(requests: &[Request], user: &str, limit: u32) -> bool {
+    let approved = requests
+        .iter()
+        .filter(|r| r.user == user && r.state == "approved")
+        .count();
+    approved < limit as usize
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -77,6 +111,17 @@ pub struct IosIntegration {
     /// Serialises changes to the files in `dir`.
     files: Mutex<()>,
     last_error: Mutex<Option<String>>,
+    /// A fetch runs in the background; one at a time.
+    fetching: AtomicBool,
+    /// The client into the other gateway GitHub is reached through, while
+    /// it runs.
+    upstream: tokio::sync::Mutex<Option<aegis_node::NodeRuntime>>,
+}
+
+/// `host[:port]` of a URL.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?']).next().unwrap_or(rest).to_owned()
 }
 
 /// An iPhone UDID: 40 hex digits (older models) or `XXXXXXXX-XXXXXXXXXXXXXXXX`.
@@ -126,6 +171,8 @@ impl IosIntegration {
             dir,
             files: Mutex::new(()),
             last_error: Mutex::new(None),
+            fetching: AtomicBool::new(false),
+            upstream: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -187,7 +234,15 @@ impl IosIntegration {
             "description": "Ad Hoc builds of the iPhone app for registered iPhones: users register their iPhone in the portal, you approve it here, and they install the app from the portal.",
             "enabled": configured,
             "state": if !configured { "off" } else if error.is_some() { "error" } else if app_ready { "active" } else { "pending" },
+            "fetching": self.fetching.load(Ordering::Relaxed),
             "repository": settings.repository,
+            "auto_approve": settings.auto_approve,
+            "auto_per_user": settings.per_user(),
+            "via": self.upstream_dir().load().ok().map(|d| json!({
+                "server": host_of(&d.url),
+                "name": d.name,
+                "certificate_expires_at": self.upstream_dir().certificate_expires_at().ok(),
+            })),
             "has_token": self.secret(TOKEN).is_some(),
             "has_key": self.secret(KEY).is_some(),
             "app": if app_ready { serde_json::to_value(&fetched).unwrap_or(Value::Null) } else { Value::Null },
@@ -196,26 +251,43 @@ impl IosIntegration {
         })
     }
 
-    /// `{repository?, token?, key?}`: the repository whose releases carry
-    /// the app, a GitHub token that can read its releases and start its
-    /// workflows, and the app's decryption key (base64, 32 bytes).
-    pub async fn configure(&self, actor: &str, body: Value) -> Result<Value, (u16, String)> {
+    /// `{repository?, via?, token?, key?}`: the repository whose releases
+    /// carry the app; `via`, an invitation from another gateway to reach
+    /// GitHub through ("" to stop); a GitHub token that can read its
+    /// releases and start its workflows; and the app's decryption key
+    /// (base64, 32 bytes). Then fetches the app in the background.
+    pub async fn configure(
+        self: &Arc<Self>,
+        actor: &str,
+        body: Value,
+    ) -> Result<Value, (u16, String)> {
         let app = self
             .app
             .upgrade()
             .ok_or_else(|| err(503, "appliance_unavailable"))?;
-        if let Some(r) = body.get("repository").and_then(Value::as_str) {
-            let r = r.trim();
-            if !valid_repository(r) {
-                return Err(err(400, "the repository must look like owner/name"));
-            }
+        {
             let _guard = self.files.lock().unwrap_or_else(|e| e.into_inner());
-            self.save(
-                "settings.json",
-                &Settings {
-                    repository: Some(r.to_owned()),
-                },
-            )?;
+            let mut settings: Settings = self.load("settings.json");
+            if let Some(r) = body.get("repository").and_then(Value::as_str) {
+                let r = r.trim();
+                if !valid_repository(r) {
+                    return Err(err(400, "the repository must look like owner/name"));
+                }
+                settings.repository = Some(r.to_owned());
+            }
+            if let Some(on) = body.get("auto_approve").and_then(Value::as_bool) {
+                settings.auto_approve = on;
+            }
+            if let Some(n) = body.get("auto_per_user").and_then(Value::as_u64) {
+                if !(1..=10).contains(&n) {
+                    return Err(err(400, "iPhones per user: 1 to 10"));
+                }
+                settings.auto_per_user = Some(n as u32);
+            }
+            self.save("settings.json", &settings)?;
+        }
+        if let Some(code) = body.get("via").and_then(Value::as_str) {
+            self.set_via(code.trim()).await?;
         }
         if let Some(t) = body.get("token").and_then(Value::as_str).map(str::trim) {
             if t.is_empty() || t.len() > 512 || !t.bytes().all(|b| b.is_ascii_graphic()) {
@@ -233,15 +305,103 @@ impl IosIntegration {
             app.secrets.put(KEY, k, true).map_err(|e| err(500, e.0))?;
         }
         self.audit(actor, "ios.configured", json!({}));
-        let fetched = self.fetch().await;
-        Ok(json!({ "fetched": fetched.is_ok(), "status": self.status() }))
+        self.set_error(None);
+        let started = self.start_fetch();
+        Ok(json!({ "fetching": started, "status": self.status() }))
     }
 
-    fn client() -> Result<reqwest::Client, (u16, String)> {
-        reqwest::Client::builder()
+    /// Fetch in the background (the console never waits on GitHub, which can
+    /// be slow or blocked). False when one is already running.
+    pub fn start_fetch(self: &Arc<Self>) -> bool {
+        if self.fetching.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = me.fetch_now().await;
+            me.fetching.store(false, Ordering::Release);
+        });
+        true
+    }
+
+    fn upstream_dir(&self) -> aegis_join::DeviceDir {
+        aegis_join::DeviceDir::new(self.dir.join("upstream"))
+    }
+
+    /// Join another gateway (an invitation from it) to reach GitHub through,
+    /// replacing any earlier one; "" stops using one.
+    async fn set_via(&self, code: &str) -> Result<(), (u16, String)> {
+        if let Some(node) = self.upstream.lock().await.take() {
+            node.shutdown(Duration::from_secs(1)).await;
+        }
+        let dir = self.dir.join("upstream");
+        let _ = std::fs::remove_dir_all(&dir);
+        if code.is_empty() {
+            return Ok(());
+        }
+        let invite = aegis_join::parse_invite(code).map_err(|e| err(400, e.to_string()))?;
+        // Under the gateway's 30-second idle limit for the console.
+        tokio::time::timeout(
+            API_TIMEOUT,
+            aegis_join::enroll(&invite, &aegis_join::DeviceDir::new(&dir)),
+        )
+        .await
+        .map_err(|_| err(502, "the other gateway didn't answer in time"))?
+        .map_err(|e| err(502, format!("joining the other gateway: {e}")))?;
+        Ok(())
+    }
+
+    /// The local HTTP proxy into the other gateway, when one is set
+    /// (starting its client the first time).
+    async fn via(&self) -> Result<Option<String>, (u16, String)> {
+        let dir = self.upstream_dir();
+        if dir.load().is_err() {
+            return Ok(None);
+        }
+        let mut node = self.upstream.lock().await;
+        if node.is_none() {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(dir.root.join(format!("state.db{suffix}")));
+            }
+            let config = aegis_join::client_config(&dir, aegis_join::Ports { socks: 0, http: 0 })
+                .map_err(|e| err(409, format!("the other gateway: {e}")))?;
+            let started = aegis_node::start(aegis_node::StartOptions {
+                config,
+                store_path: dir.store(),
+                failpoints: None,
+            })
+            .await
+            .map_err(|e| err(502, format!("the other gateway: {e}")))?;
+            *node = Some(started);
+        }
+        let addr = node
+            .as_ref()
+            .and_then(|n| n.bound_addr("http"))
+            .ok_or_else(|| err(500, "the client into the other gateway has no proxy"))?;
+        Ok(Some(format!("http://{addr}")))
+    }
+
+    /// Keep the device identity at the other gateway renewed.
+    async fn renew_via(&self) {
+        let dir = self.upstream_dir();
+        if dir.load().is_ok() && matches!(aegis_join::renew_if_due(&dir, false).await, Ok(true)) {
+            if let Some(node) = self.upstream.lock().await.as_ref() {
+                let _ = node.ctx.reload_certificates();
+            }
+        }
+    }
+
+    /// For GitHub: through the other gateway, when one is set.
+    async fn client(&self) -> Result<reqwest::Client, (u16, String)> {
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("aegisborne/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(600));
+        if let Some(proxy) = self.via().await? {
+            builder =
+                builder.proxy(reqwest::Proxy::all(&proxy).map_err(|e| err(500, e.to_string()))?);
+        }
+        builder
             .build()
             .map_err(|e| err(500, format!("HTTP client: {e}")))
     }
@@ -259,13 +419,21 @@ impl IosIntegration {
 
     /// Fetch the latest release's app when it changed (new release, or
     /// re-signed for a new iPhone). Quiet when not configured.
-    pub async fn poll(&self) {
+    pub async fn poll(self: &Arc<Self>) {
+        self.renew_via().await;
         if self.github().is_ok() && self.secret(KEY).is_some() {
-            let _ = self.fetch().await;
+            self.start_fetch();
         }
     }
 
-    pub async fn fetch(&self) -> Result<Value, (u16, String)> {
+    /// "Check GitHub now": starts a fetch; the status shows the outcome.
+    pub fn fetch(self: &Arc<Self>) -> Result<Value, (u16, String)> {
+        self.github()?;
+        let started = self.start_fetch();
+        Ok(json!({ "fetching": true, "started": started }))
+    }
+
+    async fn fetch_now(&self) -> Result<Value, (u16, String)> {
         let result = self.fetch_inner().await;
         self.set_error(result.as_ref().err().map(|e| e.1.clone()));
         result
@@ -279,11 +447,12 @@ impl IosIntegration {
         let key = base64::engine::general_purpose::STANDARD
             .decode(key)
             .map_err(|_| err(409, "the stored app key is not base64"))?;
-        let client = Self::client()?;
+        let client = self.client().await?;
         let body = client
             .get(format!(
                 "https://api.github.com/repos/{repo}/releases/latest"
             ))
+            .timeout(API_TIMEOUT)
             .bearer_auth(&token)
             .header("Accept", "application/vnd.github+json")
             .send()
@@ -362,7 +531,7 @@ impl IosIntegration {
     /// From the portal: a user asks to register an iPhone (its UDID read by
     /// the registration profile). Asking again for the same iPhone keeps
     /// one request.
-    pub fn request(&self, actor: &str, body: &Value) -> Result<Value, (u16, String)> {
+    pub fn request(self: &Arc<Self>, actor: &str, body: &Value) -> Result<Value, (u16, String)> {
         let s = |k: &str, max: usize| -> String {
             body.get(k)
                 .and_then(Value::as_str)
@@ -404,12 +573,21 @@ impl IosIntegration {
             state: "pending".into(),
             message: None,
         };
-        let out = json!({ "id": r.id, "state": r.state });
+        let settings: Settings = self.load("settings.json");
+        let auto = settings.auto_approve && auto_allowed(&list, actor, settings.per_user());
+        let id = r.id.clone();
         list.push(r);
         self.save("requests.json", &Some(list))?;
         drop(_guard);
-        self.audit(actor, "ios.device_requested", json!({}));
-        Ok(out)
+        self.audit(actor, "ios.device_requested", json!({ "auto": auto }));
+        if auto {
+            // Approved in the background: the request answers iOS at once.
+            let (me, actor, request) = (Arc::clone(self), actor.to_owned(), json!({ "id": id }));
+            tokio::spawn(async move {
+                let _ = me.approve(&actor, &request).await;
+            });
+        }
+        Ok(json!({ "id": id, "state": "pending", "auto": auto }))
     }
 
     /// The signed-in user's requests (portal).
@@ -445,8 +623,11 @@ impl IosIntegration {
             .find(|r| r.id == id)
             .ok_or_else(|| err(404, "no such request"))?;
         let (repo, token) = self.github()?;
-        let response = Self::client()?
+        let response = self
+            .client()
+            .await?
             .post(format!("https://api.github.com/repos/{repo}/dispatches"))
+            .timeout(API_TIMEOUT)
             .bearer_auth(&token)
             .header("Accept", "application/vnd.github+json")
             .header("Content-Type", "application/json")
@@ -459,7 +640,7 @@ impl IosIntegration {
             )
             .send()
             .await
-            .map_err(|e| err(502, format!("GitHub: {e}")))?;
+            .map_err(|e| err(502, format!("Could not reach GitHub ({e}). If this server can't reach it directly, reach it through another gateway.")))?;
         let ok = response.status().is_success();
         let message = if ok {
             "Sent to GitHub: the iPhone is registered and the app re-signed within a few minutes."
@@ -506,6 +687,38 @@ impl IosIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_approval_stops_at_the_limit() {
+        let r = |user: &str, state: &str| Request {
+            id: "x".into(),
+            user: user.into(),
+            username: String::new(),
+            name: String::new(),
+            udid: String::new(),
+            product: String::new(),
+            ios: String::new(),
+            requested_at: 0,
+            state: state.into(),
+            message: None,
+        };
+        let list = vec![
+            r("alice", "approved"),
+            r("alice", "pending"),
+            r("bob", "approved"),
+        ];
+        assert!(
+            auto_allowed(&list, "alice", 2),
+            "one approved, a second is fine"
+        );
+        assert!(!auto_allowed(
+            &[r("alice", "approved"), r("alice", "approved")],
+            "alice",
+            2
+        ));
+        assert!(auto_allowed(&list, "carol", 2));
+        assert!(!auto_allowed(&list, "bob", 1));
+    }
 
     #[test]
     fn udids_and_repositories() {

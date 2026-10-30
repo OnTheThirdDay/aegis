@@ -4,6 +4,14 @@
 // inserted with textContent, never innerHTML.
 "use strict";
 
+// Older Safari (iOS 12, the last for the iPhone 6) has no replaceChildren.
+if (!Element.prototype.replaceChildren) {
+  Element.prototype.replaceChildren = /** @this {Element} @param {...(Node|string)} nodes */ function (...nodes) {
+    while (this.firstChild) this.removeChild(this.firstChild);
+    this.append(...nodes);
+  };
+}
+
 /** @type {{csrf: string|null, principal: string|null, username: string, roles: string[], scopes: string[]}} */
 const session = { csrf: null, principal: null, username: "", roles: [], scopes: [] };
 let currentView = "";
@@ -107,7 +115,15 @@ async function copy(text) {
     await navigator.clipboard.writeText(text);
     notice("Copied to the clipboard.");
   } catch {
-    notice("Copy failed: select the text and copy it manually.", true);
+    // Older browsers (and plain-HTTP pages) have no clipboard API.
+    const area = /** @type {HTMLTextAreaElement} */ (el("textarea", { readonly: "", class: "offscreen" }));
+    area.value = text;
+    document.body.append(area);
+    area.select();
+    area.setSelectionRange(0, text.length);
+    const copied = document.execCommand("copy");
+    area.remove();
+    notice(copied ? "Copied to the clipboard." : "Copy failed: select the text and copy it manually.", !copied);
   }
 }
 
@@ -636,7 +652,7 @@ async function iphoneCard() {
   if (!data.enabled) return null;
   /** @type {Record<string, [string, boolean]>} */
   const outcomes = {
-    "#ios-registered": ["Your iPhone was sent for approval. Once the administrator approves it, the Install button below works on it (allow a few minutes).", false],
+    "#ios-registered": ["Your iPhone was registered. Once it's approved (on some servers that's automatic), the Install button below works on it within a few minutes.", false],
     "#ios-expired": ["That registration link expired. Press Register this iPhone again.", true],
     "#ios-failed": ["The registration didn't come through. Press Register this iPhone again.", true],
   };
@@ -666,23 +682,34 @@ async function iphoneCard() {
 /** The console's side: GitHub settings and iPhones waiting for approval. */
 function iosCard(/** @type {any} */ i) {
   const repo = /** @type {HTMLInputElement} */ (el("input", { value: i.repository || "", placeholder: "owner/name", autocomplete: "off" }));
+  const auto = /** @type {HTMLInputElement} */ (el("input", { type: "checkbox" }));
+  auto.checked = !!i.auto_approve;
+  const perUser = /** @type {HTMLInputElement} */ (el("input", { type: "number", min: "1", max: "10", value: String(i.auto_per_user || 2) }));
+  const via = /** @type {HTMLTextAreaElement} */ (el("textarea", { class: "code", rows: "2", placeholder: "aegis1:… (optional)", autocomplete: "off" }));
   const token = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_token ? "saved — leave empty to keep it" : "GitHub token" }));
   const key = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_key ? "saved — leave empty to keep it" : "base64 (the AEGIS_IOS_APP_KEY secret)" }));
   const save = button("Save");
   busy(save, async () => {
     /** @type {Record<string, string>} */
-    const body = { repository: repo.value.trim() };
+    const body = { repository: repo.value.trim(), auto_approve: auto.checked, auto_per_user: Number(perUser.value) || 2 };
+    if (via.value.trim()) body.via = via.value.trim();
     if (token.value.trim()) body.token = token.value.trim();
     if (key.value.trim()) body.key = key.value.trim();
-    const { data } = await api("POST", "/integrations/ios/configure", { body });
-    notice(data.fetched ? "Saved. The iPhone app was fetched from GitHub." : "Saved. " + (data.status.error || "The app isn't on GitHub yet."), !data.fetched);
-    setTimeout(() => view("integrations"), 700);
+    await api("POST", "/integrations/ios/configure", { body });
+    notice("Saved. Fetching the app from GitHub in the background; this page shows the result.");
+    setTimeout(() => view("integrations"), 4000);
+  });
+  const stopVia = button("Stop using it", "ghost small");
+  busy(stopVia, async () => {
+    if (!confirm("Reach GitHub directly again? Remove this server's device on the other gateway too.")) return;
+    await api("POST", "/integrations/ios/configure", { body: { via: "" } });
+    view("integrations");
   });
   const check = button("Check GitHub now", "ghost");
   busy(check, async () => {
-    const { data } = await api("POST", "/integrations/ios/fetch", { body: {} });
-    notice(data.changed ? "Fetched AegisBorne " + data.version + "." : "Already up to date (" + data.version + ").");
-    setTimeout(() => view("integrations"), 700);
+    await api("POST", "/integrations/ios/fetch", { body: {} });
+    notice("Checking GitHub in the background; this page shows the result.");
+    setTimeout(() => view("integrations"), 4000);
   });
   const rows = (i.requests || []).map((/** @type {any} */ r) => {
     const approve = button(r.state === "failed" ? "Retry" : "Approve", "small");
@@ -707,15 +734,21 @@ function iosCard(/** @type {any} */ i) {
     ]);
   });
   return el("section", { class: "card integration" }, [
-    el("div", { class: "row spread" }, [el("h2", {}, [i.name]), pill(i.state)]),
+    el("div", { class: "row spread" }, [el("h2", {}, [i.name]), pill(i.fetching ? "fetching…" : i.state)]),
     el("p", { class: "muted" }, [i.description]),
+    i.fetching ? el("p", { class: "muted" }, ["Fetching the app from GitHub… (refresh this page to see the result)"]) : null,
     i.app ? el("p", {}, ["App on this server: AegisBorne " + i.app.version + " (" + fmtBytes(i.app.size) + "), fetched " + new Date(i.app.fetched_at * 1000).toLocaleString() + "."]) : null,
     i.error ? el("p", { class: "err-text" }, [i.error]) : null,
     el("div", { class: "cols" }, [
       field("GitHub repository", repo, "Whose releases carry the app."),
+
       field("GitHub token", token, "Fine-grained, this repository only: Contents read and write (reads releases, starts the iPhone workflow)."),
       field("App key", key, "Decrypts the app: the repository's AEGIS_IOS_APP_KEY."),
     ]),
+    i.via
+      ? el("p", {}, ["GitHub is reached through " + i.via.server + " (as device " + i.via.name + "). ", stopVia])
+      : field("Reach GitHub through another gateway", via, "Only if this server can't reach GitHub (its downloads are blocked in some countries). On a gateway that can, create an invitation for a device (e.g. this-gateway-name) and paste it here: this server joins it as a device and sends only its GitHub requests through it."),
+    el("label", { class: "check" }, [auto, " Approve iPhones automatically, up to ", perUser, " per user (more wait for you)"]),
     el("div", { class: "row" }, [save, check]),
     el("h3", {}, ["iPhones"]),
     rows.length
@@ -1599,7 +1632,8 @@ async function deviceCaCard() {
 
 // ---------------------------------------------------------------- wiring
 
-document.getElementById("logout")?.addEventListener("click", async () => {
+const logoutButton = document.getElementById("logout");
+if (logoutButton) logoutButton.addEventListener("click", async () => {
   try { await api("POST", "/auth/logout"); } catch { /* already gone */ }
   session.csrf = null; session.principal = null; session.scopes = []; session.username = "";
   showLogin("Signed out.");
