@@ -1,6 +1,10 @@
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart';
+
+/// The iPhone app's name (iOS has only AegisBorne).
+const _appName = 'AegisBorne';
 
 /// A failed call, with a message for the user.
 class ClientError implements Exception {
@@ -203,8 +207,18 @@ class Client {
   Future<Servers> servers() async => Servers.fromJson(await _call('servers'));
 
   /// Joins another server and selects it.
-  Future<ServerInfo> enroll(String code) async =>
-      ServerInfo.fromJson(await _call('enroll', {'code': code.trim()}));
+  Future<ServerInfo> enroll(String code) async {
+    try {
+      return ServerInfo.fromJson(await _call('enroll', {'code': code.trim()}));
+    } on ClientError catch (e) {
+      // iPhones sold in mainland China block an app's network until allowed.
+      if (Platform.isIOS && e.message.toLowerCase().contains('could not reach')) {
+        throw ClientError('${e.message} If this iPhone asked whether $_appName may use '
+            'the network, allow it (Settings → $_appName → Wireless Data: WLAN & Cellular Data), then try again.');
+      }
+      rethrow;
+    }
+  }
 
   /// The server the next connection uses.
   Future<void> select(String id) => _call('select', {'id': id});
