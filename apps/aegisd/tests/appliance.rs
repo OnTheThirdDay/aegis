@@ -745,8 +745,14 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
 
         // Revoke: new sessions/streams are refused.
         let (_, v) = c.call(reqwest::Method::GET, "/devices", None).await;
-        let id = v["items"][0]["id"].as_str().expect("id").to_owned();
-        let etag = v["items"][0]["etag"].as_str().expect("etag").to_owned();
+        // The laptop (other devices joined above, e.g. a gateway's own).
+        let laptop = v["items"]
+            .as_array()
+            .and_then(|l| l.iter().find(|d| d["name"] == "laptop"))
+            .expect("laptop device")
+            .clone();
+        let id = laptop["id"].as_str().expect("id").to_owned();
+        let etag = laptop["etag"].as_str().expect("etag").to_owned();
         let resp = c
             .http
             .post(format!("{}/api/v1/devices/{id}/revoke", c.base))

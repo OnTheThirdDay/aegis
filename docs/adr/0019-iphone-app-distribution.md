@@ -36,6 +36,7 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
   - Its device identity there renews like any device's, and appears on that gateway's Devices page, where it can be revoked. **Stop using it** removes it from this side.
   - Friends' iPhones never contact GitHub either way: they reach only their gateway.
 - **Requests:** users' iPhone requests, which the administrator approves (this starts the workflow) or removes. Up to 500 are kept; the same iPhone keeps one request.
+- **Automatic approval (optional, per gateway):** an iPhone is approved as soon as it registers, while its user has fewer than N approved iPhones (2 unless set, 1–10). Beyond that, requests wait for the administrator. This guards the team's 100 iPhones a year against anyone who can sign in to the portal.
 
 **The user portal (Devices → iPhone app; `handlers/ios.rs`)**
 
@@ -46,6 +47,7 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 - **Install:**
   - An `itms-services://` link to a manifest. iOS fetches the manifest and the app itself, without the user's session, so both links carry a token valid for an hour.
   - The links use the portal's public address, which needs a publicly trusted certificate (Cloudflare Tunnel or Let's Encrypt).
+- **Older iPhones:** the portal's pages work in Safari on iOS 12 (the iPhone 6's last): a `replaceChildren` fallback, no `?.`, a clipboard fallback. Registering works there too; the app itself needs iOS 16.
 - **Portal routes:** these are its only additions. The token-carrying routes need no session; everything else needs a signed-in user.
 
 ## Consequences

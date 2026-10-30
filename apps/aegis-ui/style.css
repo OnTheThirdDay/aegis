@@ -74,6 +74,8 @@ details summary { cursor: pointer; color: var(--muted); }
 .warn-text { color: var(--warn); }
 .err-text { color: var(--bad); }
 .ok-text { color: var(--ok); }
+/* A textarea for copying on browsers without the clipboard API. */
+.offscreen { position: fixed; top: -1000px; left: 0; opacity: 0; }
 
 .field { margin: 10px 0; }
 label { display: block; margin: 0 0 4px; font-weight: 600; font-size: 0.92rem; }

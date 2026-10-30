@@ -53,6 +53,31 @@ fn err(status: u16, code: impl Into<String>) -> (u16, String) {
 struct Settings {
     /// `owner/name` of the repository whose releases carry the app.
     repository: Option<String>,
+    /// Approve users' iPhones as soon as they register, up to
+    /// `auto_per_user` approved iPhones each; beyond that they wait.
+    #[serde(default)]
+    auto_approve: bool,
+    #[serde(default)]
+    auto_per_user: Option<u32>,
+}
+
+/// iPhones a user gets approved automatically, unless set otherwise.
+const AUTO_PER_USER: u32 = 2;
+
+impl Settings {
+    fn per_user(&self) -> u32 {
+        self.auto_per_user.unwrap_or(AUTO_PER_USER)
+    }
+}
+
+/// Whether `user`'s new request may be approved automatically: below the
+/// number of iPhones each user gets without the administrator.
+fn auto_allowed(requests: &[Request], user: &str, limit: u32) -> bool {
+    let approved = requests
+        .iter()
+        .filter(|r| r.user == user && r.state == "approved")
+        .count();
+    approved < limit as usize
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -211,6 +236,8 @@ impl IosIntegration {
             "state": if !configured { "off" } else if error.is_some() { "error" } else if app_ready { "active" } else { "pending" },
             "fetching": self.fetching.load(Ordering::Relaxed),
             "repository": settings.repository,
+            "auto_approve": settings.auto_approve,
+            "auto_per_user": settings.per_user(),
             "via": self.upstream_dir().load().ok().map(|d| json!({
                 "server": host_of(&d.url),
                 "name": d.name,
@@ -247,6 +274,15 @@ impl IosIntegration {
                     return Err(err(400, "the repository must look like owner/name"));
                 }
                 settings.repository = Some(r.to_owned());
+            }
+            if let Some(on) = body.get("auto_approve").and_then(Value::as_bool) {
+                settings.auto_approve = on;
+            }
+            if let Some(n) = body.get("auto_per_user").and_then(Value::as_u64) {
+                if !(1..=10).contains(&n) {
+                    return Err(err(400, "iPhones per user: 1 to 10"));
+                }
+                settings.auto_per_user = Some(n as u32);
             }
             self.save("settings.json", &settings)?;
         }
@@ -495,7 +531,7 @@ impl IosIntegration {
     /// From the portal: a user asks to register an iPhone (its UDID read by
     /// the registration profile). Asking again for the same iPhone keeps
     /// one request.
-    pub fn request(&self, actor: &str, body: &Value) -> Result<Value, (u16, String)> {
+    pub fn request(self: &Arc<Self>, actor: &str, body: &Value) -> Result<Value, (u16, String)> {
         let s = |k: &str, max: usize| -> String {
             body.get(k)
                 .and_then(Value::as_str)
@@ -537,12 +573,21 @@ impl IosIntegration {
             state: "pending".into(),
             message: None,
         };
-        let out = json!({ "id": r.id, "state": r.state });
+        let settings: Settings = self.load("settings.json");
+        let auto = settings.auto_approve && auto_allowed(&list, actor, settings.per_user());
+        let id = r.id.clone();
         list.push(r);
         self.save("requests.json", &Some(list))?;
         drop(_guard);
-        self.audit(actor, "ios.device_requested", json!({}));
-        Ok(out)
+        self.audit(actor, "ios.device_requested", json!({ "auto": auto }));
+        if auto {
+            // Approved in the background: the request answers iOS at once.
+            let (me, actor, request) = (Arc::clone(self), actor.to_owned(), json!({ "id": id }));
+            tokio::spawn(async move {
+                let _ = me.approve(&actor, &request).await;
+            });
+        }
+        Ok(json!({ "id": id, "state": "pending", "auto": auto }))
     }
 
     /// The signed-in user's requests (portal).
@@ -642,6 +687,38 @@ impl IosIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_approval_stops_at_the_limit() {
+        let r = |user: &str, state: &str| Request {
+            id: "x".into(),
+            user: user.into(),
+            username: String::new(),
+            name: String::new(),
+            udid: String::new(),
+            product: String::new(),
+            ios: String::new(),
+            requested_at: 0,
+            state: state.into(),
+            message: None,
+        };
+        let list = vec![
+            r("alice", "approved"),
+            r("alice", "pending"),
+            r("bob", "approved"),
+        ];
+        assert!(
+            auto_allowed(&list, "alice", 2),
+            "one approved, a second is fine"
+        );
+        assert!(!auto_allowed(
+            &[r("alice", "approved"), r("alice", "approved")],
+            "alice",
+            2
+        ));
+        assert!(auto_allowed(&list, "carol", 2));
+        assert!(!auto_allowed(&list, "bob", 1));
+    }
 
     #[test]
     fn udids_and_repositories() {
