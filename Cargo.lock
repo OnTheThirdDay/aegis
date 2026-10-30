@@ -451,6 +451,7 @@ dependencies = [
  "aegis-updater",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "hex",
  "http",
  "http-body",

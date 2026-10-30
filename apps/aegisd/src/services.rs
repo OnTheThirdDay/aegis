@@ -363,7 +363,7 @@ pub async fn diagnostics_loop(app: Arc<Appliance>) {
 /// The iPhone app: fetch it from GitHub when a release or a re-signed
 /// build (a newly registered iPhone) is out.
 pub async fn ios_loop(app: Arc<Appliance>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(600));
+    let mut tick = tokio::time::interval(crate::integrations::ios::POLL_PREPARING);
     loop {
         tick.tick().await;
         if let Some(ios) = app.integrations.ios() {
