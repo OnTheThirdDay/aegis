@@ -70,7 +70,9 @@ jobs:
             refs/heads/main)
               # Main gate: main only holds content that was tested on staging.
               # (fetch-depth 0 already brought origin/staging and all tags.)
-              if ! git log origin/staging --format=%T | grep -qx "$(git rev-parse 'HEAD^{tree}')"; then
+              # grep reads it all: with -q it quits at the first match and,
+              # under pipefail, git log's SIGPIPE fails the check.
+              if ! git log origin/staging --format=%T | grep -x "$(git rev-parse 'HEAD^{tree}')" >/dev/null; then
                 echo "::error::main contains changes that never went through staging. Merge them into staging, then use the release pull request staging -> main."; exit 1
               fi
               if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
