@@ -130,15 +130,41 @@ pub async fn status(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
                     register: false,
                 },
             );
-            let manifest = format!("{base}api/v1/ios/manifest/{token}");
-            out["install"] = json!(format!(
-                "itms-services://?action=download-manifest&url={}",
-                percent_encode(&manifest)
-            ));
+            out["install"] = json!(install_link(base, &token));
         }
     }
     out["portal"] = json!(base);
     Ok(crate::http_util::json(StatusCode::OK, &out, &[]))
+}
+
+/// What iOS opens to install: its manifest link (`token` from [`new_link`]).
+fn install_link(portal: &str, token: &str) -> String {
+    let manifest = format!("{portal}api/v1/ios/manifest/{token}");
+    format!(
+        "itms-services://?action=download-manifest&url={}",
+        percent_encode(&manifest)
+    )
+}
+
+/// For the iPhone app's own update check (a device-authenticated
+/// `update_query` for `ios`): the version this gateway serves and an install
+/// link bound to the device, or `None` when there is no app here or no
+/// portal address to install from. iOS checks Apple's signature and that the
+/// build is for this iPhone; the app checks the version is newer.
+pub(crate) async fn device_offer(ctx: &Ctx, device: &str) -> Option<Value> {
+    let info = ios_action(ctx, "mine", device, json!({})).await.ok()?;
+    let version = info["app"]["version"].as_str()?.to_owned();
+    let base = crate::portal::url(ctx)?;
+    let token = new_link(
+        ctx,
+        IosLink {
+            principal: format!("device:{device}"),
+            username: String::new(),
+            expires: now() + INSTALL_TTL,
+            register: false,
+        },
+    );
+    Some(json!({ "version": version, "install": install_link(&base, &token) }))
 }
 
 fn percent_encode(s: &str) -> String {

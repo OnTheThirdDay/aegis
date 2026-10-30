@@ -246,7 +246,7 @@ class Client {
   Future<String?> installBorne() async => (await _call('installBorne'))['message'] as String?;
 
   /// A newer app the selected server offers (checked every few hours), or
-  /// null. Not on iOS yet.
+  /// null. On iOS it installs through the system, like the first install.
   Future<AppUpdate?> checkUpdate() async {
     try {
       final j = await _call('checkUpdate');
@@ -258,8 +258,8 @@ class Client {
   }
 
   /// Download the offered update and hand it to the system installer,
-  /// which asks the user. Returns a message when the user has something to
-  /// do first.
+  /// which asks the user (iOS: opens the install link; iOS downloads it).
+  /// Returns a message when the user has something to do first.
   Future<String?> installUpdate() async => (await _call('installUpdate'))['message'] as String?;
 
   Future<Diagnostics> diagnostics() async => Diagnostics.fromJson(await _call('diagStatus'));

@@ -63,7 +63,7 @@ The Windows and macOS apps aren't signed by a certificate authority, so nothing 
 - iOS installs Ad Hoc builds only through `itms-services://` with a manifest. The system downloads the IPA itself, over HTTPS with a publicly trusted certificate, and can't present a device certificate.
 - So the iOS app will need a short-lived download link from the gateway. The gateway's edge needs a public certificate, which Cloudflare and ACME setups have; a private CA won't do.
 - Each iPhone must also be registered in the Ad Hoc provisioning profile, and a new phone needs a new build.
-- The iOS app checks the offer's signature and version exactly as the others do.
+- As built (1.1.5, ADR-0019): there is no signed `.update` description for iOS. iOS verifies Apple's signature itself, and the build is the one every gateway fetches for the iPhone app integration. The gateway answers the iPhone's `update_query` with that app's version and a device-bound install link; the app checks the version is newer and the link is an `itms-services` manifest over HTTPS.
 
 ## Consequences
 
