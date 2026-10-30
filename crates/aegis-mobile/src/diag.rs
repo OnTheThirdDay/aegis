@@ -1,6 +1,6 @@
 //! On-demand diagnostics on the phone (ADR-0008): the desktop client's
 //! recorder, sent to the gateway signed with the device's key. Off unless
-//! the user starts it, memory only, at most 5 MB, stops by itself; when the
+//! the user starts it, memory only, at most 1 MB, stops by itself; when the
 //! time runs out the report is sent. The last send's outcome is also kept
 //! in the data folder, so the iOS app can show it after the tunnel
 //! extension (which records there) has ended.
@@ -11,15 +11,19 @@
 //! phone and imported in the console. A recording also checks the
 //! gateway's address from the phone (name lookup, TCP connection), when it
 //! starts and whenever connecting fails.
+//!
+//! A recording belongs to the server selected when it started: it is saved
+//! under that server's device name and sent to that server, even if the
+//! user switched servers meanwhile.
 
 use crate::{client, fail, lock, now, ok, Client};
-use aegis_join::{DeviceDir, JoinError, Servers};
+use aegis_join::{DeviceDir, JoinError, Server, Servers};
 use aegis_telemetry::report::{Report, Role};
 use aegis_telemetry::{DiagnosticSink, Severity};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The last send's outcome, in the data folder.
@@ -28,16 +32,46 @@ const RESULT_FILE: &str = "diagnostics-result.json";
 const RESULT_KEPT: u64 = 3600;
 /// Under the gateway's limit, with room for base64 and JSON.
 const MAX_UPLOAD: usize = 900 * 1024;
+/// Size cap of a recording. An iPhone's VPN extension may use about 50 MB
+/// in all; the held records take several times their accounted size, and a
+/// report is built from a copy of them.
+const MAX_RECORDING: usize = 1024 * 1024;
 
-#[derive(Default)]
 pub(crate) struct Diag {
     pub(crate) sink: Arc<DiagnosticSink>,
+    /// The server the recording belongs to (selected when it started).
+    server: Mutex<Option<String>>,
     /// Changes with every start, stop and discard: a recording's watcher
     /// sends it when its time runs out only if nothing else happened.
     generation: AtomicU64,
     /// Recorded and not sent yet.
     unsent: AtomicBool,
     sending: AtomicBool,
+}
+
+impl Default for Diag {
+    fn default() -> Self {
+        Diag {
+            sink: Arc::new(DiagnosticSink::with_limit(MAX_RECORDING)),
+            server: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            unsent: AtomicBool::new(false),
+            sending: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The server the recording belongs to, if it is still joined.
+fn recorded_server(d: &Diag, dir: &str) -> Result<Server, &'static str> {
+    let servers = Servers::open(dir).map_err(|_| "Join a server first.")?;
+    match lock(&d.server).clone() {
+        Some(id) => servers
+            .list()
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or("The server this was recorded for was removed."),
+        None => servers.selected().ok_or("Join a server first."),
+    }
 }
 
 fn next(d: &Diag) -> u64 {
@@ -75,7 +109,9 @@ pub fn start(dir: &str, minutes: u64, about: &str) -> Value {
             ("server", s.server.as_deref().unwrap_or("")),
         ],
     );
-    if let Ok(Some(server)) = Servers::open(dir).map(|s| s.selected()) {
+    let selected = Servers::open(dir).ok().and_then(|s| s.selected());
+    *lock(&d.server) = selected.as_ref().map(|s| s.id.clone());
+    if let Some(server) = selected {
         c.rt.spawn(async move { reach(&server.dir, &c.diag.sink).await });
     }
     // Send by itself when the time runs out.
@@ -110,7 +146,7 @@ pub fn stop(dir: &str, send_it: bool) -> Value {
     }
 }
 
-/// Send what was recorded to the selected server (blocks). `sent` says
+/// Send what was recorded to its server (blocks). `sent` says
 /// whether it arrived; `message` is for the user either way.
 pub fn send_now(dir: &str) -> Value {
     let c = match client() {
@@ -165,11 +201,9 @@ pub fn save(dir: &str) -> Value {
     let Some(recording) = c.diag.sink.recording() else {
         return fail("Nothing was recorded.");
     };
-    let name = Servers::open(dir)
-        .ok()
-        .and_then(|s| s.selected())
-        .map(|s| s.device.name.clone())
-        .unwrap_or_else(|| "phone".into());
+    let name = recorded_server(&c.diag, dir)
+        .map(|s| s.device.name)
+        .unwrap_or_else(|_| "phone".into());
     let mut report = Report {
         role: Role::Client,
         name,
@@ -352,9 +386,9 @@ async fn upload(c: &Client, dir: &str) -> (bool, String) {
     let Some(recording) = c.diag.sink.recording() else {
         return (false, "Nothing was recorded.".into());
     };
-    let server = match Servers::open(dir).map(|s| s.selected()) {
-        Ok(Some(s)) => s,
-        _ => return (false, "Join a server first.".into()),
+    let server = match recorded_server(&c.diag, dir) {
+        Ok(s) => s,
+        Err(e) => return (false, e.into()),
     };
     let mut report = Report {
         role: Role::Client,

@@ -36,7 +36,7 @@ Some names live on machines that are already installed, where changing them brea
   - `borne` is AegisBorne (`borne.aegis.app`).
   - `legacy` is the last update of the old app ID (`net.aegis.app`, still named AegisNet). It carries the AegisBorne APK.
   - The legacy update asks the user to **Move to AegisBorne**. It installs the bundled APK with Android's package installer: the user allows "install unknown apps" once, then confirms the install.
-  - On first start with no servers, AegisBorne takes every server (profile and identity, not per-connection state) from the old app through a content provider. It then offers to uninstall the old app, and the old app shows "Moved to AegisBorne".
+  - On first start with no servers, AegisBorne takes every server (profile and identity, not per-connection state) from the old app through a content provider. It then offers to uninstall the old app, and the old app shows "Moved to AegisBorne". Since 1.1.8 the old app says so only once AegisBorne confirmed it keeps every server (a second provider call, `imported`): a failed import leaves the old app's servers and state as they were, and AegisBorne tries again when opened again. Uninstalling the old app deletes its copy of the identities, so it must not be offered before.
   - The phone keeps its device identities, so nothing is joined again and the console shows no new device.
 - **Security of the hand-over**
   - The provider is guarded by a signature-level permission, `borne.aegis.app.permission.MIGRATE`. Only an app signed with our release key can hold it.

@@ -21,11 +21,14 @@ The owner has a paid Apple developer account (individual) and no Mac. Distributi
   - The core then runs the connection on it: renewal, the client node, the packet path.
   - The extension's own traffic to the gateway doesn't go through the tunnel, as excluding the app does on Android.
   - Its name lookups do, though: iOS resolves for it through the system resolver, which the tunnel's DNS settings send to the VPN's fake-IP DNS. So before applying the settings, the extension looks up the gateway's names (connection, enrollment and renewal, QUIC) through the normal network (`aegis_prepare_tunnel`), and the VPN's DNS answers those names with the real addresses, as the desktop VPN pins them. Without it the gateway's name resolved into the tunnel and the connection never came up (1.1.6).
+  - IPv6 too (1.1.8): where the network has IPv6 (the system then answers `AAAA`), the gateway's IPv6 addresses are pinned as well, so the extension reaches the gateway over IPv6 as Android does (its lookups bypass the VPN), often by a better route. Other names still get no `AAAA` answer. Pinned answers have a 10-second TTL.
+  - When health checks fail twice in a row (at most once a minute), the pinned names are looked up again directly from the extension (Alibaba, DNSPod and Cloudflare DNS, together; not Google's, blocked in mainland China), fresh addresses first, and the addresses' order rotates, so reconnecting doesn't keep trying an address the network stopped carrying. Cloudflare gives a name fixed addresses, so the rotation matters most. A wrong answer can't redirect the device: the outer TLS and the gateway's pinned identity are checked on every connection. Each change is noted in diagnostics (`client.gateway.addresses`).
   - iPhones sold in mainland China ask whether an app may use the network the first time it uses Apple's networking; the core's own sockets never ask and fail until it's allowed. The app makes one such request at launch, and a failed join points to the setting.
 - **Connect and disconnect:** the app saves a `NETunnelProviderManager` configuration (iOS asks the user the first time) and starts or stops the tunnel.
 - **Status:** while the tunnel runs, the app asks the extension with a provider message (`status`), which answers with the core's status JSON.
 - **Unexpected stops:** when the core disconnects by itself (an expired certificate, a removed device), the extension ends the tunnel with that error, and the app shows it from `fetchLastDisconnectError`. That needs iOS 16, now the minimum.
 - **Removing the connected server:** the app stops the tunnel first.
+- **Stopping (1.1.8):** the session's network waits (renewal, starting, health checks, address checks) end as soon as it is asked to stop; one that doesn't end within 5 seconds is cancelled, so it can't write its state over a later session's.
 
 **The core on iOS**
 

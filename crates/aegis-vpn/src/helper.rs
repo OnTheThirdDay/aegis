@@ -80,9 +80,13 @@ pub trait System: Send + Sync + 'static {
     /// (which go away with it). Returns the packet device and the
     /// interface; dropping the device removes the interface.
     fn open_tun(&self) -> io::Result<(Self::Device, Tun)>;
-    /// Point the system resolver at the VPN; returns what to restore.
-    /// On failure nothing is left changed.
-    fn set_dns(&self) -> io::Result<DnsSaved>;
+    /// The resolver settings [`set_dns`](Self::set_dns) would change (what
+    /// to restore afterwards). Changes nothing.
+    fn read_dns(&self) -> io::Result<DnsSaved>;
+    /// Point the resolver of the services in `saved` (from
+    /// [`read_dns`](Self::read_dns)) at the VPN. On failure nothing is
+    /// left changed.
+    fn set_dns(&self, saved: &DnsSaved) -> io::Result<()>;
     fn restore_dns(&self, saved: &DnsSaved) -> io::Result<()>;
     fn flush_dns_cache(&self);
     /// Kill switch: outbound traffic may leave only through `tun` (while
@@ -129,9 +133,38 @@ impl JournalFile {
     }
 
     fn clear(&self) {
-        *lock(&self.state) = Journal::default();
-        let _ = std::fs::remove_file(&self.path);
+        self.keep(Journal::default());
     }
+
+    /// Replace the journal with `left` (what could not be undone yet).
+    fn keep(&self, left: Journal) {
+        if left == Journal::default() {
+            *lock(&self.state) = left;
+            let _ = std::fs::remove_file(&self.path);
+        } else {
+            self.update(|j| *j = left);
+        }
+    }
+}
+
+/// Undo `j` as far as possible; returns what could not be undone (kept in
+/// the journal and tried again, so a passing failure doesn't leave the
+/// system changed for good).
+fn undo_journal<S: System>(sys: &S, j: Journal) -> Journal {
+    let dns = if !j.dns.is_empty() && sys.restore_dns(&j.dns).is_err() {
+        j.dns
+    } else {
+        Vec::new()
+    };
+    let routes = j
+        .routes
+        .into_iter()
+        .filter(|r| match sys.delete_route(r) {
+            Ok(()) => false,
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        })
+        .collect();
+    Journal { routes, dns }
 }
 
 /// The kill switch's state, kept in its own file while it is on.
@@ -203,17 +236,20 @@ impl<S: System> Helper<S> {
         let left: Option<Journal> = std::fs::read(&journal)
             .ok()
             .and_then(|t| serde_json::from_slice(&t).ok());
-        if let Some(left) = left {
-            if !left.dns.is_empty() {
-                let _ = sys.restore_dns(&left.dns);
+        let left = match left {
+            Some(left) => {
+                let left = undo_journal(&*sys, left);
+                sys.flush_dns_cache();
+                left
             }
-            for r in &left.routes {
-                let _ = sys.delete_route(r);
-            }
-            sys.flush_dns_cache();
-        }
-        let _ = std::fs::remove_file(&journal);
-        let kill_path = journal.with_extension("kill.json");
+            None => Journal::default(),
+        };
+        let journal = JournalFile {
+            path: journal,
+            state: Mutex::default(),
+        };
+        journal.keep(left);
+        let kill_path = journal.path.with_extension("kill.json");
         let left: Option<Kill> = std::fs::read(&kill_path)
             .ok()
             .and_then(|t| serde_json::from_slice(&t).ok());
@@ -230,10 +266,7 @@ impl<S: System> Helper<S> {
         save_kill(&kill_path, kill.as_ref());
         Arc::new(Helper {
             sys,
-            journal: Arc::new(JournalFile {
-                path: journal,
-                state: Mutex::default(),
-            }),
+            journal: Arc::new(journal),
             active: tokio::sync::Mutex::new(None),
             kill: tokio::sync::Mutex::new(kill),
             kill_path,
@@ -267,14 +300,18 @@ impl<S: System> Helper<S> {
         Ok(())
     }
 
-    async fn unblock(&self) {
+    /// Release the kill switch. On failure it stays recorded (and reported
+    /// as blocking), so releasing can be tried again, also after a restart
+    /// of the helper.
+    async fn unblock(&self) -> io::Result<()> {
         let mut kill = self.kill.lock().await;
-        if let Some(k) = kill.take() {
-            let _ = self
-                .on_sys(move |sys| sys.unblock(k.token.as_deref()))
-                .await;
+        if let Some(k) = kill.clone() {
+            self.on_sys(move |sys| sys.unblock(k.token.as_deref()))
+                .await?;
+            *kill = None;
             save_kill(&self.kill_path, None);
         }
+        Ok(())
     }
 
     /// Serve one control connection until it closes; the VPN it started
@@ -311,7 +348,7 @@ impl<S: System> Helper<S> {
         if let Some(a) = active {
             self.teardown(a).await;
         }
-        self.unblock().await;
+        let _ = self.unblock().await;
     }
 
     async fn request(&self, id: u64, request: Request) -> Reply {
@@ -361,7 +398,12 @@ impl<S: System> Helper<S> {
             Request::Release => {
                 // Only a kill switch left blocking after the VPN ended.
                 if self.active.lock().await.is_none() {
-                    self.unblock().await;
+                    if let Err(e) = self.unblock().await {
+                        return Reply {
+                            blocked: Some(true),
+                            ..Reply::error(format!("Could not release the kill switch: {e}"))
+                        };
+                    }
                 }
                 Reply {
                     blocked: Some(false),
@@ -382,7 +424,7 @@ impl<S: System> Helper<S> {
         let kill_switch = a.kill_switch;
         self.teardown(a).await;
         if deliberate {
-            self.unblock().await;
+            let _ = self.unblock().await;
         } else if kill_switch {
             let _ = self.block(None, None).await;
         }
@@ -459,8 +501,7 @@ impl<S: System> Helper<S> {
         let armed = if kill_switch {
             self.block(Some(tun), Some(server)).await
         } else {
-            self.unblock().await;
-            Ok(())
+            self.unblock().await
         };
         if let Err(e) = armed {
             if let Some(a) = active.take() {
@@ -490,13 +531,14 @@ impl<S: System> Helper<S> {
         let routes = std::mem::take(&mut *lock(&a.routes));
         let dns = a.dns;
         let _ = tokio::task::spawn_blocking(move || {
+            // With what an earlier helper could not undo yet.
+            let mut all = std::mem::take(&mut *lock(&journal.state));
+            all.routes.retain(|r| !routes.contains(r));
+            all.routes.extend(routes);
             if !dns.is_empty() {
-                let _ = sys.restore_dns(&dns);
+                all.dns = dns;
             }
-            for r in &routes {
-                let _ = sys.delete_route(r);
-            }
-            journal.clear();
+            journal.keep(undo_journal(&*sys, all));
             sys.flush_dns_cache();
         })
         .await;
@@ -570,15 +612,28 @@ fn setup<S: System>(
             return Err(format!("Could not create the VPN interface: {e}"));
         }
     };
-    let saved = match sys.set_dns() {
-        Ok(saved) => saved,
-        Err(e) => {
-            drop(device);
-            undo(&added);
-            return Err(format!("Could not set the system's DNS: {e}"));
+    // What to restore is journaled before anything changes: a crash in
+    // between leaves a record to restore from. Settings an earlier helper
+    // could not restore yet are the originals (the current ones are ours).
+    let earlier = lock(&journal.state).dns.clone();
+    let saved = if earlier.is_empty() {
+        match sys.read_dns() {
+            Ok(saved) => saved,
+            Err(e) => {
+                drop(device);
+                undo(&added);
+                return Err(format!("Could not read the system's DNS: {e}"));
+            }
         }
+    } else {
+        earlier
     };
     journal.update(|j| j.dns = saved.clone());
+    if let Err(e) = sys.set_dns(&saved) {
+        drop(device);
+        undo(&added);
+        return Err(format!("Could not set the system's DNS: {e}"));
+    }
     sys.flush_dns_cache();
     Ok((device, tun, added, saved))
 }
@@ -617,20 +672,25 @@ fn move_routes<S: System>(
         return;
     };
     let mut routes = lock(routes);
-    let Some(current) = routes.first().map(|r| r.via) else {
-        return;
-    };
-    if candidates.contains(&current) {
+    if routes.iter().all(|r| candidates.contains(&r.via)) {
         return;
     }
     // Offline: keep the routes until a network comes back.
     let Some(next) = candidates.first().copied() else {
         return;
     };
-    for r in routes.iter_mut() {
-        let _ = sys.delete_route(r);
-        r.via = next;
-        let _ = sys.add_route(r);
+    // A route is recorded on the new uplink only once it is there; one that
+    // failed stays on the old one and is tried again next time.
+    for r in routes.iter_mut().filter(|r| !candidates.contains(&r.via)) {
+        let moved = HostRoute { via: next, ..*r };
+        let added = match sys.add_route(&moved) {
+            Ok(()) => true,
+            Err(e) => e.kind() == io::ErrorKind::AlreadyExists,
+        };
+        if added {
+            let _ = sys.delete_route(r);
+            *r = moved;
+        }
     }
     let now = routes.clone();
     journal.update(|j| j.routes = now);
@@ -650,8 +710,19 @@ mod tests {
         /// The far ends of the devices handed out (kept open).
         peers: Vec<DuplexStream>,
         fail_tun: bool,
+        /// The next this many calls fail (a passing OS error).
+        fail_restore: u32,
+        fail_add: u32,
+        fail_unblock: u32,
         /// The kill switch: (through the VPN interface, allowed addresses).
         block: Option<(bool, Vec<Ipv4Addr>)>,
+    }
+
+    /// Whether the call counted down by `n` fails this time.
+    fn failing(n: &mut u32) -> bool {
+        let fail = *n > 0;
+        *n = n.saturating_sub(1);
+        fail
     }
 
     #[derive(Clone, Default)]
@@ -675,7 +746,11 @@ mod tests {
             Ok(lock(&self.0).defaults.clone())
         }
         fn add_route(&self, r: &HostRoute) -> io::Result<()> {
-            lock(&self.0).routes.push(*r);
+            let mut s = lock(&self.0);
+            if failing(&mut s.fail_add) {
+                return Err(io::Error::other("busy"));
+            }
+            s.routes.push(*r);
             Ok(())
         }
         fn delete_route(&self, r: &HostRoute) -> io::Result<()> {
@@ -698,13 +773,20 @@ mod tests {
                 },
             ))
         }
-        fn set_dns(&self) -> io::Result<DnsSaved> {
-            lock(&self.0).dns_set = true;
+        fn read_dns(&self) -> io::Result<DnsSaved> {
             Ok(vec![("Wi-Fi".into(), vec!["192.168.1.1".into()])])
+        }
+        fn set_dns(&self, _saved: &DnsSaved) -> io::Result<()> {
+            lock(&self.0).dns_set = true;
+            Ok(())
         }
         fn restore_dns(&self, saved: &DnsSaved) -> io::Result<()> {
             assert_eq!(saved[0].0, "Wi-Fi");
-            lock(&self.0).dns_set = false;
+            let mut s = lock(&self.0);
+            if failing(&mut s.fail_restore) {
+                return Err(io::Error::other("busy"));
+            }
+            s.dns_set = false;
             Ok(())
         }
         fn flush_dns_cache(&self) {}
@@ -719,7 +801,11 @@ mod tests {
         }
         fn unblock(&self, token: Option<&str>) -> io::Result<()> {
             assert_eq!(token, Some("token"));
-            lock(&self.0).block = None;
+            let mut s = lock(&self.0);
+            if failing(&mut s.fail_unblock) {
+                return Err(io::Error::other("busy"));
+            }
+            s.block = None;
             Ok(())
         }
         fn blocking(&self) -> bool {
@@ -931,5 +1017,83 @@ mod tests {
             .start(1, 1080, vec!["x".into(); 9], false)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_that_failed_is_tried_again() {
+        let fake = Fake::default();
+        let path = journal_path("retry");
+        let left = HostRoute {
+            dest: Ipv4Addr::new(203, 0, 113, 9),
+            via: WIFI,
+        };
+        {
+            let mut s = lock(&fake.0);
+            s.routes.push(left);
+            s.dns_set = true;
+            s.fail_restore = 1;
+        }
+        let journal = Journal {
+            routes: vec![left],
+            dns: vec![("Wi-Fi".into(), vec![])],
+        };
+        std::fs::write(&path, serde_json::to_vec(&journal).expect("json")).expect("write");
+        // The resolver could not be restored: that part stays journaled.
+        drop(Helper::new(fake.clone(), path.clone()));
+        assert!(lock(&fake.0).dns_set);
+        let kept: Journal =
+            serde_json::from_slice(&std::fs::read(&path).expect("journal")).expect("json");
+        assert_eq!(kept.dns.len(), 1);
+        assert!(kept.routes.is_empty(), "the route was removed");
+        // The next helper restores it.
+        drop(Helper::new(fake.clone(), path.clone()));
+        assert!(!lock(&fake.0).dns_set);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_keeps_the_kill_switch_known() {
+        let fake = Fake::default();
+        let path = journal_path("release");
+        let helper = Helper::new(fake.clone(), path.clone());
+        helper.block(None, Some(vec![])).await.expect("block");
+        lock(&fake.0).fail_unblock = 1;
+        let reply = helper.request(1, Request::Release).await;
+        assert!(reply.error.is_some());
+        assert_eq!(reply.blocked, Some(true));
+        assert!(lock(&fake.0).block.is_some());
+        assert!(path.with_extension("kill.json").exists(), "still recorded");
+        let reply = helper.request(1, Request::Release).await;
+        assert_eq!(reply.error, None);
+        assert_eq!(reply.blocked, Some(false));
+        assert!(lock(&fake.0).block.is_none());
+        assert!(!path.with_extension("kill.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_route_that_failed_to_move_is_moved_later() {
+        let fake = Fake::default();
+        lock(&fake.0).defaults = vec![WIFI];
+        let journal = JournalFile {
+            path: journal_path("move-retry"),
+            state: Mutex::default(),
+        };
+        let route = HostRoute {
+            dest: Ipv4Addr::new(203, 0, 113, 9),
+            via: WIFI,
+        };
+        fake.add_route(&route).expect("add");
+        let routes = Mutex::new(vec![route]);
+        {
+            let mut s = lock(&fake.0);
+            s.defaults = vec![ETHERNET];
+            s.fail_add = 1;
+        }
+        move_routes(&fake, &journal, &routes, 99);
+        assert_eq!(lock(&routes)[0].via, WIFI, "not moved yet");
+        move_routes(&fake, &journal, &routes, 99);
+        assert_eq!(lock(&routes)[0].via, ETHERNET, "moved on the next check");
+        assert_eq!(lock(&fake.0).routes, vec![lock(&routes)[0]]);
+        journal.clear();
     }
 }

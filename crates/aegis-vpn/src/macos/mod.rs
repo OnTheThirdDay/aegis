@@ -153,21 +153,22 @@ impl System for MacOs {
         ))
     }
 
-    fn set_dns(&self) -> io::Result<DnsSaved> {
+    fn read_dns(&self) -> io::Result<DnsSaved> {
+        services()?
+            .into_iter()
+            .map(|service| dns_servers(&service).map(|old| (service, old)))
+            .collect()
+    }
+
+    fn set_dns(&self, saved: &DnsSaved) -> io::Result<()> {
         let ours = vec![dns::SERVER.to_string()];
-        let mut saved: DnsSaved = Vec::new();
-        for service in services()? {
-            let result = dns_servers(&service)
-                .and_then(|old| set_dns_servers(&service, &ours).map(|()| old));
-            match result {
-                Ok(old) => saved.push((service, old)),
-                Err(e) => {
-                    let _ = self.restore_dns(&saved);
-                    return Err(e);
-                }
+        for (i, (service, _)) in saved.iter().enumerate() {
+            if let Err(e) = set_dns_servers(service, &ours) {
+                let _ = self.restore_dns(&saved[..i].to_vec());
+                return Err(e);
             }
         }
-        Ok(saved)
+        Ok(())
     }
 
     fn restore_dns(&self, saved: &DnsSaved) -> io::Result<()> {

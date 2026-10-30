@@ -189,7 +189,21 @@ fn install_link_ok(link: &str) -> bool {
 /// Ask the gateway for an iPhone app newer than `current`.
 pub async fn check_ios(dir: &DeviceDir, current: &str) -> Result<Option<IosOffer>, JoinError> {
     let (url, edge, cert) = request(dir)?;
-    let body = json!({"certificate_pem": cert, "update_query": {"platform": "ios"}});
+    // Signed with the device key: the gateway gives the install link only
+    // to a device that holds it.
+    let key = dir.read("key.pem")?;
+    let signed_at = crate::now();
+    let signature = aegis_identity::pki::sign_with_key(
+        &key,
+        &aegis_identity::pki::ios_offer_message(signed_at),
+    )
+    .map_err(|_| JoinError::Storage("could not sign the request".into()))?;
+    let body = json!({
+        "certificate_pem": cert,
+        "update_query": {"platform": "ios"},
+        "signed_at": signed_at,
+        "signature": base64::engine::general_purpose::STANDARD.encode(signature),
+    });
     let (status, bytes) = http::post_json(&url, &edge, &body).await?;
     if status != 200 {
         return Err(rejected(status, &bytes));

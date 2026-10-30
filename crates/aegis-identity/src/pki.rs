@@ -134,6 +134,14 @@ pub fn certificate_matches_key(cert_der: &[u8], key_pem: &str) -> bool {
     rcgen::PublicKeyData::der_bytes(&key) == cert.public_key().subject_public_key.data.as_ref()
 }
 
+/// What a device signs to ask for the iPhone app's install link: a domain
+/// label and the signing time. The link opens a download of the app (and
+/// the device list in it), so a certificate alone, which is not secret,
+/// must not be enough to get one.
+pub fn ios_offer_message(signed_at: i64) -> Vec<u8> {
+    format!("aegis-ios-offer-v1\n{signed_at}").into_bytes()
+}
+
 /// What a device signs to upload a diagnostic report: a domain label, the
 /// signing time and the payload's SHA-256, so a signature is useless for
 /// anything else.

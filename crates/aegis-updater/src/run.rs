@@ -116,6 +116,13 @@ pub fn run(o: Options) -> Result<(), String> {
     let mut next_check = Instant::now();
     let mut beat = Instant::now() - HEARTBEAT;
     loop {
+        // Until an interrupted upgrade is sorted out (Docker may not have
+        // answered yet), nothing else is done.
+        if u.interrupted {
+            u.recover();
+            std::thread::sleep(POLL);
+            continue;
+        }
         let request = files::take_request(&o.data);
         if request == Some(Request::Check) || Instant::now() >= next_check {
             next_check = Instant::now() + o.interval;
@@ -206,14 +213,22 @@ impl<'a, E: Engine> Updater<'a, E> {
     /// - otherwise the previous one (`<name>-previous`) takes its name back
     ///   and runs again;
     /// - interrupted before the rename: the stopped gateway runs again.
+    ///
+    /// When Docker can't say which containers exist, nothing is decided:
+    /// the upgrade stays marked interrupted and is recovered later.
     pub(crate) fn recover(&mut self) {
-        if !std::mem::take(&mut self.interrupted) {
+        if !self.interrupted {
             return;
         }
         let name = self.o.container.clone();
         let previous = format!("{name}-previous");
-        let current = self.e.inspect_container(&name).ok().flatten();
-        let before = self.e.inspect_container(&previous).ok().flatten();
+        let (Ok(current), Ok(before)) = (
+            self.e.inspect_container(&name),
+            self.e.inspect_container(&previous),
+        ) else {
+            return;
+        };
+        self.interrupted = false;
         let running = |c: &Value| c["State"]["Running"] == json!(true);
         match (current, before) {
             (Some(c), Some(_)) if running(&c) && self.wait_healthy(&name).is_ok() => {
@@ -552,6 +567,8 @@ mod tests {
         registry: Option<String>, // version `latest` pulls
         log: RefCell<Vec<String>>,
         fail_rename: bool,
+        /// The next this many container inspections fail.
+        fail_inspect: std::cell::Cell<u32>,
     }
 
     impl Fake {
@@ -572,6 +589,10 @@ mod tests {
 
     impl Engine for Fake {
         fn inspect_container(&self, name: &str) -> Result<Option<Value>, DockerError> {
+            if self.fail_inspect.get() > 0 {
+                self.fail_inspect.set(self.fail_inspect.get() - 1);
+                return Err(DockerError("busy".into()));
+            }
             Ok(self.containers.borrow().get(name).map(|(image, running)| {
                 let health = if self.unhealthy.contains(image) { "unhealthy" } else { "healthy" };
                 json!({
@@ -909,5 +930,33 @@ mod tests {
         let mut u = Updater::new(&o, &fake);
         u.recover();
         assert!(!fake.containers.borrow()["aegis"].1);
+    }
+
+    #[test]
+    fn recovery_waits_for_docker_to_answer() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fake = Fake::default();
+        fake.image("sha256:old", "0.7.0");
+        stopped(&fake, "aegis-previous", "sha256:old");
+        interrupted(tmp.path());
+        fake.fail_inspect.set(2);
+        let o = options(tmp.path(), Source::Local);
+        let mut u = Updater::new(&o, &fake);
+        u.recover();
+        assert_eq!(
+            files::status(tmp.path()).expect("status")["state"],
+            "upgrading",
+            "nothing decided without Docker"
+        );
+        assert!(u.interrupted);
+        // A restart of the updater still knows; so does this run.
+        assert!(Updater::new(&o, &fake).interrupted);
+        u.recover();
+        assert_eq!(fake.running_image("aegis").as_deref(), Some("sha256:old"));
+        assert!(fake.containers.borrow()["aegis"].1);
+        assert_eq!(
+            files::status(tmp.path()).expect("status")["state"],
+            "rolled_back"
+        );
     }
 }
