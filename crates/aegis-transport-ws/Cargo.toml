@@ -20,6 +20,7 @@ webpki-roots = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }

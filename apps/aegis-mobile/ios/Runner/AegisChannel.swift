@@ -216,19 +216,25 @@ final class AegisChannel {
                 result(Self.ok)
             }
         }
+        // The report an earlier extension saved (it couldn't send it).
+        let savedEarlier = {
+            let status = Self.object(Self.core { aegis_diag_status(Self.dir) })
+            return (status["result"] as? [String: Any])?["file"] as? String
+        }
         running { session in
             guard let session else {
-                let status = Self.object(Self.core { aegis_diag_status(Self.dir) })
-                present((status["result"] as? [String: Any])?["file"] as? String)
+                present(savedEarlier())
                 return
             }
+            // A fresh report from the running extension; when it recorded
+            // nothing (it started after the recording), the earlier one.
             do {
                 try session.sendProviderMessage(Data("diag-save".utf8)) { data in
                     let saved = Self.object(data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
-                    present(saved["path"] as? String)
+                    present(saved["path"] as? String ?? savedEarlier())
                 }
             } catch {
-                present(nil)
+                present(savedEarlier())
             }
         }
     }

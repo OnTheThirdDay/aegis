@@ -56,6 +56,8 @@ The Windows and macOS apps aren't signed by a certificate authority, so nothing 
   - Android itself refuses an APK not signed with the release key.
   - The old app (AegisNet) never offers updates; it moves to AegisBorne instead.
 - **The desktop VPN helper:** after an update the app shows **Update VPN helper** when the installed helper is older, as before.
+- **Phones (1.1.8):** the answer to an update check is reused for 15 minutes, for the server that gave it only; a download comes from the server that offered it.
+- **Desktop (1.1.8):** downloading and installing runs as a task of its own, so Disconnect and Shutdown are handled meanwhile; shutting down cancels it.
 
 **iOS (owner choice: Ad Hoc IPA, when the iOS app exists)**
 
@@ -63,7 +65,7 @@ The Windows and macOS apps aren't signed by a certificate authority, so nothing 
 - iOS installs Ad Hoc builds only through `itms-services://` with a manifest. The system downloads the IPA itself, over HTTPS with a publicly trusted certificate, and can't present a device certificate.
 - So the iOS app will need a short-lived download link from the gateway. The gateway's edge needs a public certificate, which Cloudflare and ACME setups have; a private CA won't do.
 - Each iPhone must also be registered in the Ad Hoc provisioning profile, and a new phone needs a new build.
-- As built (1.1.5, ADR-0019): there is no signed `.update` description for iOS. iOS verifies Apple's signature itself, and the build is the one every gateway fetches for the iPhone app integration. The gateway answers the iPhone's `update_query` with that app's version and a device-bound install link; the app checks the version is newer and the link is an `itms-services` manifest over HTTPS.
+- As built (1.1.5, ADR-0019): there is no signed `.update` description for iOS. iOS verifies Apple's signature itself, and the build is the one every gateway fetches for the iPhone app integration. The gateway answers the iPhone's `update_query` with that app's version and a device-bound install link; the app checks the version is newer and the link is an `itms-services` manifest over HTTPS. Since 1.1.8 the link is given only to a request signed with the device key (`ios_offer_message`): a device certificate is not secret, and the link downloads the app. Apps up to 1.1.7 don't sign, so they install 1.1.8 from the portal.
 
 ## Consequences
 

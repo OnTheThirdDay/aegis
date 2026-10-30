@@ -48,6 +48,20 @@ pub async fn run<D>(
     proxy: SocketAddr,
     dns: FakeDns,
     stats: Arc<Stats>,
+    stop: watch::Receiver<bool>,
+) where
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    run_shared(device, proxy, Arc::new(Mutex::new(dns)), stats, stop).await
+}
+
+/// [`run`] with a DNS table the caller keeps too (to change pinned
+/// addresses while the path runs).
+pub async fn run_shared<D>(
+    device: D,
+    proxy: SocketAddr,
+    dns: Arc<Mutex<FakeDns>>,
+    stats: Arc<Stats>,
     mut stop: watch::Receiver<bool>,
 ) where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -56,7 +70,6 @@ pub async fn run<D>(
     let _ = config.mtu(MTU);
     config.udp_timeout(UDP_TIMEOUT);
     let mut stack = IpStack::new(config, device);
-    let dns = Arc::new(Mutex::new(dns));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         let stream = tokio::select! {

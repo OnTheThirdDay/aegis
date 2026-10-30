@@ -35,9 +35,10 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
   - It joins that gateway as a device, with an invitation created there (pasted under **Reach GitHub through another gateway**).
   - Its GitHub requests then go through a built-in client: a local HTTP proxy into the tunnel, started when first needed. Nothing else of its traffic changes.
   - Its device identity there renews like any device's, and appears on that gateway's Devices page, where it can be revoked. **Stop using it** removes it from this side.
+  - A new invitation is joined first (1.1.8): the earlier identity is replaced only once that worked, so a mistyped or expired invitation leaves the working setup as it was.
   - Friends' iPhones never contact GitHub either way: they reach only their gateway.
 - **Requests:** users' iPhone requests, which the administrator approves (this starts the workflow) or removes. Up to 500 are kept; the same iPhone keeps one request.
-- **Automatic approval (optional, per gateway):** an iPhone is approved as soon as it registers, while its user has fewer than N approved iPhones (2 unless set, 1–10). Beyond that, requests wait for the administrator. This guards the team's 100 iPhones a year against anyone who can sign in to the portal.
+- **Automatic approval (optional, per gateway):** an iPhone is approved as soon as it registers, while its user has fewer than N approved iPhones (2 unless set, 1–10). Beyond that, requests wait for the administrator. This guards the team's 100 iPhones a year against anyone who can sign in to the portal. Requests still being approved automatically count toward the limit (1.1.8), so several sent at once can't all pass it.
 
 **The user portal (Devices → iPhone app; `handlers/ios.rs`)**
 
@@ -49,7 +50,7 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
   - An `itms-services://` link to a manifest. iOS fetches the manifest and the app itself, without the user's session, so both links carry a token valid for an hour.
   - The links use the portal's public address, which needs a publicly trusted certificate (Cloudflare Tunnel or Let's Encrypt).
 - **Downloads iOS makes:** the manifest and the app answer `HEAD` (iOS asks for the app's size first and waits forever at "Waiting…" when refused) and single byte ranges (`206`), with an explicit `Content-Length`.
-- **Updating from the app (1.1.5):** the iPhone app asks its gateway for updates like the other apps (a device-authenticated `update_query` for `ios`). The gateway answers with the version of the iPhone app it serves and an install link bound to the device, valid an hour. The app offers the update when that version is newer, and opens the link: iOS asks the user, closes the app and installs over it, keeping its data (same bundle ID and team). iOS checks Apple's signature and that the build is for this iPhone; the app accepts only an `itms-services` link to an HTTPS manifest. Needs the iPhone app integration and the portal's public address on that gateway.
+- **Updating from the app (1.1.5):** the iPhone app asks its gateway for updates like the other apps (a device-authenticated `update_query` for `ios`). The gateway answers with the version of the iPhone app it serves and an install link bound to the device, valid an hour. The app offers the update when that version is newer, and opens the link: iOS asks the user, closes the app and installs over it, keeping its data (same bundle ID and team). iOS checks Apple's signature and that the build is for this iPhone; the app accepts only an `itms-services` link to an HTTPS manifest. Needs the iPhone app integration and the portal's public address on that gateway. Since 1.1.8 the request must be signed with the device key to get the link (ADR-0017).
 - **Older iPhones:** the portal's pages work in Safari on iOS 12 (the iPhone 6's last): a `replaceChildren` fallback, no `?.`, a clipboard fallback. Registering works there too; the app itself needs iOS 16.
 - **Portal routes:** these are its only additions. The token-carrying routes need no session; everything else needs a signed-in user.
 

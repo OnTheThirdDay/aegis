@@ -207,12 +207,13 @@ impl Engine {
             settings,
             state: Arc::clone(&state),
             node: None,
-            repaint,
+            repaint: Arc::from(repaint),
             proxy_saved: None,
             vpn: None,
             endpoint_failed: None,
             offer: None,
             update_checked: None,
+            update_job: None,
         };
         runtime.spawn(worker.run(rx));
         Ok(Engine {
@@ -250,7 +251,7 @@ struct Worker {
     settings: Settings,
     state: Arc<Mutex<Snapshot>>,
     node: Option<aegis_node::NodeRuntime>,
-    repaint: Box<dyn Fn() + Send + Sync>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
     proxy_saved: Option<sysproxy::Saved>,
     /// The system VPN, while it runs.
     vpn: Option<Session>,
@@ -260,6 +261,9 @@ struct Worker {
     /// The update the server offers, checked and signed (ADR-0017).
     offer: Option<aegis_join::update::Update>,
     update_checked: Option<Instant>,
+    /// Downloading and installing an update: a task of its own, so that
+    /// Disconnect and Shutdown are handled meanwhile (Shutdown cancels it).
+    update_job: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Worker {
@@ -372,6 +376,9 @@ impl Worker {
                         }
                         Command::InstallUpdate => self.install_update().await,
                         Command::Shutdown(done) => {
+                            if let Some(job) = self.update_job.take() {
+                                job.abort();
+                            }
                             self.disconnect().await;
                             let _ = done.send(());
                             break;
@@ -961,13 +968,19 @@ impl Worker {
     }
 
     async fn install_update(&mut self) {
+        if self.update_job.as_ref().is_some_and(|j| !j.is_finished()) {
+            return;
+        }
         let (Some(offer), Some(device)) = (self.offer.clone(), self.device.clone()) else {
             return;
         };
         let version = offer.version.clone();
-        let failed = |message: String| UpdateState::Failed {
-            version: version.clone(),
-            message,
+        let failed = {
+            let version = version.clone();
+            move |message: String| UpdateState::Failed {
+                version: version.clone(),
+                message,
+            }
         };
         let folder = self.data_dir.join("update");
         if let Err(e) = std::fs::create_dir_all(&folder) {
@@ -983,34 +996,38 @@ impl Worker {
                 total: offer.size,
             }
         });
-        let (state, repaint) = (&self.state, &self.repaint);
-        let downloaded = aegis_join::update::download(&device, &offer, &dest, |done, total| {
-            if let UpdateState::Downloading {
-                done: d, total: t, ..
-            } = &mut state.lock().unwrap_or_else(|e| e.into_inner()).update
-            {
-                (*d, *t) = (done, total);
+        let (state, repaint) = (Arc::clone(&self.state), Arc::clone(&self.repaint));
+        self.update_job = Some(tokio::spawn(async move {
+            let set = |next: UpdateState| {
+                state.lock().unwrap_or_else(|e| e.into_inner()).update = next;
+                repaint();
+            };
+            let downloaded = aegis_join::update::download(&device, &offer, &dest, |done, total| {
+                if let UpdateState::Downloading {
+                    done: d, total: t, ..
+                } = &mut state.lock().unwrap_or_else(|e| e.into_inner()).update
+                {
+                    (*d, *t) = (done, total);
+                }
+                repaint();
+            })
+            .await;
+            if let Err(e) = downloaded {
+                set(failed(format!("Could not download the update: {e}")));
+                return;
             }
-            repaint();
-        })
-        .await;
-        if let Err(e) = downloaded {
-            self.update(|s| s.update = failed(format!("Could not download the update: {e}")));
-            return;
-        }
-        let installed = tokio::task::spawn_blocking(move || crate::selfupdate::install(&dest))
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
-        self.update(|s| {
-            s.update = match installed {
+            let installed = tokio::task::spawn_blocking(move || crate::selfupdate::install(&dest))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+            set(match installed {
                 Ok(start) => UpdateState::Ready {
                     version: version.clone(),
                     start,
                 },
                 Err(e) => failed(e),
-            }
-        });
+            });
+        }));
     }
 
     async fn diag_send(&mut self) {

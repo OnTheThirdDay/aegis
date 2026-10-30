@@ -81,8 +81,12 @@ class _RootState extends State<Root> with WidgetsBindingObserver {
           s = await client.servers();
         }
         legacyOutdated = r.legacy == 'outdated';
+        // Nothing moved (the old app needs its update first, say): tried
+        // again when the user comes back, as the notice asks them to.
+        if (r.count == 0) importTried = false;
       } on ClientError {
-        // Join with an invitation instead.
+        // Join with an invitation instead, or come back to try again.
+        importTried = false;
       }
     }
     final text = await client.sharedText();

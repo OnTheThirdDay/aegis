@@ -82,13 +82,15 @@ impl Settings {
 }
 
 /// Whether `user`'s new request may be approved automatically: below the
-/// number of iPhones each user gets without the administrator.
+/// number of iPhones each user gets without the administrator. Requests
+/// still being approved automatically count too, so that several sent at
+/// once can't all pass before the first is approved.
 fn auto_allowed(requests: &[Request], user: &str, limit: u32) -> bool {
-    let approved = requests
+    let taken = requests
         .iter()
-        .filter(|r| r.user == user && r.state == "approved")
+        .filter(|r| r.user == user && (r.state == "approved" || (r.state == "pending" && r.auto)))
         .count();
-    approved < limit as usize
+    taken < limit as usize
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -120,6 +122,10 @@ struct Request {
     message: Option<String>,
     #[serde(default)]
     approved_at: Option<i64>,
+    /// Being approved automatically: counts toward the user's automatic
+    /// iPhones while GitHub is asked (see [`auto_allowed`]).
+    #[serde(default)]
+    auto: bool,
 }
 
 /// Where an iPhone stands: `pending`, `failed`, `ready` (the app here
@@ -482,25 +488,40 @@ impl IosIntegration {
     }
 
     /// Join another gateway (an invitation from it) to reach GitHub through,
-    /// replacing any earlier one; "" stops using one.
+    /// replacing any earlier one; "" stops using one. The earlier one stays
+    /// until the new one joined: a mistyped or expired invitation, or an
+    /// unreachable gateway, leaves the working setup as it was.
     async fn set_via(&self, code: &str) -> Result<(), (u16, String)> {
-        if let Some(node) = self.upstream.lock().await.take() {
-            node.shutdown(Duration::from_secs(1)).await;
-        }
         let dir = self.dir.join("upstream");
-        let _ = std::fs::remove_dir_all(&dir);
         if code.is_empty() {
+            if let Some(node) = self.upstream.lock().await.take() {
+                node.shutdown(Duration::from_secs(1)).await;
+            }
+            let _ = std::fs::remove_dir_all(&dir);
             return Ok(());
         }
         let invite = aegis_join::parse_invite(code).map_err(|e| err(400, e.to_string()))?;
+        let next = self.dir.join("upstream.next");
+        let _ = std::fs::remove_dir_all(&next);
         // Under the gateway's 30-second idle limit for the console.
-        tokio::time::timeout(
+        let joined = tokio::time::timeout(
             API_TIMEOUT,
-            aegis_join::enroll(&invite, &aegis_join::DeviceDir::new(&dir)),
+            aegis_join::enroll(&invite, &aegis_join::DeviceDir::new(&next)),
         )
         .await
-        .map_err(|_| err(502, "the other gateway didn't answer in time"))?
-        .map_err(|e| err(502, format!("joining the other gateway: {e}")))?;
+        .map_err(|_| err(502, "the other gateway didn't answer in time"))
+        .and_then(|r| r.map_err(|e| err(502, format!("joining the other gateway: {e}"))));
+        if let Err(e) = joined {
+            let _ = std::fs::remove_dir_all(&next);
+            return Err(e);
+        }
+        let mut node = self.upstream.lock().await;
+        if let Some(old) = node.take() {
+            old.shutdown(Duration::from_secs(1)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::rename(&next, &dir)
+            .map_err(|e| err(500, format!("keeping the new identity: {e}")))?;
         Ok(())
     }
 
@@ -757,9 +778,12 @@ impl IosIntegration {
             state: "pending".into(),
             message: None,
             approved_at: None,
+            auto: false,
         };
         let settings: Settings = self.load("settings.json");
         let auto = settings.auto_approve && auto_allowed(&list, actor, settings.per_user());
+        // Reserved under the same lock that checked the limit.
+        let r = Request { auto, ..r };
         let id = r.id.clone();
         list.push(r);
         self.save("requests.json", &Some(list))?;
@@ -892,6 +916,7 @@ mod tests {
             state: state.into(),
             message: None,
             approved_at: None,
+            auto: false,
         };
         let list = vec![
             r("alice", "approved"),
@@ -909,6 +934,12 @@ mod tests {
         ));
         assert!(auto_allowed(&list, "carol", 2));
         assert!(!auto_allowed(&list, "bob", 1));
+        // Requests being approved automatically hold their place.
+        let mut reserved = r("carol", "pending");
+        reserved.auto = true;
+        let list = vec![reserved.clone(), reserved];
+        assert!(!auto_allowed(&list, "carol", 2));
+        assert!(auto_allowed(&list, "carol", 3));
     }
 
     #[test]
@@ -938,6 +969,7 @@ mod tests {
             state: "pending".into(),
             message: None,
             approved_at: None,
+            auto: false,
         };
         let has = vec!["447C2B96BB63020799BBD2C659A98AF8EDF3B525".to_owned()];
         assert_eq!(stage(&r, Some(&has), 100), "pending");

@@ -94,6 +94,54 @@ pub async fn post_json(url: &str, edge: &Edge, body: &Value) -> Result<(u16, Vec
     post_json_up_to(url, edge, body, MAX_RESPONSE).await
 }
 
+/// How long connecting to the gateway may take, and one of its addresses.
+const CONNECT_LIMIT: Duration = Duration::from_secs(15);
+const PER_ADDRESS: Duration = Duration::from_secs(3);
+
+/// Connect to `host:port`, trying its addresses in turn, IPv6 and IPv4
+/// alternating. Each but the last gets a few seconds at most, so an
+/// address this network can't reach (IPv6 where it doesn't work) doesn't
+/// use up all of `limit` before the next is tried.
+/// (As `aegis_transport_ws::connect_host`, which this crate doesn't use.)
+async fn connect_host(
+    host: &str,
+    port: u16,
+    limit: Duration,
+) -> std::io::Result<tokio::net::TcpStream> {
+    use std::io::{Error, ErrorKind};
+    let deadline = tokio::time::Instant::now() + limit;
+    let found = tokio::time::timeout(limit, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "name lookup timed out"))??;
+    let (v6, v4): (Vec<_>, Vec<_>) = found.partition(std::net::SocketAddr::is_ipv6);
+    let mut addrs = Vec::new();
+    let (mut a, mut b) = (v6.into_iter(), v4.into_iter());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => break,
+            (x, y) => addrs.extend(x.into_iter().chain(y)),
+        }
+    }
+    let mut last = Error::new(ErrorKind::NotFound, "no address");
+    for (i, addr) in addrs.iter().enumerate() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let try_for = if i + 1 < addrs.len() {
+            left.min(PER_ADDRESS)
+        } else {
+            left
+        };
+        match tokio::time::timeout(try_for, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = Error::new(ErrorKind::TimedOut, "connect timed out"),
+        }
+    }
+    Err(last)
+}
+
 /// [`post_json`] accepting a response of up to `max` bytes (update
 /// downloads come in larger pieces).
 pub async fn post_json_up_to(
@@ -122,7 +170,7 @@ pub async fn post_json_up_to(
         format!("{host_header}:{}", target.port)
     };
     let exchange = async {
-        let tcp = tokio::net::TcpStream::connect((target.host.as_str(), target.port))
+        let tcp = connect_host(&target.host, target.port, CONNECT_LIMIT)
             .await
             .map_err(|e| JoinError::Network(e.kind().to_string()))?;
         let mut tls = tokio_rustls::TlsConnector::from(config)

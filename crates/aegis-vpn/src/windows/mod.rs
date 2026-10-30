@@ -174,8 +174,12 @@ impl System for Windows {
 
     /// The VPN's resolver is set on its own adapter, which is ahead of the
     /// others, and DNS through any other adapter is blocked (`wfp`).
-    fn set_dns(&self) -> io::Result<DnsSaved> {
+    fn read_dns(&self) -> io::Result<DnsSaved> {
         Ok(Vec::new())
+    }
+
+    fn set_dns(&self, _saved: &DnsSaved) -> io::Result<()> {
+        Ok(())
     }
 
     fn restore_dns(&self, _saved: &DnsSaved) -> io::Result<()> {

@@ -5,6 +5,10 @@
 //! duplex. The upgrade itself grants nothing — inner mTLS must complete before
 //! any proxy command is honored. Origin is never used for authentication;
 //! by default requests carrying an `Origin` header (i.e. browsers) are refused.
+//!
+//! Padding: the client asks for padded framing with [`PADDING_HEADER`]; a
+//! gateway that supports it answers with the same header, and only then do
+//! both ends pad (see [`WsDuplex`]). Older clients and gateways ignore it.
 #![forbid(unsafe_code)]
 
 mod duplex;
@@ -18,13 +22,15 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::ServerName;
 use std::fmt;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 pub const DESCRIPTOR: ModuleDescriptor = ModuleDescriptor {
@@ -83,6 +89,10 @@ impl fmt::Display for WsError {
 
 impl std::error::Error for WsError {}
 
+/// Upgrade header announcing padded framing, in the request and its answer.
+pub const PADDING_HEADER: &str = "aegis-framing";
+const PADDING_VERSION: &str = "padded-1";
+
 fn ws_config(max_message: usize) -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(max_message))
@@ -127,9 +137,11 @@ where
 {
     let path = cfg.path.clone();
     let origins = cfg.allowed_origins.clone();
+    let padded = Arc::new(AtomicBool::new(false));
+    let agreed = Arc::clone(&padded);
     // The callback signature (and its large error type) is tungstenite's.
     #[allow(clippy::result_large_err)]
-    let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+    let callback = move |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
         if req.uri().path() != path {
             return Err(reject(StatusCode::NOT_FOUND));
         }
@@ -145,6 +157,15 @@ where
                 return Err(reject(StatusCode::FORBIDDEN));
             }
         }
+        if req
+            .headers()
+            .get(PADDING_HEADER)
+            .is_some_and(|v| v == PADDING_VERSION)
+        {
+            resp.headers_mut()
+                .insert(PADDING_HEADER, HeaderValue::from_static(PADDING_VERSION));
+            agreed.store(true, Ordering::Relaxed);
+        }
         Ok(resp)
     };
     let fut = tokio_tungstenite::accept_hdr_async_with_config(
@@ -156,7 +177,7 @@ where
         .await
         .map_err(|_| WsError::Timeout)?
         .map_err(|e| WsError::Handshake(e.to_string()))?;
-    Ok(WsDuplex::new(ws))
+    Ok(WsDuplex::new(ws, padded.load(Ordering::Relaxed)))
 }
 
 /// A stream whose first bytes were already read (e.g. to route a request by
@@ -354,16 +375,57 @@ fn outer_tls_config(
     Ok(Arc::new(config))
 }
 
+/// How long one of several addresses is tried before the next.
+const PER_ADDRESS: Duration = Duration::from_secs(3);
+
+/// Connect to `host:port`, trying its addresses in turn, IPv6 and IPv4
+/// alternating. Each but the last gets a few seconds at most, so an
+/// address this network can't reach (IPv6 where it doesn't work) doesn't
+/// use up all of `limit` before the next is tried.
+pub async fn connect_host(host: &str, port: u16, limit: Duration) -> std::io::Result<TcpStream> {
+    use std::io::{Error, ErrorKind};
+    let deadline = tokio::time::Instant::now() + limit;
+    let found = tokio::time::timeout(limit, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "name lookup timed out"))??;
+    let (v6, v4): (Vec<_>, Vec<_>) = found.partition(std::net::SocketAddr::is_ipv6);
+    let mut addrs = Vec::new();
+    let (mut a, mut b) = (v6.into_iter(), v4.into_iter());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => break,
+            (x, y) => addrs.extend(x.into_iter().chain(y)),
+        }
+    }
+    let mut last = Error::new(ErrorKind::NotFound, "no address");
+    for (i, addr) in addrs.iter().enumerate() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let try_for = if i + 1 < addrs.len() {
+            left.min(PER_ADDRESS)
+        } else {
+            left
+        };
+        match tokio::time::timeout(try_for, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = Error::new(ErrorKind::TimedOut, "connect timed out"),
+        }
+    }
+    Err(last)
+}
+
 pub async fn connect(cfg: &WsClientConfig) -> Result<WsDuplex<OuterStream>, WsError> {
     let url = parse_url(&cfg.url)?;
     let tcp = if cfg.connect_addresses.is_empty() {
-        tokio::time::timeout(
-            cfg.connect_timeout,
-            TcpStream::connect((url.host.as_str(), url.port)),
-        )
-        .await
-        .map_err(|_| WsError::Timeout)?
-        .map_err(WsError::Connect)?
+        connect_host(&url.host, url.port, cfg.connect_timeout)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut => WsError::Timeout,
+                _ => WsError::Connect(e),
+            })?
     } else {
         let mut last = WsError::Timeout;
         let mut connected = None;
@@ -400,14 +462,26 @@ pub async fn connect(cfg: &WsClientConfig) -> Result<WsDuplex<OuterStream>, WsEr
     } else {
         OuterStream::Plain(tcp)
     };
+    let mut request = cfg
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| WsError::Handshake(e.to_string()))?;
+    request
+        .headers_mut()
+        .insert(PADDING_HEADER, HeaderValue::from_static(PADDING_VERSION));
     let fut = tokio_tungstenite::client_async_with_config(
-        cfg.url.as_str(),
+        request,
         outer,
         Some(ws_config(cfg.max_message_bytes)),
     );
-    let (ws, _resp) = tokio::time::timeout(cfg.handshake_timeout, fut)
+    let (ws, resp) = tokio::time::timeout(cfg.handshake_timeout, fut)
         .await
         .map_err(|_| WsError::Timeout)?
         .map_err(|e| WsError::Handshake(e.to_string()))?;
-    Ok(WsDuplex::new(ws))
+    let padded = resp
+        .headers()
+        .get(PADDING_HEADER)
+        .is_some_and(|v| v == PADDING_VERSION);
+    Ok(WsDuplex::new(ws, padded))
 }
