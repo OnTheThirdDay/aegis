@@ -66,8 +66,9 @@ jobs:
       APPLE_DIST_P12_PASSWORD: ${{ secrets.APPLE_DIST_P12_PASSWORD }}
       AEGIS_IOS_APP_KEY: ${{ secrets.AEGIS_IOS_APP_KEY }}
       GH_TOKEN: ${{ github.token }}
-      RCODESIGN: "0.29.0"
-      RCODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
+      # Not RCODESIGN_*: rcodesign reads those as its own settings.
+      CODESIGN_VERSION: "0.29.0"
+      CODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
     steps:
       - uses: actions/checkout@v7
         with:
@@ -78,12 +79,12 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -q cryptography
           # rcodesign: Apple code signing on Linux (pinned).
-          archive="apple-codesign-$RCODESIGN-x86_64-unknown-linux-musl.tar.gz"
+          archive="apple-codesign-$CODESIGN_VERSION-x86_64-unknown-linux-musl.tar.gz"
           curl -fsSL -o "$RUNNER_TEMP/$archive" \
-            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/$RCODESIGN/$archive"
-          echo "$RCODESIGN_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/$CODESIGN_VERSION/$archive"
+          echo "$CODESIGN_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/apple-codesign-$RCODESIGN-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/apple-codesign-$CODESIGN_VERSION-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
       - name: Re-sign the current app
         run: |
           set -euo pipefail

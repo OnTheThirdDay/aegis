@@ -45,7 +45,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The routes a portal user needs, nothing else.
 fn allowed(method: &Method, path: &str) -> bool {
-    if *method == Method::GET {
+    // HEAD as GET: iOS asks for the app's size before downloading it, and
+    // waits forever when refused.
+    if *method == Method::GET || *method == Method::HEAD {
         matches!(
             path,
             "/" | "/app.js"
@@ -481,9 +483,12 @@ mod tests {
             &Method::GET,
             "/downloads/aegis-client-windows-x86_64.exe"
         ));
+        assert!(allowed(&Method::HEAD, "/api/v1/ios/app/token"));
+        assert!(allowed(&Method::HEAD, "/api/v1/ios/manifest/token"));
         for (m, p) in [
             (Method::GET, "/api/v1/users"),
             (Method::GET, "/api/v1/system/info"),
+            (Method::HEAD, "/api/v1/users"),
             (Method::POST, "/api/v1/users"),
             (Method::GET, "/api/v1/diagnostics"),
             (Method::POST, "/api/v1/system/device-ca/export-root-key"),

@@ -339,11 +339,45 @@ pub async fn manifest(State(ctx): State<Ctx>, Path(token): Path<String>) -> ApiR
     Ok(resp)
 }
 
-/// `GET /api/v1/ios/app/{token}`: the app itself, streamed from disk.
-pub async fn app(State(ctx): State<Ctx>, Path(token): Path<String>) -> ApiResult {
+/// The bytes a `Range: bytes=…` header asks for (one range), inclusive:
+/// `None` for the whole file, `Err` when it can't be satisfied.
+fn byte_range(range: Option<&str>, len: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = range?.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        // Several ranges: the whole file is a valid answer.
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let parsed = match (first.trim(), last.trim()) {
+        ("", n) => n
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0 && len > 0)
+            .map(|n| (len.saturating_sub(n), len - 1)),
+        (a, "") => a
+            .parse::<u64>()
+            .ok()
+            .filter(|&a| a < len)
+            .map(|a| (a, len - 1)),
+        (a, b) => match (a.parse::<u64>(), b.parse::<u64>()) {
+            (Ok(a), Ok(b)) if a <= b && a < len => Some((a, b.min(len - 1))),
+            _ => None,
+        },
+    };
+    Some(parsed.ok_or(()))
+}
+
+/// `GET /api/v1/ios/app/{token}`: the app itself, streamed from disk. iOS
+/// may ask for its size first (HEAD) and download it in parts (`Range`).
+pub async fn app(
+    State(ctx): State<Ctx>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult {
+    use tokio::io::AsyncSeekExt;
     take_link(&ctx, &token, false).ok_or_else(ApiError::not_found)?;
     let dir = ctx.data_dir().ok_or_else(ApiError::not_found)?;
-    let file = tokio::fs::File::open(dir.join("ios/app.ipa"))
+    let mut file = tokio::fs::File::open(dir.join("ios/app.ipa"))
         .await
         .map_err(|_| ApiError::not_found())?;
     let len = file
@@ -351,12 +385,44 @@ pub async fn app(State(ctx): State<Ctx>, Path(token): Path<String>) -> ApiResult
         .await
         .map_err(|_| ApiError::not_found())?
         .len();
-    let mut resp = axum::response::Response::new(Body::new(FileBody::new(file, len)));
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let (status, start, count, content_range) = match byte_range(range, len) {
+        None => (StatusCode::OK, 0, len, None),
+        Some(Ok((a, b))) => (
+            StatusCode::PARTIAL_CONTENT,
+            a,
+            b - a + 1,
+            Some(format!("bytes {a}-{b}/{len}")),
+        ),
+        Some(Err(())) => {
+            let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            if let Ok(v) = http::HeaderValue::from_str(&format!("bytes */{len}")) {
+                resp.headers_mut().insert(header::CONTENT_RANGE, v);
+            }
+            return Ok(resp);
+        }
+    };
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|_| ApiError::not_found())?;
+    }
+    let mut resp = axum::response::Response::new(Body::new(FileBody::new(file, count)));
+    *resp.status_mut() = status;
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/octet-stream"),
     );
+    h.insert(
+        header::ACCEPT_RANGES,
+        http::HeaderValue::from_static("bytes"),
+    );
+    if let Some(v) = content_range.and_then(|v| http::HeaderValue::from_str(&v).ok()) {
+        h.insert(header::CONTENT_RANGE, v);
+    }
+    // Explicit, so a HEAD answer (body dropped) still carries the size.
+    h.insert(header::CONTENT_LENGTH, http::HeaderValue::from(count));
     h.insert(
         header::CACHE_CONTROL,
         http::HeaderValue::from_static("no-store"),
@@ -367,6 +433,20 @@ pub async fn app(State(ctx): State<Ctx>, Path(token): Path<String>) -> ApiResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_ranges() {
+        assert_eq!(byte_range(None, 100), None);
+        assert_eq!(byte_range(Some("bytes=0-9"), 100), Some(Ok((0, 9))));
+        assert_eq!(byte_range(Some("bytes=90-"), 100), Some(Ok((90, 99))));
+        assert_eq!(byte_range(Some("bytes=-10"), 100), Some(Ok((90, 99))));
+        assert_eq!(byte_range(Some("bytes=50-500"), 100), Some(Ok((50, 99))));
+        assert_eq!(byte_range(Some("bytes=-500"), 100), Some(Ok((0, 99))));
+        assert_eq!(byte_range(Some("bytes=100-"), 100), Some(Err(())));
+        assert_eq!(byte_range(Some("bytes=9-0"), 100), Some(Err(())));
+        assert_eq!(byte_range(Some("bytes=0-1,5-6"), 100), None);
+        assert_eq!(byte_range(Some("items=0-1"), 100), None);
+    }
 
     #[test]
     fn the_udid_is_read_from_what_ios_posts() {
