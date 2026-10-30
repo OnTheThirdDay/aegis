@@ -89,6 +89,13 @@ class MainActivity : FlutterActivity() {
                 // App updates the server offers (ADR-0017).
                 "checkUpdate" -> background(result) { Native.checkUpdate(dir) }
                 "installUpdate" -> background(result) { installUpdate(dir) }
+                // On-demand diagnostics.
+                "diagStatus" -> result.success(Native.diagStatus(dir))
+                "diagStart" -> result.success(Native.diagStart(dir, call.argument<Int>("minutes") ?: 15, about()))
+                "diagStop" -> background(result) { Native.diagStop(dir, call.argument<Boolean>("send") ?: false) }
+                "diagSend" -> background(result) { Native.diagSend(dir) }
+                "diagDiscard" -> result.success(Native.diagDiscard(dir))
+                "diagShare" -> result.success(shareReport(dir))
                 "uninstallLegacy" -> {
                     Migration.uninstallLegacy(this)
                     result.success(JSONObject().put("ok", true).toString())
@@ -96,6 +103,23 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    /** The phone, for diagnostics: maker, model and Android version. */
+    private fun about() = "${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+
+    /** Save the recorded report and offer it to another app (chat, mail). */
+    private fun shareReport(dir: String): String {
+        val saved = JSONObject(Native.diagSave(dir))
+        if (!saved.optBoolean("ok")) return saved.toString()
+        val file = java.io.File(saved.getString("path"))
+        val send = Intent(Intent.ACTION_SEND)
+            .setType("application/gzip")
+            .putExtra(Intent.EXTRA_STREAM, ReportProvider.uri(this, file))
+            .putExtra(Intent.EXTRA_SUBJECT, "AegisBorne diagnostics")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(Intent.createChooser(send, getString(R.string.app_name)))
+        return JSONObject().put("ok", true).toString()
     }
 
     /** The core's status, plus a failure from before the core took over. */
@@ -163,6 +187,7 @@ class MainActivity : FlutterActivity() {
         if (resultCode == RESULT_OK) {
             startVpn(result)
         } else {
+            Native.diagNote("the user or the system didn't allow the VPN")
             result.success(
                 JSONObject().put("ok", false)
                     .put("error", "Android didn't allow the VPN connection.").toString()

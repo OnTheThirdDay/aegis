@@ -24,6 +24,22 @@ char *aegis_start_tunnel(const char *dir);
 char *aegis_stop(void);
 /// Connection state and counters.
 char *aegis_status(void);
+/// Diagnostics: record for 1-60 minutes; about describes the phone.
+char *aegis_diag_start(const char *dir, uint32_t minutes, const char *about);
+/// Stop recording; with send non-zero, send the report. Blocks.
+char *aegis_diag_stop(const char *dir, int32_t send);
+/// Send the recorded report to the selected server. Blocks.
+char *aegis_diag_send(const char *dir);
+/// The tunnel is ending: send an unsent recording, or save it when that
+/// fails. Blocks.
+char *aegis_diag_finish(const char *dir);
+/// Save the recorded report to a file to share: {"path"}.
+char *aegis_diag_save(const char *dir);
+char *aegis_diag_discard(const char *dir);
+/// Record a problem the platform side saw (no-op unless recording).
+char *aegis_diag_note(const char *text);
+/// {state, remaining_seconds, events, sending, result: {sent, message, at, file?}}
+char *aegis_diag_status(const char *dir);
 /// Release a string returned by any function above.
 void aegis_free(char *s);
 

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart' hide ConnectionState;
 import 'package:flutter/services.dart';
@@ -341,6 +342,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// Downloading an update, until the system installer takes over.
   bool updating = false;
 
+  Diagnostics diag = Diagnostics();
+  int diagMinutes = 15;
+  bool diagBusy = false;
+
+  /// The outcome of the last diagnostics action, shown in its card.
+  ({bool ok, String text})? diagNote;
+
   /// A newer app from the server: offered, never installed unasked.
   Widget _updateCard(AppUpdate u) {
     final scheme = Theme.of(context).colorScheme;
@@ -436,6 +444,171 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     } on ClientError {
       // Keep the last status.
     }
+    try {
+      final d = await widget.client.diagnostics();
+      if (mounted) setState(() => diag = d);
+    } on ClientError {
+      // Keep the last state.
+    } on MissingPluginException {
+      // An older platform side.
+    }
+  }
+
+  /// Run a diagnostics action, showing its outcome or error in the card.
+  Future<void> _diag(Future<({bool ok, String text})?> Function() f) async {
+    setState(() {
+      diagBusy = true;
+      diagNote = null;
+    });
+    try {
+      final note = await f();
+      if (mounted) setState(() => diagNote = note);
+    } on ClientError catch (e) {
+      if (mounted) setState(() => diagNote = (ok: false, text: e.message));
+    } finally {
+      await _refresh();
+      if (mounted) setState(() => diagBusy = false);
+    }
+  }
+
+  Widget _troubleshooting() {
+    final t = Theme.of(context).textTheme;
+    final scheme = Theme.of(context).colorScheme;
+    final d = diag;
+    final recordsWithVpn = Platform.isIOS && !_on;
+    final lines = <Widget>[];
+    final buttons = <Widget>[];
+    switch (d.state) {
+      case 'recording':
+        final left = d.remaining ?? 0;
+        lines.add(Row(children: [
+          Icon(Icons.fiber_manual_record, color: scheme.error, size: 14),
+          const SizedBox(width: 6),
+          Text('Recording · ${left ~/ 60}:${(left % 60).toString().padLeft(2, '0')} left · ${d.events} events',
+              style: t.titleSmall),
+        ]));
+        lines.add(Text(
+          'Reproduce the problem now (open the sites or apps that fail, or connect again). '
+          'When the time is up the report is sent to the server by itself.',
+          style: t.bodySmall,
+        ));
+        buttons.add(FilledButton(
+          onPressed: diagBusy
+              ? null
+              : () => _diag(() async {
+                    final r = await widget.client.stopDiagnostics(send: true);
+                    return r == null ? null : (ok: r.sent, text: r.message);
+                  }),
+          child: const Text('Stop and send'),
+        ));
+        buttons.add(OutlinedButton(
+          onPressed: diagBusy
+              ? null
+              : () => _diag(() async {
+                    await widget.client.stopDiagnostics(send: false);
+                    return null;
+                  }),
+          child: const Text('Stop'),
+        ));
+      case 'stopped':
+        lines.add(Text('Recording finished · ${d.events} events (kept for up to an hour)', style: t.titleSmall));
+        buttons.add(FilledButton(
+          onPressed: diagBusy || d.sending
+              ? null
+              : () => _diag(() async {
+                    final r = await widget.client.sendDiagnostics();
+                    return (ok: r.sent, text: r.message);
+                  }),
+          child: Text(d.sending ? 'Sending…' : 'Send to server'),
+        ));
+        buttons.add(OutlinedButton(
+          onPressed: diagBusy
+              ? null
+              : () => _diag(() async {
+                    await widget.client.shareDiagnostics();
+                    return null;
+                  }),
+          child: const Text('Share report'),
+        ));
+        buttons.add(TextButton(
+          onPressed: diagBusy
+              ? null
+              : () => _diag(() async {
+                    await widget.client.discardDiagnostics();
+                    return null;
+                  }),
+          child: const Text('Discard'),
+        ));
+      default:
+        lines.add(Text(
+          'Something not working, even connecting? Record what happens while you reproduce it, '
+          'so your administrator can see what went wrong.',
+          style: t.bodyMedium,
+        ));
+        lines.add(Row(children: [
+          const Text('Record for '),
+          DropdownButton<int>(
+            value: diagMinutes,
+            items: [for (final m in const [5, 15, 30, 60]) DropdownMenuItem(value: m, child: Text('$m minutes'))],
+            onChanged: (m) => setState(() => diagMinutes = m ?? 15),
+          ),
+        ]));
+        buttons.add(FilledButton(
+          onPressed: diagBusy
+              ? null
+              : () => _diag(() async {
+                    await widget.client.startDiagnostics(diagMinutes);
+                    return null;
+                  }),
+          child: Text(recordsWithVpn ? 'Connect and record' : 'Start recording'),
+        ));
+        if (d.file != null) {
+          buttons.add(OutlinedButton(
+            onPressed: diagBusy
+                ? null
+                : () => _diag(() async {
+                      await widget.client.shareDiagnostics();
+                      return null;
+                    }),
+            child: const Text('Share last report'),
+          ));
+        }
+        if (recordsWithVpn) {
+          lines.add(Text('On iPhone the recording runs in the VPN, so it starts with the connection.', style: t.bodySmall));
+        }
+    }
+    // The last send (also from the VPN when it ended), unless just shown.
+    final note = diagNote ?? (d.message == null ? null : (ok: d.sent == true, text: d.message!));
+    return Card(
+      child: ExpansionTile(
+        leading: const Icon(Icons.bug_report_outlined),
+        title: const Text('Troubleshooting'),
+        initiallyExpanded: d.state != 'off',
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        expandedCrossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ...lines.expand((w) => [w, const SizedBox(height: 8)]),
+          Wrap(spacing: 8, runSpacing: 8, children: buttons),
+          if (note != null) ...[
+            const SizedBox(height: 10),
+            Text(note.text, style: t.bodyMedium?.copyWith(color: note.ok ? scheme.primary : scheme.error)),
+            if (!note.ok && d.state != 'off')
+              Text(
+                "If the phone can't reach the server, use Share report and send the file to your "
+                'administrator another way (chat, mail); they import it in the console.',
+                style: t.bodySmall,
+              ),
+          ],
+          const SizedBox(height: 10),
+          Text(
+            'Records connection events and error messages only, never the sites you visit or your traffic. '
+            'Kept in memory (at most 5 MB) and switched off automatically. '
+            'Ask your administrator to start diagnostics on the server too.',
+            style: t.bodySmall,
+          ),
+        ],
+      ),
+    );
   }
 
   bool get _on => status.state != ConnectionState.disconnected;
@@ -667,6 +840,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ],
               ),
             ),
+            const SizedBox(height: 12),
+            _troubleshooting(),
             const SizedBox(height: 12),
             Text(
               'While connected, apps on this phone reach the internet through your server. '

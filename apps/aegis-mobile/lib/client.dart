@@ -115,6 +115,40 @@ class Status {
   final int? updateTotal;
 }
 
+/// On-demand diagnostics: a recording of what the connection does while
+/// the user reproduces a problem, for the administrator (ADR-0008).
+class Diagnostics {
+  Diagnostics({this.state = 'off', this.remaining, this.events = 0, this.sending = false, this.sent, this.message, this.file});
+
+  factory Diagnostics.fromJson(Map<String, dynamic> j) {
+    final r = j['result'] as Map<String, dynamic>?;
+    return Diagnostics(
+      state: (j['state'] as String?) ?? 'off',
+      remaining: (j['remaining_seconds'] as num?)?.toInt(),
+      events: (j['events'] as num?)?.toInt() ?? 0,
+      sending: j['sending'] == true,
+      sent: r?['sent'] as bool?,
+      message: r?['message'] as String?,
+      file: r?['file'] as String?,
+    );
+  }
+
+  /// `off`, `recording`, or `stopped` (recorded, kept for an hour).
+  final String state;
+
+  /// Seconds left while recording.
+  final int? remaining;
+  final int events;
+  final bool sending;
+
+  /// The last send: whether the report arrived, and what to tell the user.
+  final bool? sent;
+  final String? message;
+
+  /// A report saved because it couldn't be sent (iOS), to share.
+  final String? file;
+}
+
 /// A newer version of the app that the server offers, signed by the
 /// release workflow (ADR-0017), and the version installed.
 class AppUpdate {
@@ -227,6 +261,32 @@ class Client {
   /// which asks the user. Returns a message when the user has something to
   /// do first.
   Future<String?> installUpdate() async => (await _call('installUpdate'))['message'] as String?;
+
+  Future<Diagnostics> diagnostics() async => Diagnostics.fromJson(await _call('diagStatus'));
+
+  /// Record for [minutes]. On iOS, while the VPN is off, this connects and
+  /// records from the start of the connection.
+  Future<void> startDiagnostics(int minutes) => _call('diagStart', {'minutes': minutes});
+
+  /// Stop recording; with [send], send the report. Returns the outcome
+  /// (null when not sending).
+  Future<({bool sent, String message})?> stopDiagnostics({required bool send}) async {
+    final j = await _call('diagStop', {'send': send});
+    final message = j['message'] as String?;
+    return message == null ? null : (sent: j['sent'] == true, message: message);
+  }
+
+  /// Send the recorded report to the server.
+  Future<({bool sent, String message})> sendDiagnostics() async {
+    final j = await _call('diagSend');
+    return (sent: j['sent'] == true, message: (j['message'] as String?) ?? '');
+  }
+
+  Future<void> discardDiagnostics() => _call('diagDiscard');
+
+  /// Save the report to a file and offer it to another app (chat, mail),
+  /// for when the server can't be reached; the administrator imports it.
+  Future<void> shareDiagnostics() => _call('diagShare');
 
   /// Ask Android to uninstall the old app (the user confirms).
   Future<void> uninstallLegacy() => _call('uninstallLegacy');

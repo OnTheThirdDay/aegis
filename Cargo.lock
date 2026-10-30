@@ -209,6 +209,7 @@ dependencies = [
  "aegis-config",
  "aegis-join",
  "aegis-node",
+ "aegis-telemetry",
  "aegis-tun",
  "jni 0.21.1",
  "libc",

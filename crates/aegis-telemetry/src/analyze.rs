@@ -142,6 +142,57 @@ fn analyze_device(c: &Side, gw: Option<&Side>, out: &mut Vec<Finding>) {
         .unwrap_or_default();
     let gw_sessions = gw.map(|g| g.count("session.opened")).unwrap_or(0);
 
+    // The phone app's own check of the gateway's address: the name lookup,
+    // then a plain TCP connection to the port.
+    let dns_failed = c.matching("client.reach.dns", "result", "failed");
+    let tcp_failed = c.matching("client.reach.tcp", "result", "failed");
+    if let Some(r) = dns_failed.first() {
+        let host = r.attr("host").unwrap_or("the server");
+        out.push(finding(
+            Severity::Error,
+            "gateway_name_not_resolved",
+            format!("{who} can't look up the gateway's address"),
+            with_error(format!("Looking up {host} failed on the device."), Side::top_error(&dns_failed)),
+            "Check that the server address in the invitation still exists in DNS (with Cloudflare, that its record is still there). If it does, the device's network blocks or filters the lookup: try another network, for example mobile data instead of Wi-Fi.",
+            vec![format!("{}× client.reach.dns result=failed", Side::total(&dns_failed))],
+        ));
+    } else if let Some(r) = tcp_failed.first() {
+        let address = r.attr("address").unwrap_or("the server's address");
+        let resolved = c
+            .matching("client.reach.dns", "result", "ok")
+            .first()
+            .and_then(|d| d.attr("addresses"))
+            .map(|a| format!(" The name resolved to {a}."))
+            .unwrap_or_default();
+        out.push(finding(
+            Severity::Error,
+            "gateway_port_unreachable",
+            format!("{who} can't open a connection to the gateway's address"),
+            with_error(format!("Connecting to {address} failed on the device.{resolved}"), Side::top_error(&tcp_failed)),
+            "Check that the address is your server's (or Cloudflare's, with Cloudflare Tunnel) and that the port is open in the server's or cloud provider's firewall. If the address looks wrong (127.0.0.1, 0.0.0.0, or one that is neither yours nor Cloudflare's), the device's network is altering DNS answers: try another network.",
+            vec![format!("{}× client.reach.tcp result=failed", Side::total(&tcp_failed))],
+        ));
+    }
+
+    // What the phone's VPN layer reported (the system refused the VPN,
+    // the interface closed).
+    let platform: Vec<&Record> = c
+        .records
+        .iter()
+        .copied()
+        .filter(|r| r.code == "client.platform")
+        .collect();
+    if !platform.is_empty() {
+        out.push(finding(
+            Severity::Warn,
+            "device_vpn_problem",
+            format!("{who} reported a problem with its VPN"),
+            with_error(format!("{} problem(s) from the phone's VPN.", Side::total(&platform)), Side::top_error(&platform)),
+            "The phone's system refused or ended the VPN. Check that the app may create a VPN (Android: Settings → Network → VPN; iOS: Settings → VPN), that no other VPN app took over, and that battery saving doesn't stop the app.",
+            vec![format!("{}× client.platform", Side::total(&platform))],
+        ));
+    }
+
     // Connection attempts that failed, by stage.
     let ws = c.matching("client.connect.failed", "stage", "websocket");
     let tls = c.matching("client.connect.failed", "stage", "tls");
@@ -506,6 +557,63 @@ mod tests {
         assert_eq!(a.findings[0].id, "device_cannot_reach_gateway");
         assert!(a.findings[0].title.contains("can't reach"));
         assert!(a.findings[0].detail.contains("connection refused"));
+    }
+
+    #[test]
+    fn the_phones_own_reachability_check_is_explained() {
+        let phone = |records| report(Role::Client, records, &[]);
+        let a = analyze(
+            None,
+            &[phone(vec![rec(
+                "client.reach.dns",
+                &[
+                    ("host", "gw.example.test"),
+                    ("result", "failed"),
+                    ("error", "no such host"),
+                ],
+                1,
+            )])],
+        );
+        assert!(ids(&a).contains(&"gateway_name_not_resolved"));
+        assert!(a.findings.iter().any(|f| f.detail.contains("no such host")));
+        let a = analyze(
+            None,
+            &[phone(vec![
+                rec(
+                    "client.reach.dns",
+                    &[
+                        ("host", "gw.example.test"),
+                        ("result", "ok"),
+                        ("addresses", "127.0.0.1"),
+                    ],
+                    1,
+                ),
+                rec(
+                    "client.reach.tcp",
+                    &[
+                        ("address", "127.0.0.1:443"),
+                        ("result", "failed"),
+                        ("error", "refused"),
+                    ],
+                    1,
+                ),
+            ])],
+        );
+        let f = a
+            .findings
+            .iter()
+            .find(|f| f.id == "gateway_port_unreachable")
+            .expect("finding");
+        assert!(f.detail.contains("resolved to 127.0.0.1"));
+        let a = analyze(
+            None,
+            &[phone(vec![rec(
+                "client.platform",
+                &[("error", "VPN not allowed")],
+                1,
+            )])],
+        );
+        assert!(ids(&a).contains(&"device_vpn_problem"));
     }
 
     #[test]

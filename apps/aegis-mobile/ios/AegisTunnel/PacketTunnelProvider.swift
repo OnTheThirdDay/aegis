@@ -5,8 +5,15 @@ import NetworkExtension
 /// interface from the core's settings and lets the core run the connection
 /// on it (the core finds the interface's descriptor itself). Its own
 /// traffic to the gateway doesn't go through the tunnel. The app talks to
-/// it for status (`handleAppMessage`); servers are shared through the App
-/// Group container.
+/// it for status and diagnostics (`handleAppMessage`); servers are shared
+/// through the App Group container.
+///
+/// Diagnostics record in this process, so they end with it: a connection
+/// that fails ends the tunnel at once. The app can therefore start a
+/// recording with the connection (the `diagMinutes` start option), and
+/// before this process ends the core saves the recording to the shared
+/// container and sends it (`aegis_diag_finish`), so the app can share it
+/// when the gateway was out of reach.
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     static let appGroup = "group.borne.aegis.app"
     private let queue = DispatchQueue(label: "aegis.tunnel")
@@ -28,6 +35,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     static func object(_ text: String) -> [String: Any] {
         (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] ?? [:]
+    }
+
+    /// The phone's model and system version, for diagnostics.
+    static var about: String {
+        var info = utsname()
+        uname(&info)
+        let model = withUnsafeBytes(of: &info.machine) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return "\(model), iOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
+    }
+
+    /// Before this process ends: note why, then save and send a recording.
+    private static func finishDiagnostics(_ why: String?) {
+        if let why { _ = core { aegis_diag_note(why) } }
+        _ = core { aegis_diag_finish(dir) }
     }
 
     static func failure(_ message: String) -> NSError {
@@ -73,14 +96,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        if let minutes = (options?["diagMinutes"] as? NSNumber)?.uint32Value {
+            _ = Self.core { aegis_diag_start(Self.dir, minutes, Self.about) }
+        }
+        let fail = { (message: String) in
+            self.queue.async {
+                Self.finishDiagnostics(message)
+                completionHandler(Self.failure(message))
+            }
+        }
         let cfg = Self.object(Self.core { aegis_vpn_config() })
         guard let settings = Self.settings(cfg) else {
-            completionHandler(Self.failure("The VPN settings are incomplete."))
+            fail("The VPN settings are incomplete.")
             return
         }
         setTunnelNetworkSettings(settings) { error in
             if let error {
-                completionHandler(error)
+                fail("iOS refused the VPN settings: \(error.localizedDescription)")
                 return
             }
             self.queue.async {
@@ -89,7 +121,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.watchCore()
                     completionHandler(nil)
                 } else {
-                    completionHandler(Self.failure(started["error"] as? String ?? "Could not connect."))
+                    fail(started["error"] as? String ?? "Could not connect.")
                 }
             }
         }
@@ -105,6 +137,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard status["state"] as? String == "disconnected" else { return }
             self?.watch?.cancel()
             self?.watch = nil
+            Self.finishDiagnostics(nil)
             self?.cancelTunnelWithError(Self.failure(status["error"] as? String ?? "Disconnected."))
         }
         watch = timer
@@ -116,16 +149,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         watch = nil
         queue.async {
             _ = Self.core { aegis_stop() }
+            Self.finishDiagnostics(reason == .userInitiated ? nil : "iOS stopped the VPN (reason \(reason.rawValue))")
             completionHandler()
         }
     }
 
-    /// The app asks for "status": the core's state and counters.
+    /// The app asks for "status" (the core's state and counters) and runs
+    /// diagnostics here: "diag-status", "diag-start:<minutes>",
+    /// "diag-stop:<1 to send>", "diag-send", "diag-save", "diag-discard".
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        guard String(data: messageData, encoding: .utf8) == "status" else {
+        let parts = (String(data: messageData, encoding: .utf8) ?? "")
+            .split(separator: ":", maxSplits: 1).map(String.init)
+        let name = parts.first ?? ""
+        let value = parts.count > 1 ? parts[1] : ""
+        let dir = Self.dir
+        let call: (() -> String)?
+        switch name {
+        case "status": call = { Self.core { aegis_status() } }
+        case "diag-status": call = { Self.core { aegis_diag_status(dir) } }
+        case "diag-start":
+            let minutes = UInt32(value) ?? 15
+            call = { Self.core { aegis_diag_start(dir, minutes, Self.about) } }
+        case "diag-stop":
+            let send: Int32 = value == "1" ? 1 : 0
+            call = { Self.core { aegis_diag_stop(dir, send) } }
+        case "diag-send": call = { Self.core { aegis_diag_send(dir) } }
+        case "diag-save": call = { Self.core { aegis_diag_save(dir) } }
+        case "diag-discard": call = { Self.core { aegis_diag_discard(dir) } }
+        default: call = nil
+        }
+        guard let call else {
             completionHandler?(nil)
             return
         }
-        completionHandler?(Data(Self.core { aegis_status() }.utf8))
+        // Sending blocks on the network: off the caller's thread.
+        DispatchQueue.global(qos: .userInitiated).async {
+            completionHandler?(Data(call().utf8))
+        }
     }
 }

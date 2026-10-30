@@ -3,7 +3,7 @@
 //! crate function.
 
 use jni::objects::{JClass, JString};
-use jni::sys::{jint, jstring};
+use jni::sys::{jboolean, jint, jstring};
 use jni::JNIEnv;
 use serde_json::Value;
 
@@ -133,5 +133,92 @@ pub extern "system" fn Java_borne_aegis_app_Native_downloadUpdate(
 ) -> jstring {
     let (dir, into) = (arg(&mut env, &dir), arg(&mut env, &into));
     let v = crate::download_update(&dir, &into);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_diagStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+    minutes: jint,
+    about: JString,
+) -> jstring {
+    let (dir, about) = (arg(&mut env, &dir), arg(&mut env, &about));
+    let v = crate::diag::start(&dir, u64::try_from(minutes).unwrap_or(0), &about);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_diagStop(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+    send: jboolean,
+) -> jstring {
+    let dir = arg(&mut env, &dir);
+    let v = crate::diag::stop(&dir, send != 0);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_diagSend(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+) -> jstring {
+    let dir = arg(&mut env, &dir);
+    let v = crate::diag::send_now(&dir);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_diagSave(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+) -> jstring {
+    let dir = arg(&mut env, &dir);
+    let v = crate::diag::save(&dir);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_diagDiscard(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+) -> jstring {
+    let dir = arg(&mut env, &dir);
+    let v = crate::diag::discard(&dir);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_diagNote(
+    mut env: JNIEnv,
+    _class: JClass,
+    text: JString,
+) -> jstring {
+    let text = arg(&mut env, &text);
+    let v = crate::diag::note(&text);
+    ret(&mut env, v)
+}
+
+#[no_mangle]
+#[allow(unsafe_code)]
+pub extern "system" fn Java_borne_aegis_app_Native_diagStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+    dir: JString,
+) -> jstring {
+    let dir = arg(&mut env, &dir);
+    let v = crate::diag::status(&dir);
     ret(&mut env, v)
 }

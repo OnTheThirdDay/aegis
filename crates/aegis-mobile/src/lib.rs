@@ -12,6 +12,9 @@
 //! Every function returns a JSON object with `"ok": true` and its fields, or
 //! `"ok": false` and an `"error"` message for the user.
 //!
+//! On-demand diagnostics (`diag`) record what the connection does while the
+//! user reproduces a problem, for the administrator.
+//!
 //! Unsafe code is denied, not forbidden (ADR-0011): only the platform
 //! boundary allows it, item by item (`fd`, `android`).
 #![deny(unsafe_code)]
@@ -25,8 +28,11 @@ mod android;
 #[cfg(any(target_vendor = "apple", test))]
 pub mod ffi;
 
+pub mod diag;
+
 use aegis_join::update::Update;
 use aegis_join::{DeviceDir, JoinError, Ports, Servers};
+use aegis_telemetry::{DiagnosticSink, Severity};
 use aegis_tun::{dns, packet, routes};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -45,6 +51,9 @@ const TICK: Duration = Duration::from_secs(2);
 const PROBE_EVERY: u32 = 15;
 /// How long an answer to "is there a newer app?" is reused.
 const UPDATE_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// While recording diagnostics, the VPN's counters are noted every this
+/// many status refreshes (a minute).
+const STATS_EVERY: u32 = 30;
 
 /// What the app shows.
 #[derive(Clone, Default)]
@@ -95,6 +104,7 @@ struct Client {
     offer: Mutex<Option<(Instant, Option<Update>)>>,
     /// An update download in progress: bytes done and total.
     progress: Arc<Mutex<Option<(u64, u64)>>>,
+    diag: diag::Diag,
 }
 
 fn client() -> Result<&'static Client, String> {
@@ -114,6 +124,7 @@ fn client() -> Result<&'static Client, String> {
                 running: Mutex::default(),
                 offer: Mutex::default(),
                 progress: Arc::default(),
+                diag: diag::Diag::default(),
             })
         })
         .as_ref()
@@ -301,6 +312,7 @@ where
         device,
         Arc::clone(&c.snapshot),
         stats,
+        Arc::clone(&c.diag.sink),
         stop_rx,
     ));
     *lock(&c.running) = Some(Running {
@@ -449,6 +461,7 @@ async fn session<D>(
     device: D,
     snapshot: Arc<Mutex<Snapshot>>,
     stats: Arc<packet::Stats>,
+    diag: Arc<DiagnosticSink>,
     mut stop: watch::Receiver<bool>,
 ) where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -459,7 +472,13 @@ async fn session<D>(
             s.error = Some(e);
         })
     };
+    diag.note(Severity::Info, "client.connect", &[]);
     if let Err(e) = aegis_join::renew_if_due(&dir, false).await {
+        diag.note(
+            Severity::Warn,
+            "client.renew.failed",
+            &[("error", &e.to_string())],
+        );
         let expired = dir
             .certificate_expires_at()
             .is_ok_and(|exp| exp <= now() as i64);
@@ -469,9 +488,13 @@ async fn session<D>(
             ));
         }
     }
-    let node = match start_node(&dir, &snapshot).await {
+    let node = match start_node(&dir, &snapshot, &diag).await {
         Ok(n) => n,
-        Err(e) => return fail_with(e),
+        Err(e) => {
+            diag.note(Severity::Error, "client.start.failed", &[("error", &e)]);
+            diag::reach(&dir, &diag).await;
+            return fail_with(e);
+        }
     };
     let Some(socks) = node.bound_addr("socks") else {
         node.shutdown(Duration::from_secs(1)).await;
@@ -481,18 +504,26 @@ async fn session<D>(
         device,
         socks,
         dns::FakeDns::default(),
-        stats,
+        Arc::clone(&stats),
         stop.clone(),
     ));
     let mut tick = tokio::time::interval(TICK);
     let mut ticks = 0u32;
     let mut renewal_checked = Instant::now();
+    // The last health check's outcome: a failure after a pass (or the
+    // first one) checks the gateway's address too.
+    let mut last_check = None;
     loop {
         tokio::select! {
             _ = tick.tick() => {}
             _ = stop.wait_for(|s| *s) => break,
         }
         if packets.is_finished() {
+            diag.note(
+                Severity::Warn,
+                "client.platform",
+                &[("error", "the VPN interface closed")],
+            );
             update(&snapshot, |s| {
                 s.error = Some("The VPN interface closed.".into())
             });
@@ -508,6 +539,36 @@ async fn session<D>(
         } else {
             None
         };
+        match verified {
+            Some(true) => diag.count("client.check.ok"),
+            Some(false) => {
+                diag.note(Severity::Warn, "client.check.failed", &[]);
+                if last_check != Some(false) {
+                    diag::reach(&dir, &diag).await;
+                }
+            }
+            None => {}
+        }
+        if verified.is_some() {
+            last_check = verified;
+        }
+        if ticks.is_multiple_of(STATS_EVERY) && diag.is_recording() {
+            let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed).to_string();
+            diag.note(
+                Severity::Info,
+                "client.vpn.stats",
+                &[
+                    ("tcp_open", &n(&stats.tcp_open)),
+                    ("tcp_total", &n(&stats.tcp_total)),
+                    ("tcp_failed", &n(&stats.tcp_failed)),
+                    ("udp_total", &n(&stats.udp_total)),
+                    ("udp_failed", &n(&stats.udp_failed)),
+                    ("dns_queries", &n(&stats.dns_queries)),
+                    ("dropped", &n(&stats.dropped)),
+                    ("transport", transport.unwrap_or("none")),
+                ],
+            );
+        }
         update(&snapshot, |s| {
             s.bytes_up = m.transport_bytes_up;
             s.bytes_down = m.transport_bytes_down;
@@ -530,11 +591,20 @@ async fn session<D>(
         });
         if renewal_checked.elapsed() >= RENEWAL_CHECK {
             renewal_checked = Instant::now();
-            if let Ok(true) = aegis_join::renew_if_due(&dir, false).await {
-                let _ = node.ctx.reload_certificates();
+            match aegis_join::renew_if_due(&dir, false).await {
+                Ok(true) => {
+                    let _ = node.ctx.reload_certificates();
+                }
+                Ok(false) => {}
+                Err(e) => diag.note(
+                    Severity::Warn,
+                    "client.renew.failed",
+                    &[("error", &e.to_string())],
+                ),
             }
         }
     }
+    diag.note(Severity::Info, "client.disconnect", &[]);
     packets.abort();
     node.shutdown(Duration::from_secs(1)).await;
     update(&snapshot, |s| {
@@ -562,6 +632,7 @@ fn within_memory_limit(core: &mut aegis_config::CoreConfig, small: bool) {
 async fn start_node(
     dir: &DeviceDir,
     snapshot: &Mutex<Snapshot>,
+    diag: &Arc<DiagnosticSink>,
 ) -> Result<aegis_node::NodeRuntime, String> {
     let ports = Ports { socks: 0, http: 0 };
     let start = |mut cfg: aegis_config::NodeConfig| async {
@@ -569,14 +640,33 @@ async fn start_node(
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(dir.root.join(format!("state.db{suffix}")));
         }
-        aegis_node::start(aegis_node::StartOptions {
-            config: cfg,
-            store_path: dir.store(),
-            failpoints: None,
-        })
+        aegis_node::start_with_diagnostics(
+            aegis_node::StartOptions {
+                config: cfg,
+                store_path: dir.store(),
+                failpoints: None,
+            },
+            Arc::clone(diag),
+        )
         .await
     };
-    if let Ok(Some(endpoint)) = aegis_join::fetch_endpoint(dir).await {
+    let endpoint = match aegis_join::fetch_endpoint(dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            diag.note(
+                Severity::Info,
+                "client.endpoint.unchecked",
+                &[("error", &e.to_string())],
+            );
+            None
+        }
+    };
+    if let Some(endpoint) = endpoint {
+        diag.note(
+            Severity::Info,
+            "client.endpoint.changed",
+            &[("url", &endpoint.url)],
+        );
         if let Ok(cfg) = aegis_join::client_config_for(dir, ports, Some(&endpoint)) {
             if let Ok(trial) = start(cfg).await {
                 let verified = match trial.bound_addr("socks") {
@@ -594,6 +684,11 @@ async fn start_node(
                         return Ok(trial);
                     }
                 }
+                diag.note(
+                    Severity::Warn,
+                    "client.endpoint.rejected",
+                    &[("url", &endpoint.url)],
+                );
                 trial.shutdown(Duration::from_secs(1)).await;
             }
         }
