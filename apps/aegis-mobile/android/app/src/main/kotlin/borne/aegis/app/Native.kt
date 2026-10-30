@@ -32,4 +32,19 @@ object Native {
     external fun checkUpdate(dir: String): String
     /** Download the offered update into [into]; `{"path"}`. Blocks. */
     external fun downloadUpdate(dir: String, into: String): String
+
+    // On-demand diagnostics (crates/aegis-mobile/src/diag.rs).
+    /** Record for 1-60 minutes; [about] describes the phone. */
+    external fun diagStart(dir: String, minutes: Int, about: String): String
+    /** Stop; with [send], send the report (blocks). */
+    external fun diagStop(dir: String, send: Boolean): String
+    /** `{"sent", "message"}`. Blocks. */
+    external fun diagSend(dir: String): String
+    /** Save the report to share; `{"path"}`. */
+    external fun diagSave(dir: String): String
+    external fun diagDiscard(dir: String): String
+    /** Record a problem seen here (no-op unless recording). */
+    external fun diagNote(text: String): String
+    /** `{state, remaining_seconds, events, sending, result}` */
+    external fun diagStatus(dir: String): String
 }

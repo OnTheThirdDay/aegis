@@ -58,6 +58,7 @@ class AegisVpnService : VpnService() {
                 e.message ?: e.toString()
             }
             if (error != null) {
+                Native.diagNote(error)
                 lastError = error
                 main.post { finish() }
             } else {
@@ -125,6 +126,7 @@ class AegisVpnService : VpnService() {
 
     override fun onRevoke() {
         // Another VPN took over, or the user revoked it in system settings.
+        Native.diagNote("Android ended the VPN: another VPN took over, or it was turned off in settings")
         disconnect()
     }
 
