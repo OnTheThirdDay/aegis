@@ -6,7 +6,7 @@ Status: accepted (owner direction, 2026-10-30). In progress: it builds in CI; it
 
 ADR-0011 planned iOS on the same Flutter UI and Rust core as Android. On iOS a VPN must run in a separate process, a Network Extension packet tunnel. The app and the extension share files only through an App Group container.
 
-The owner has a paid Apple developer account (individual) and no Mac. Distribution to friends will be Ad Hoc (ADR-0017).
+The owner has a paid Apple developer account (individual) and no Mac. Distribution to friends is Ad Hoc ([ADR-0019](0019-iphone-app-distribution.md)).
 
 ## Decision
 

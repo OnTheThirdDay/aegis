@@ -73,6 +73,7 @@ details summary { cursor: pointer; color: var(--muted); }
 .small { font-size: 0.85rem; }
 .warn-text { color: var(--warn); }
 .err-text { color: var(--bad); }
+.ok-text { color: var(--ok); }
 
 .field { margin: 10px 0; }
 label { display: block; margin: 0 0 4px; font-weight: 600; font-size: 0.92rem; }
@@ -91,6 +92,9 @@ button.danger { background: var(--bad); border-color: var(--bad); }
 button.small { padding: 5px 10px; font-size: 0.85rem; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.busy { opacity: 0.7; cursor: progress; }
+/* Links iOS must follow (profiles, app installs), styled as buttons. */
+a.button { display: inline-block; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent); color: #fff; font-weight: 600; text-decoration: none; }
+a.button.ghost { background: transparent; color: var(--accent); }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
 .row.spread { justify-content: space-between; }
 

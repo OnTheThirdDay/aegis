@@ -8,7 +8,8 @@ Environment: APPLE_API_KEY_ID, APPLE_API_ISSUER_ID, APPLE_API_KEY_P8 (the key's
 contents). The profiles use the account's newest Apple Distribution
 certificate (the one CI signs with, RELEASING.md).
 
-    ios-profiles.py install        # recreate and install both profiles
+    ios-profiles.py install [DIR]  # recreate both profiles; install them
+                                   # for Xcode, or write DIR/<bundle id>.mobileprovision
     ios-profiles.py add-device NAME UDID
 """
 import base64
@@ -68,7 +69,7 @@ def need(status, out, ok=(200, 201, 204)):
     return out
 
 
-def install():
+def install(out=None):
     devices = need(*call("GET", "/v1/devices?filter[status]=ENABLED&filter[platform]=IOS&limit=200"))["data"]
     if not devices:
         sys.exit("No iPhone is registered: Ad Hoc builds need at least one (ios-profiles.py add-device).")
@@ -76,7 +77,7 @@ def install():
     if not certs:
         sys.exit("No Apple Distribution certificate on the account.")
     cert = max(certs, key=lambda c: c["attributes"].get("expirationDate") or "")["id"]
-    folder = pathlib.Path.home() / "Library/MobileDevice/Provisioning Profiles"
+    folder = pathlib.Path(out) if out else pathlib.Path.home() / "Library/MobileDevice/Provisioning Profiles"
     folder.mkdir(parents=True, exist_ok=True)
     for identifier, name in PROFILES.items():
         bundle = need(*call("GET", f"/v1/bundleIds?filter[identifier]={identifier}"))["data"]
@@ -100,11 +101,33 @@ def install():
         }
         made = need(*call("POST", "/v1/profiles", body))["data"]
         content = base64.b64decode(made["attributes"]["profileContent"])
-        (folder / f"{made['attributes']['uuid']}.mobileprovision").write_bytes(content)
+        file = f"{identifier}.mobileprovision" if out else f"{made['attributes']['uuid']}.mobileprovision"
+        (folder / file).write_bytes(content)
         print(f"{name}: {len(devices)} device(s)")
 
 
+def valid_udid(udid: str) -> bool:
+    """40 hex digits (older iPhones) or XXXXXXXX-XXXXXXXXXXXXXXXX."""
+    hexdigits = set("0123456789abcdefABCDEF")
+    if "-" in udid:
+        a, _, b = udid.partition("-")
+        return len(a) == 8 and len(b) == 16 and set(a + b) <= hexdigits
+    return len(udid) == 40 and set(udid) <= hexdigits
+
+
 def add_device(name: str, udid: str):
+    if not valid_udid(udid):
+        sys.exit(f"not an iPhone UDID: {udid!r}")
+    name = "".join(c for c in name if c.isprintable())[:50] or "iPhone"
+    found = need(*call("GET", f"/v1/devices?filter[udid]={udid}&limit=1"))["data"]
+    if found:
+        device = found[0]
+        if device["attributes"].get("status") != "ENABLED":
+            need(*call("PATCH", f"/v1/devices/{device['id']}", {
+                "data": {"type": "devices", "id": device["id"], "attributes": {"status": "ENABLED"}}
+            }))
+        print("already registered", device["attributes"]["name"])
+        return
     out = need(*call("POST", "/v1/devices", {
         "data": {"type": "devices", "attributes": {"name": name, "udid": udid, "platform": "IOS"}}
     }))
@@ -112,8 +135,8 @@ def add_device(name: str, udid: str):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["install"]:
-        install()
+    if sys.argv[1:2] == ["install"] and len(sys.argv) <= 3:
+        install(sys.argv[2] if len(sys.argv) == 3 else None)
     elif sys.argv[1:2] == ["add-device"] and len(sys.argv) == 4:
         add_device(sys.argv[2], sys.argv[3])
     else:

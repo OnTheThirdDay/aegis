@@ -54,7 +54,12 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | "/api/v1/auth/2fa"
                 | "/api/v1/devices"
                 | "/api/v1/system/downloads"
+                | "/api/v1/ios"
+                | "/api/v1/ios/register.mobileconfig"
         ) || path.starts_with("/downloads/")
+            // Fetched by iOS itself, with a token in the path.
+            || path.starts_with("/api/v1/ios/manifest/")
+            || path.starts_with("/api/v1/ios/app/")
     } else if *method == Method::POST {
         matches!(
             path,
@@ -66,6 +71,8 @@ fn allowed(method: &Method, path: &str) -> bool {
                 | "/api/v1/auth/2fa/disable"
                 | "/api/v1/devices/invite"
         ) || (path.starts_with("/api/v1/devices/") && path.ends_with("/revoke"))
+            // iOS posts the registration back, with a token in the path.
+            || path.starts_with("/api/v1/ios/udid/")
     } else {
         false
     }

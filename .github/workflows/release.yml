@@ -312,11 +312,14 @@ jobs:
       APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
       APPLE_DIST_P12_B64: ${{ secrets.APPLE_DIST_P12_B64 }}
       APPLE_DIST_P12_PASSWORD: ${{ secrets.APPLE_DIST_P12_PASSWORD }}
+      AEGIS_IOS_APP_KEY: ${{ secrets.AEGIS_IOS_APP_KEY }}
     steps:
       - name: Apple secrets
         id: apple
         run: |
-          if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_DIST_P12_B64" ]; then
+          # The app is only ever published encrypted (its profile lists every
+          # registered iPhone), so the app key is required too.
+          if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_DIST_P12_B64" ] && [ -n "$AEGIS_IOS_APP_KEY" ]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::The Apple secrets are not set: no iOS build (RELEASING.md)"
@@ -370,7 +373,9 @@ jobs:
           flutter build ipa --release --build-name "$VERSION" --build-number "$GITHUB_RUN_NUMBER" \
             --export-options-plist=ios/ExportOptions.plist
           mkdir -p ../../out
-          cp build/ios/ipa/*.ipa ../../out/aegis-client-ios.ipa
+          # Encrypted for the gateways (ADR-0019); the plain app isn't published.
+          "$RUNNER_TEMP/venv/bin/python" ../../.github/scripts/ios-ipa-crypt.py encrypt \
+            build/ios/ipa/*.ipa ../../out/aegis-client-ios.ipa.enc
       - name: Remove the keychain
         if: always() && steps.apple.outputs.ready
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
