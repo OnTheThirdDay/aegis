@@ -12,6 +12,11 @@
 //!   approves the request here, which starts the repository's `ios-device`
 //!   workflow (repository dispatch). Neither the Apple key nor the signing
 //!   certificate is on the gateway.
+//! - A gateway that can't reach GitHub (its downloads are blocked in places)
+//!   can reach it through another gateway: it joins that gateway as a device,
+//!   with an invitation from it, and its GitHub requests go through a client
+//!   of its own (a local HTTP proxy into the tunnel). Nothing else of its
+//!   traffic changes.
 
 use crate::services::Appliance;
 use aegis_storage::now_unix;
@@ -48,10 +53,6 @@ fn err(status: u16, code: impl Into<String>) -> (u16, String) {
 struct Settings {
     /// `owner/name` of the repository whose releases carry the app.
     repository: Option<String>,
-    /// An HTTP proxy for GitHub (`http://host:port`), for a gateway that
-    /// can't reach it directly (GitHub's downloads are blocked in places).
-    #[serde(default)]
-    proxy: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -87,20 +88,15 @@ pub struct IosIntegration {
     last_error: Mutex<Option<String>>,
     /// A fetch runs in the background; one at a time.
     fetching: AtomicBool,
+    /// The client into the other gateway GitHub is reached through, while
+    /// it runs.
+    upstream: tokio::sync::Mutex<Option<aegis_node::NodeRuntime>>,
 }
 
-/// An `http://host:port` proxy (no path, no credentials in the clear).
-fn valid_proxy(p: &str) -> bool {
-    let Some(rest) = p.strip_prefix("http://") else {
-        return false;
-    };
-    let rest = rest.trim_end_matches('/');
-    !rest.is_empty()
-        && rest.len() <= 255
-        && !rest.contains(['/', '@', '?', '#', ' '])
-        && rest
-            .rsplit_once(':')
-            .is_some_and(|(h, port)| !h.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
+/// `host[:port]` of a URL.
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?']).next().unwrap_or(rest).to_owned()
 }
 
 /// An iPhone UDID: 40 hex digits (older models) or `XXXXXXXX-XXXXXXXXXXXXXXXX`.
@@ -151,6 +147,7 @@ impl IosIntegration {
             files: Mutex::new(()),
             last_error: Mutex::new(None),
             fetching: AtomicBool::new(false),
+            upstream: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -214,7 +211,11 @@ impl IosIntegration {
             "state": if !configured { "off" } else if error.is_some() { "error" } else if app_ready { "active" } else { "pending" },
             "fetching": self.fetching.load(Ordering::Relaxed),
             "repository": settings.repository,
-            "proxy": settings.proxy,
+            "via": self.upstream_dir().load().ok().map(|d| json!({
+                "server": host_of(&d.url),
+                "name": d.name,
+                "certificate_expires_at": self.upstream_dir().certificate_expires_at().ok(),
+            })),
             "has_token": self.secret(TOKEN).is_some(),
             "has_key": self.secret(KEY).is_some(),
             "app": if app_ready { serde_json::to_value(&fetched).unwrap_or(Value::Null) } else { Value::Null },
@@ -223,11 +224,11 @@ impl IosIntegration {
         })
     }
 
-    /// `{repository?, proxy?, token?, key?}`: the repository whose releases
-    /// carry the app, an HTTP proxy for GitHub ("" for none), a GitHub token
-    /// that can read its releases and start its workflows, and the app's
-    /// decryption key (base64, 32 bytes). Then fetches the app in the
-    /// background.
+    /// `{repository?, via?, token?, key?}`: the repository whose releases
+    /// carry the app; `via`, an invitation from another gateway to reach
+    /// GitHub through ("" to stop); a GitHub token that can read its
+    /// releases and start its workflows; and the app's decryption key
+    /// (base64, 32 bytes). Then fetches the app in the background.
     pub async fn configure(
         self: &Arc<Self>,
         actor: &str,
@@ -247,14 +248,10 @@ impl IosIntegration {
                 }
                 settings.repository = Some(r.to_owned());
             }
-            if let Some(p) = body.get("proxy").and_then(Value::as_str) {
-                let p = p.trim();
-                if !p.is_empty() && !valid_proxy(p) {
-                    return Err(err(400, "the proxy must look like http://host:port"));
-                }
-                settings.proxy = (!p.is_empty()).then(|| p.trim_end_matches('/').to_owned());
-            }
             self.save("settings.json", &settings)?;
+        }
+        if let Some(code) = body.get("via").and_then(Value::as_str) {
+            self.set_via(code.trim()).await?;
         }
         if let Some(t) = body.get("token").and_then(Value::as_str).map(str::trim) {
             if t.is_empty() || t.len() > 512 || !t.bytes().all(|b| b.is_ascii_graphic()) {
@@ -291,16 +288,82 @@ impl IosIntegration {
         true
     }
 
-    /// For GitHub: through the configured proxy, if any.
-    fn client(&self) -> Result<reqwest::Client, (u16, String)> {
-        let settings: Settings = self.load("settings.json");
+    fn upstream_dir(&self) -> aegis_join::DeviceDir {
+        aegis_join::DeviceDir::new(self.dir.join("upstream"))
+    }
+
+    /// Join another gateway (an invitation from it) to reach GitHub through,
+    /// replacing any earlier one; "" stops using one.
+    async fn set_via(&self, code: &str) -> Result<(), (u16, String)> {
+        if let Some(node) = self.upstream.lock().await.take() {
+            node.shutdown(Duration::from_secs(1)).await;
+        }
+        let dir = self.dir.join("upstream");
+        let _ = std::fs::remove_dir_all(&dir);
+        if code.is_empty() {
+            return Ok(());
+        }
+        let invite = aegis_join::parse_invite(code).map_err(|e| err(400, e.to_string()))?;
+        // Under the gateway's 30-second idle limit for the console.
+        tokio::time::timeout(
+            API_TIMEOUT,
+            aegis_join::enroll(&invite, &aegis_join::DeviceDir::new(&dir)),
+        )
+        .await
+        .map_err(|_| err(502, "the other gateway didn't answer in time"))?
+        .map_err(|e| err(502, format!("joining the other gateway: {e}")))?;
+        Ok(())
+    }
+
+    /// The local HTTP proxy into the other gateway, when one is set
+    /// (starting its client the first time).
+    async fn via(&self) -> Result<Option<String>, (u16, String)> {
+        let dir = self.upstream_dir();
+        if dir.load().is_err() {
+            return Ok(None);
+        }
+        let mut node = self.upstream.lock().await;
+        if node.is_none() {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(dir.root.join(format!("state.db{suffix}")));
+            }
+            let config = aegis_join::client_config(&dir, aegis_join::Ports { socks: 0, http: 0 })
+                .map_err(|e| err(409, format!("the other gateway: {e}")))?;
+            let started = aegis_node::start(aegis_node::StartOptions {
+                config,
+                store_path: dir.store(),
+                failpoints: None,
+            })
+            .await
+            .map_err(|e| err(502, format!("the other gateway: {e}")))?;
+            *node = Some(started);
+        }
+        let addr = node
+            .as_ref()
+            .and_then(|n| n.bound_addr("http"))
+            .ok_or_else(|| err(500, "the client into the other gateway has no proxy"))?;
+        Ok(Some(format!("http://{addr}")))
+    }
+
+    /// Keep the device identity at the other gateway renewed.
+    async fn renew_via(&self) {
+        let dir = self.upstream_dir();
+        if dir.load().is_ok() && matches!(aegis_join::renew_if_due(&dir, false).await, Ok(true)) {
+            if let Some(node) = self.upstream.lock().await.as_ref() {
+                let _ = node.ctx.reload_certificates();
+            }
+        }
+    }
+
+    /// For GitHub: through the other gateway, when one is set.
+    async fn client(&self) -> Result<reqwest::Client, (u16, String)> {
         let mut builder = reqwest::Client::builder()
             .user_agent(concat!("aegisborne/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600));
-        if let Some(p) = settings.proxy {
-            builder = builder
-                .proxy(reqwest::Proxy::all(&p).map_err(|e| err(400, format!("proxy {p}: {e}")))?);
+        if let Some(proxy) = self.via().await? {
+            builder =
+                builder.proxy(reqwest::Proxy::all(&proxy).map_err(|e| err(500, e.to_string()))?);
         }
         builder
             .build()
@@ -321,6 +384,7 @@ impl IosIntegration {
     /// Fetch the latest release's app when it changed (new release, or
     /// re-signed for a new iPhone). Quiet when not configured.
     pub async fn poll(self: &Arc<Self>) {
+        self.renew_via().await;
         if self.github().is_ok() && self.secret(KEY).is_some() {
             self.start_fetch();
         }
@@ -347,7 +411,7 @@ impl IosIntegration {
         let key = base64::engine::general_purpose::STANDARD
             .decode(key)
             .map_err(|_| err(409, "the stored app key is not base64"))?;
-        let client = self.client()?;
+        let client = self.client().await?;
         let body = client
             .get(format!(
                 "https://api.github.com/repos/{repo}/releases/latest"
@@ -515,7 +579,8 @@ impl IosIntegration {
             .ok_or_else(|| err(404, "no such request"))?;
         let (repo, token) = self.github()?;
         let response = self
-            .client()?
+            .client()
+            .await?
             .post(format!("https://api.github.com/repos/{repo}/dispatches"))
             .timeout(API_TIMEOUT)
             .bearer_auth(&token)
@@ -530,7 +595,7 @@ impl IosIntegration {
             )
             .send()
             .await
-            .map_err(|e| err(502, format!("Could not reach GitHub ({e}). If this server can't reach it directly, set a proxy.")))?;
+            .map_err(|e| err(502, format!("Could not reach GitHub ({e}). If this server can't reach it directly, reach it through another gateway.")))?;
         let ok = response.status().is_success();
         let message = if ok {
             "Sent to GitHub: the iPhone is registered and the app re-signed within a few minutes."
@@ -577,17 +642,6 @@ impl IosIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn proxies() {
-        assert!(valid_proxy("http://127.0.0.1:10809"));
-        assert!(valid_proxy("http://proxy.lan:8080/"));
-        assert!(!valid_proxy("https://proxy:8080"));
-        assert!(!valid_proxy("http://user:pass@proxy:8080"));
-        assert!(!valid_proxy("http://proxy"));
-        assert!(!valid_proxy("http://proxy:0"));
-        assert!(!valid_proxy("socks5://proxy:1080"));
-    }
 
     #[test]
     fn udids_and_repositories() {

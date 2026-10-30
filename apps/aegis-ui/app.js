@@ -666,18 +666,25 @@ async function iphoneCard() {
 /** The console's side: GitHub settings and iPhones waiting for approval. */
 function iosCard(/** @type {any} */ i) {
   const repo = /** @type {HTMLInputElement} */ (el("input", { value: i.repository || "", placeholder: "owner/name", autocomplete: "off" }));
-  const proxy = /** @type {HTMLInputElement} */ (el("input", { value: i.proxy || "", placeholder: "http://host:port (optional)", autocomplete: "off" }));
+  const via = /** @type {HTMLTextAreaElement} */ (el("textarea", { class: "code", rows: "2", placeholder: "aegis1:… (optional)", autocomplete: "off" }));
   const token = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_token ? "saved — leave empty to keep it" : "GitHub token" }));
   const key = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_key ? "saved — leave empty to keep it" : "base64 (the AEGIS_IOS_APP_KEY secret)" }));
   const save = button("Save");
   busy(save, async () => {
     /** @type {Record<string, string>} */
-    const body = { repository: repo.value.trim(), proxy: proxy.value.trim() };
+    const body = { repository: repo.value.trim() };
+    if (via.value.trim()) body.via = via.value.trim();
     if (token.value.trim()) body.token = token.value.trim();
     if (key.value.trim()) body.key = key.value.trim();
     await api("POST", "/integrations/ios/configure", { body });
     notice("Saved. Fetching the app from GitHub in the background; this page shows the result.");
     setTimeout(() => view("integrations"), 4000);
+  });
+  const stopVia = button("Stop using it", "ghost small");
+  busy(stopVia, async () => {
+    if (!confirm("Reach GitHub directly again? Remove this server's device on the other gateway too.")) return;
+    await api("POST", "/integrations/ios/configure", { body: { via: "" } });
+    view("integrations");
   });
   const check = button("Check GitHub now", "ghost");
   busy(check, async () => {
@@ -715,10 +722,13 @@ function iosCard(/** @type {any} */ i) {
     i.error ? el("p", { class: "err-text" }, [i.error]) : null,
     el("div", { class: "cols" }, [
       field("GitHub repository", repo, "Whose releases carry the app."),
-      field("Proxy for GitHub", proxy, "Only if this server can't reach GitHub directly (GitHub's downloads are blocked in some countries): an HTTP proxy that can, e.g. http://127.0.0.1:10809. Leave empty otherwise."),
+
       field("GitHub token", token, "Fine-grained, this repository only: Contents read and write (reads releases, starts the iPhone workflow)."),
       field("App key", key, "Decrypts the app: the repository's AEGIS_IOS_APP_KEY."),
     ]),
+    i.via
+      ? el("p", {}, ["GitHub is reached through " + i.via.server + " (as device " + i.via.name + "). ", stopVia])
+      : field("Reach GitHub through another gateway", via, "Only if this server can't reach GitHub (its downloads are blocked in some countries). On a gateway that can, create an invitation for a device (e.g. this-gateway-name) and paste it here: this server joins it as a device and sends only its GitHub requests through it."),
     el("div", { class: "row" }, [save, check]),
     el("h3", {}, ["iPhones"]),
     rows.length
