@@ -1729,3 +1729,189 @@ async fn udp_waiting_for_its_flows_stays_within_the_buffer_budget() {
     assert!(peak <= limit, "used {peak} of {limit}");
     client.shutdown(Duration::from_secs(1)).await;
 }
+
+/// A server that sends `size` bytes to every connection, then closes.
+async fn download_server(ip: IpAddr, size: usize) -> SocketAddr {
+    let l = TcpListener::bind(SocketAddr::new(ip, 0))
+        .await
+        .expect("bind download");
+    let addr = l.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = l.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let chunk = vec![7u8; 64 * 1024];
+                let mut left = size;
+                while left > 0 {
+                    let n = left.min(chunk.len());
+                    if s.write_all(&chunk[..n]).await.is_err() {
+                        return;
+                    }
+                    left -= n;
+                }
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// `count` connections that start downloading and stop reading (a browser's
+/// slow or abandoned page loads), then a fresh connection that must still
+/// work within `deadline`. `core` overrides the client's buffer settings.
+async fn stalled_downloads_leave_room(
+    core: &str,
+    count: usize,
+    deadline: Duration,
+) -> Result<(), String> {
+    let Some(ip) = lan_ip() else {
+        return Ok(());
+    };
+    let echo = echo_server(ip).await;
+    let download = download_server(ip, 4 * 1024 * 1024).await;
+    let dir = tempfile::tempdir().expect("tmp");
+    let secrets = dir.path().join("secrets");
+    let _pki = provision(&secrets);
+    let gw_cfg = parse_toml(&gateway_toml(dir.path(), &format!("{ip}/32"))).expect("gw cfg");
+    let gw = start(StartOptions {
+        config: gw_cfg,
+        store_path: dir.path().join("gw.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("gateway start");
+    let gw_addr = gw.bound_addr("ingress-ws").expect("ws addr");
+    let toml = format!(
+        "{}\n[core]\n{core}\n",
+        client_toml(dir.path(), &secrets, gw_addr)
+    );
+    let client = start(StartOptions {
+        config: parse_toml(&toml).expect("client cfg"),
+        store_path: dir.path().join("client.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("client start");
+    let proxy = client.bound_addr("socks").expect("socks");
+    let mut held = Vec::new();
+    for _ in 0..count {
+        let (mut s, code) = socks_connect(proxy, &download.to_string(), None).await;
+        if code != 0 {
+            return Err(format!("download {} refused: {code}", held.len()));
+        }
+        // Read a little, then stop reading.
+        let mut first = [0u8; 4096];
+        let _ = s.read(&mut first).await;
+        held.push(s);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let used = client.ctx.budget.used();
+    let probe = async {
+        let (s, code) = socks_connect(proxy, &echo.to_string(), None).await;
+        if code != 0 {
+            return Err(format!("probe refused: {code}"));
+        }
+        echo_roundtrip(s, 1024).await;
+        Ok(())
+    };
+    let result = match tokio::time::timeout(deadline, probe).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("a new connection stalled (budget used {used})")),
+    };
+    drop(held);
+    client.shutdown(Duration::from_secs(1)).await;
+    gw.shutdown(Duration::from_secs(1)).await;
+    result
+}
+
+/// As the iPhone build runs (crates/aegis-mobile, within_memory_limit).
+const IPHONE_CORE: &str = "process_buffer_budget_bytes = 25165824\npeer_buffer_budget_bytes = 20971520\nstream_buffer_budget_bytes = 262144\nsession_window_bytes = 8388608";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_downloads_leave_the_tunnel_usable() {
+    // With a 4 MB window the iPhone refused every new connection after 21
+    // stalled ones (1.1.6): its health check failed and pages stopped.
+    let default = stalled_downloads_leave_room("", 24, Duration::from_secs(10)).await;
+    let iphone = stalled_downloads_leave_room(IPHONE_CORE, 24, Duration::from_secs(10)).await;
+    assert!(
+        default.is_ok() && iphone.is_ok(),
+        "default: {default:?}; iphone: {iphone:?}"
+    );
+}
+
+/// Many short-lived downloads, each closed after a little reading (a
+/// browser's churn), then a fresh connection that must still work.
+async fn churned_downloads_leave_room(core: &str, rounds: usize) -> Result<(), String> {
+    let Some(ip) = lan_ip() else {
+        return Ok(());
+    };
+    let echo = echo_server(ip).await;
+    let download = download_server(ip, 4 * 1024 * 1024).await;
+    let dir = tempfile::tempdir().expect("tmp");
+    let secrets = dir.path().join("secrets");
+    let _pki = provision(&secrets);
+    let gw_cfg = parse_toml(&gateway_toml(dir.path(), &format!("{ip}/32"))).expect("gw cfg");
+    let gw = start(StartOptions {
+        config: gw_cfg,
+        store_path: dir.path().join("gw.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("gateway start");
+    let gw_addr = gw.bound_addr("ingress-ws").expect("ws addr");
+    let toml = format!(
+        "{}\n[core]\n{core}\n",
+        client_toml(dir.path(), &secrets, gw_addr)
+    );
+    let client = start(StartOptions {
+        config: parse_toml(&toml).expect("client cfg"),
+        store_path: dir.path().join("client.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("client start");
+    let proxy = client.bound_addr("socks").expect("socks");
+    let mut result = Ok(());
+    'rounds: for round in 0..rounds {
+        let mut batch = Vec::new();
+        for _ in 0..8 {
+            let (s, code) = socks_connect(proxy, &download.to_string(), None).await;
+            if code != 0 {
+                result = Err(format!("round {round}: download refused ({code})"));
+                break 'rounds;
+            }
+            batch.push(s);
+        }
+        for s in &mut batch {
+            let mut buf = vec![0u8; 256 * 1024];
+            let _ = tokio::time::timeout(Duration::from_millis(200), s.read(&mut buf)).await;
+        }
+        drop(batch);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    if result.is_ok() {
+        let probe = async {
+            let (s, code) = socks_connect(proxy, &echo.to_string(), None).await;
+            if code != 0 {
+                return Err(format!("probe refused: {code}"));
+            }
+            echo_roundtrip(s, 1024).await;
+            Ok(())
+        };
+        result = match tokio::time::timeout(Duration::from_secs(10), probe).await {
+            Ok(r) => r,
+            Err(_) => Err("a new connection stalled".into()),
+        };
+    }
+    client.shutdown(Duration::from_secs(1)).await;
+    gw.shutdown(Duration::from_secs(1)).await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_downloads_give_their_windows_back() {
+    let iphone = churned_downloads_leave_room(IPHONE_CORE, 40).await;
+    assert!(iphone.is_ok(), "iphone: {iphone:?}");
+}

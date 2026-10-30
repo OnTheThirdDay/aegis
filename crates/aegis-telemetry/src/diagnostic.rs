@@ -216,7 +216,12 @@ fn describe(event: &Event) -> Option<Described> {
         // High-volume byte accounting is not diagnostic information.
         Event::TransportBytes { .. } => return None,
         Event::SessionOpened => ("session.opened", Severity::Info, vec![], true),
-        Event::SessionClosed => ("session.closed", Severity::Info, vec![], true),
+        Event::SessionClosed { cause } => (
+            "session.closed",
+            Severity::Info,
+            vec![("cause", cause.to_owned())],
+            true,
+        ),
         Event::StreamOpened => ("stream.opened", Severity::Debug, vec![], false),
         Event::StreamClosed { result, reason } => {
             let severity = match result {
@@ -572,7 +577,9 @@ mod tests {
         assert_eq!(st.state, "stopped");
         assert_eq!(st.events, 1);
         assert!(st.discard_unix.is_some());
-        d.record(Event::SessionClosed);
+        d.record(Event::SessionClosed {
+            cause: "keepalive_timeout",
+        });
         assert_eq!(d.recording().expect("recording").records.len(), 1);
     }
 }

@@ -54,7 +54,10 @@ pub enum OperationResult {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
     SessionOpened,
-    SessionClosed,
+    /// `cause`: why it ended (`aegis_session::SessionError::cause`).
+    SessionClosed {
+        cause: &'static str,
+    },
     StreamOpened,
     StreamClosed {
         result: OperationResult,

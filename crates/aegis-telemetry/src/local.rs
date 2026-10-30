@@ -256,7 +256,7 @@ impl Observability for LocalMetrics {
             Event::SessionOpened => {
                 self.sessions_opened.fetch_add(1, Ordering::Relaxed);
             }
-            Event::SessionClosed => {
+            Event::SessionClosed { .. } => {
                 self.sessions_closed.fetch_add(1, Ordering::Relaxed);
             }
             Event::StreamOpened => {

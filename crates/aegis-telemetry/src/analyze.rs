@@ -97,6 +97,29 @@ fn finding(
     }
 }
 
+/// A `gateway.tls.rejected` that refused a certificate, not a handshake
+/// that never finished (timed out, cut off: a slow or disrupted path).
+fn refused_certificate(r: &Record) -> bool {
+    let e = r.attr("error").unwrap_or("").to_ascii_lowercase();
+    !(e.contains("timed out") || e.contains("reset") || e.contains("eof") || e.contains("closed"))
+}
+
+/// Why sessions ended, most frequent first: `keepalive_timeout ×3, …`.
+fn session_causes(side: &Side) -> Option<String> {
+    let mut by: BTreeMap<&str, u64> = BTreeMap::new();
+    for r in side.records.iter().filter(|r| r.code == "session.closed") {
+        *by.entry(r.attr("cause").unwrap_or("unknown")).or_default() += r.repeat;
+    }
+    let mut list: Vec<(&str, u64)> = by.into_iter().collect();
+    list.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    (!list.is_empty()).then(|| {
+        list.iter()
+            .map(|(c, n)| format!("{c} ×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
 fn with_error(base: String, error: Option<String>) -> String {
     match error {
         Some(e) => format!("{base} The error was: \"{e}\"."),
@@ -136,7 +159,7 @@ fn analyze_device(c: &Side, gw: Option<&Side>, out: &mut Vec<Finding>) {
             g.records
                 .iter()
                 .copied()
-                .filter(|r| r.code == "gateway.tls.rejected")
+                .filter(|r| r.code == "gateway.tls.rejected" && refused_certificate(r))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -356,11 +379,21 @@ fn analyze_device(c: &Side, gw: Option<&Side>, out: &mut Vec<Finding>) {
     let ok = c.count("client.check.ok");
     let failed = c.count("client.check.failed");
     if failed > 0 && ok > 0 {
+        let mut detail = format!(
+            "{ok} health check(s) passed and {failed} failed during the recording, with {} reconnect(s).",
+            c.count("transport.reconnect")
+        );
+        if let Some(causes) = session_causes(c) {
+            detail.push_str(&format!(" The device's sessions ended with: {causes}."));
+        }
+        if let Some(causes) = gw.and_then(session_causes) {
+            detail.push_str(&format!(" The gateway's ended with: {causes}."));
+        }
         out.push(finding(
             Severity::Warn,
             "connection_unstable",
             format!("The connection of {who} was unstable"),
-            format!("{ok} health check(s) passed and {failed} failed during the recording, with {} reconnect(s).", c.count("transport.reconnect")),
+            detail,
             "Intermittent drops usually come from the device's network (Wi-Fi, mobile data, sleep). If many devices drop at the same time, check the gateway host's network and, with Cloudflare Tunnel, the connector status.",
             vec![format!("{ok}× client.check.ok, {failed}× client.check.failed")],
         ));
@@ -441,7 +474,13 @@ pub fn analyze(gateway: Option<&Report>, devices: &[Report]) -> Analysis {
             ));
         }
         if clients.is_empty() {
-            let rejects = g.count("gateway.tls.rejected");
+            let refused: Vec<&Record> = g
+                .records
+                .iter()
+                .copied()
+                .filter(|r| r.code == "gateway.tls.rejected" && refused_certificate(r))
+                .collect();
+            let rejects = Side::total(&refused);
             if rejects > 0 {
                 out.push(finding(
                     Severity::Warn,
@@ -449,7 +488,7 @@ pub fn analyze(gateway: Option<&Report>, devices: &[Report]) -> Analysis {
                     "The gateway rejected device certificates",
                     with_error(
                         format!("{rejects} connection(s) presented a certificate the gateway does not accept."),
-                        Side::top_error(&g.records.iter().copied().filter(|r| r.code == "gateway.tls.rejected").collect::<Vec<_>>()),
+                        Side::top_error(&refused),
                     ),
                     "A removed or expired device keeps retrying. Re-invite it if it should have access; otherwise remove the app from that device.",
                     vec![format!("{rejects}× gateway.tls.rejected")],
@@ -614,6 +653,46 @@ mod tests {
             )])],
         );
         assert!(ids(&a).contains(&"device_vpn_problem"));
+    }
+
+    #[test]
+    fn unfinished_handshakes_are_not_rejected_certificates() {
+        let g = report(
+            Role::Gateway,
+            vec![rec(
+                "gateway.tls.rejected",
+                &[("error", "TLS handshake timed out")],
+                2,
+            )],
+            &[("gateway.tls.rejected", 2)],
+        );
+        assert!(!ids(&analyze(Some(&g), &[])).contains(&"gateway_rejected_certificates"));
+        let g = report(
+            Role::Gateway,
+            vec![rec(
+                "gateway.tls.rejected",
+                &[("error", "certificate revoked")],
+                1,
+            )],
+            &[("gateway.tls.rejected", 1)],
+        );
+        assert!(ids(&analyze(Some(&g), &[])).contains(&"gateway_rejected_certificates"));
+    }
+
+    #[test]
+    fn unstable_connections_say_why_sessions_ended() {
+        let c = report(
+            Role::Client,
+            vec![rec("session.closed", &[("cause", "keepalive_timeout")], 3)],
+            &[("client.check.ok", 2), ("client.check.failed", 5)],
+        );
+        let a = analyze(None, &[c]);
+        let f = a
+            .findings
+            .iter()
+            .find(|f| f.id == "connection_unstable")
+            .expect("finding");
+        assert!(f.detail.contains("keepalive_timeout ×3"), "{}", f.detail);
     }
 
     #[test]
