@@ -188,7 +188,7 @@ function pill(state) {
   const s = String(state);
   const cls = /^(active|ready|ok|running|allowed|connected)/.test(s) || s.startsWith("ok ") ? "ok"
     : /^(failed|error|revoked|disabled|denied|recovery_required)/.test(s) || s.startsWith("expires in") ? "bad"
-    : /^(applying|issuing|pending|planned|planning|removing|starting|verifying|must change)/.test(s) ? "warn" : "";
+    : /^(applying|issuing|pending|preparing|planned|planning|removing|starting|verifying|must change)/.test(s) ? "warn" : "";
   return el("span", { class: "pill " + cls }, [state]);
 }
 
@@ -652,31 +652,52 @@ async function iphoneCard() {
   if (!data.enabled) return null;
   /** @type {Record<string, [string, boolean]>} */
   const outcomes = {
-    "#ios-registered": ["Your iPhone was registered. Once it's approved (on some servers that's automatic), the Install button below works on it within a few minutes.", false],
+    "#ios-registered": ["Your iPhone was registered. Once it shows \"ready to install\" below, press Install (this page updates by itself).", false],
     "#ios-expired": ["That registration link expired. Press Register this iPhone again.", true],
     "#ios-failed": ["The registration didn't come through. Press Register this iPhone again.", true],
   };
   const outcome = outcomes[location.hash];
   if (outcome) history.replaceState(null, "", location.pathname);
   /** @type {Record<string, string>} */
-  const label = { pending: "waiting for approval", approved: "approved", failed: "failed — ask your administrator" };
-  const requests = data.requests.map((/** @type {any} */ r) =>
-    el("li", {}, [r.name + (r.product ? " (" + r.product + ")" : "") + " — ", pill(label[r.state] || r.state)]));
+  const label = {
+    pending: "waiting for approval",
+    preparing: "approved — preparing the app (a few minutes)",
+    ready: "ready to install",
+    delayed: "approved, but the app isn't ready yet — ask your administrator",
+    failed: "failed — ask your administrator",
+  };
+  /** @type {any[]} */
+  const mine = data.requests;
+  const stage = (/** @type {any} */ r) => r.stage || r.state;
+  const requests = mine.map((r) =>
+    el("li", {}, [r.name + (r.product ? " (" + r.product + ")" : "") + " — ", pill(label[stage(r)] || stage(r))]));
+  const ready = mine.some((r) => stage(r) === "ready");
+  const waiting = mine.some((r) => ["pending", "preparing"].includes(stage(r)));
   const register = el("a", { class: "button" + (data.install ? " ghost" : ""), href: BASE + "/api/v1/ios/register.mobileconfig" }, ["Register this iPhone"]);
-  const install = data.install ? el("a", { class: "button", href: data.install }, ["Install AegisBorne " + data.app.version]) : null;
-  return card("iPhone app", [
+  const install = data.install ? el("a", { class: "button" + (ready || !mine.length ? "" : " ghost"), href: data.install }, ["Install AegisBorne " + data.app.version]) : null;
+  const box = card("iPhone app", [
     outcome ? el("p", { class: outcome[1] ? "err-text" : "ok-text" }, [outcome[0]]) : null,
     el("p", { class: "muted" }, ["On your iPhone, in Safari. The app installs only on iPhones the administrator approved (iOS 16 or later)."]),
     el("ol", { class: "steps" }, [
       el("li", {}, ["Press ", el("em", {}, ["Register this iPhone"]), ", then open Settings → Profile Downloaded and install it. It only sends this iPhone's identifier, and doesn't stay installed."]),
-      el("li", {}, ["Wait for the administrator's approval."]),
+      el("li", {}, ["Wait until it shows ", el("em", {}, ["ready to install"]), " below: it's approved, then the app is prepared for it (a few minutes)."]),
       el("li", {}, ["Press ", el("em", {}, ["Install"]), "."]),
     ]),
     requests.length ? el("ul", {}, requests) : null,
     el("div", { class: "row" }, [register, install]),
+    install && mine.length && !ready ? el("p", { class: "muted small" }, ["Install works on your iPhone once it shows ready to install."]) : null,
     !data.install && data.app ? el("p", { class: "muted small" }, ["Installing needs the portal's public address (ask your administrator)."]) : null,
     !data.app ? el("p", { class: "muted small" }, ["The app isn't on this server yet."]) : null,
   ]);
+  // Update by itself while an iPhone waits, without redrawing the page.
+  if (waiting) {
+    pollTimer = window.setTimeout(async () => {
+      if (currentView !== "devices" || !box.isConnected) return;
+      const fresh = await iphoneCard().catch(() => null);
+      if (fresh && box.isConnected) box.replaceWith(fresh);
+    }, 30000);
+  }
+  return box;
 }
 
 /** The console's side: GitHub settings and iPhones waiting for approval. */
@@ -729,7 +750,13 @@ function iosCard(/** @type {any} */ i) {
       el("td", {}, [el("strong", {}, [r.name]), el("div", { class: "muted small" }, [[r.product, r.ios].filter(Boolean).join(" · ")])]),
       el("td", {}, [r.username || "—"]),
       el("td", {}, [new Date(r.requested_at * 1000).toLocaleString()]),
-      el("td", {}, [pill(r.state), r.message ? el("div", { class: "muted small" }, [r.message]) : null]),
+      el("td", {}, [
+        pill(r.stage || r.state),
+        r.stage === "delayed"
+          ? el("div", { class: "err-text small" }, ["Not in the app after 30 minutes: check the ios-device workflow on GitHub, then Check GitHub now."])
+          : r.stage === "ready" ? null
+          : r.message ? el("div", { class: "muted small" }, [r.message]) : null,
+      ]),
       el("td", {}, [el("div", { class: "row" }, [approve, remove])]),
     ]);
   });

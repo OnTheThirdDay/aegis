@@ -12,6 +12,10 @@
 //!   approves the request here, which starts the repository's `ios-device`
 //!   workflow (repository dispatch). Neither the Apple key nor the signing
 //!   certificate is on the gateway.
+//! - An approved iPhone is "ready to install" once the app on this gateway
+//!   was signed for it: its UDID is in the provisioning profiles inside.
+//!   While one is being prepared, the gateway checks GitHub every minute
+//!   instead of every 10.
 //! - A gateway that can't reach GitHub (its downloads are blocked in places)
 //!   can reach it through another gateway: it joins that gateway as a device,
 //!   with an invitation from it, and its GitHub requests go through a client
@@ -23,8 +27,9 @@ use aegis_storage::now_unix;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -44,6 +49,12 @@ const MAX_REQUESTS: usize = 500;
 /// GitHub's API, while the console waits (under the gateway's 30-second
 /// idle limit): reading the latest release, starting the workflow.
 const API_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often the app is checked for on GitHub, and how often while an
+/// approved iPhone is being prepared (registered and re-signed for).
+const POLL_EVERY: i64 = 600;
+pub const POLL_PREPARING: Duration = Duration::from_secs(60);
+/// How long preparing an iPhone may take before it shows as delayed.
+const PREPARING: i64 = 30 * 60;
 
 fn err(status: u16, code: impl Into<String>) -> (u16, String) {
     (status, code.into())
@@ -87,6 +98,10 @@ struct Fetched {
     updated_at: String,
     fetched_at: i64,
     size: u64,
+    /// The iPhones (UDIDs, upper case) the app installs on; None when they
+    /// couldn't be read.
+    #[serde(default)]
+    devices: Option<Vec<String>>,
 }
 
 /// A user's request to register an iPhone.
@@ -103,6 +118,25 @@ struct Request {
     /// `pending`, `approved` (sent to GitHub) or `failed`.
     state: String,
     message: Option<String>,
+    #[serde(default)]
+    approved_at: Option<i64>,
+}
+
+/// Where an iPhone stands: `pending`, `failed`, `ready` (the app here
+/// installs on it), `preparing` (approved, being registered and re-signed
+/// for), `delayed` (still not in the app after a while) or `approved`
+/// (when the app's iPhones are unknown).
+fn stage(r: &Request, devices: Option<&[String]>, now: i64) -> &'static str {
+    match (r.state.as_str(), devices) {
+        ("approved", None) => "approved",
+        ("approved", Some(d)) if d.iter().any(|u| u.eq_ignore_ascii_case(&r.udid)) => "ready",
+        ("approved", Some(_)) if now - r.approved_at.unwrap_or(r.requested_at) < PREPARING => {
+            "preparing"
+        }
+        ("approved", Some(_)) => "delayed",
+        ("failed", _) => "failed",
+        _ => "pending",
+    }
 }
 
 pub struct IosIntegration {
@@ -116,6 +150,8 @@ pub struct IosIntegration {
     /// The client into the other gateway GitHub is reached through, while
     /// it runs.
     upstream: tokio::sync::Mutex<Option<aegis_node::NodeRuntime>>,
+    /// When `poll` last checked on its regular schedule.
+    last_poll: AtomicI64,
 }
 
 /// `host[:port]` of a URL.
@@ -141,6 +177,91 @@ fn valid_repository(r: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
     };
     matches!(r.split_once('/'), Some((o, n)) if ok(o) && ok(n) && !n.contains('/'))
+}
+
+const BAD_ZIP: &str = "the app isn't a readable zip file";
+
+/// The files in a zip (an `.ipa`) whose names `want` picks, uncompressed.
+fn zip_files(zip: &[u8], want: impl Fn(&str) -> bool) -> Result<Vec<Vec<u8>>, &'static str> {
+    let u16_at = |i: usize| {
+        zip.get(i..i + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .ok_or(BAD_ZIP)
+    };
+    let u32_at = |i: usize| {
+        zip.get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+            .ok_or(BAD_ZIP)
+    };
+    // The end of the central directory: 22 bytes and a comment (< 64 KiB).
+    let from = zip.len().saturating_sub(22 + 0xffff);
+    let end = (from..zip.len().saturating_sub(21))
+        .rev()
+        .find(|&i| u32_at(i) == Ok(0x0605_4b50))
+        .ok_or(BAD_ZIP)?;
+    let mut at = u32_at(end + 16)?;
+    let mut out = Vec::new();
+    for _ in 0..u16_at(end + 10)? {
+        if u32_at(at)? != 0x0201_4b50 {
+            return Err(BAD_ZIP);
+        }
+        let (method, compressed, size) = (u16_at(at + 10)?, u32_at(at + 20)?, u32_at(at + 24)?);
+        let name_len = u16_at(at + 28)?;
+        let local = u32_at(at + 42)?;
+        let name = zip.get(at + 46..at + 46 + name_len).ok_or(BAD_ZIP)?;
+        at += 46 + name_len + u16_at(at + 30)? + u16_at(at + 32)?;
+        if !want(&String::from_utf8_lossy(name)) {
+            continue;
+        }
+        if size > 16 << 20 || u32_at(local)? != 0x0403_4b50 {
+            return Err(BAD_ZIP);
+        }
+        let start = local + 30 + u16_at(local + 26)? + u16_at(local + 28)?;
+        let data = zip.get(start..start + compressed).ok_or(BAD_ZIP)?;
+        out.push(match method {
+            0 => data.to_vec(),
+            8 => {
+                let mut plain = Vec::with_capacity(size);
+                flate2::read::DeflateDecoder::new(data)
+                    .take(size as u64)
+                    .read_to_end(&mut plain)
+                    .map_err(|_| BAD_ZIP)?;
+                plain
+            }
+            _ => return Err(BAD_ZIP),
+        });
+    }
+    Ok(out)
+}
+
+/// The UDIDs (upper case) a provisioning profile lists: it's a signed
+/// plist, readable as text.
+fn profile_devices(profile: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(profile);
+    let Some((list, _)) = text
+        .split_once("<key>ProvisionedDevices</key>")
+        .and_then(|(_, rest)| rest.split_once("</array>"))
+    else {
+        return Vec::new();
+    };
+    list.split("<string>")
+        .skip(1)
+        .filter_map(|s| s.split_once("</string>"))
+        .map(|(u, _)| u.trim().to_ascii_uppercase())
+        .collect()
+}
+
+/// The iPhones an Ad Hoc app installs on: those in every provisioning
+/// profile inside it (the app's and its extension's).
+pub fn provisioned_devices(ipa: &[u8]) -> Result<Vec<String>, &'static str> {
+    let profiles = zip_files(ipa, |name| name.ends_with("/embedded.mobileprovision"))?;
+    let mut profiles = profiles.iter().map(|p| profile_devices(p));
+    let first = profiles
+        .next()
+        .ok_or("no provisioning profile in the app")?;
+    Ok(profiles.fold(first, |common, devices| {
+        common.into_iter().filter(|d| devices.contains(d)).collect()
+    }))
 }
 
 /// Decrypt a downloaded `.ipa.enc` with the 32-byte key.
@@ -173,6 +294,7 @@ impl IosIntegration {
             last_error: Mutex::new(None),
             fetching: AtomicBool::new(false),
             upstream: tokio::sync::Mutex::new(None),
+            last_poll: AtomicI64::new(0),
         }
     }
 
@@ -204,6 +326,32 @@ impl IosIntegration {
     fn requests(&self) -> Vec<Request> {
         self.load::<Option<Vec<Request>>>("requests.json")
             .unwrap_or_default()
+    }
+
+    /// Requests as JSON, each with its `stage`.
+    fn staged(&self, requests: Vec<Request>, fetched: Option<&Fetched>) -> Vec<Value> {
+        let devices = fetched
+            .filter(|_| self.dir.join("app.ipa").is_file())
+            .and_then(|f| f.devices.as_deref());
+        let now = now_unix();
+        requests
+            .into_iter()
+            .map(|r| {
+                let stage = stage(&r, devices, now);
+                let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
+                v["stage"] = stage.into();
+                v
+            })
+            .collect()
+    }
+
+    /// Whether an approved iPhone is being prepared (so GitHub is checked
+    /// more often).
+    fn preparing(&self) -> bool {
+        let fetched: Option<Fetched> = self.load("fetched.json");
+        self.staged(self.requests(), fetched.as_ref())
+            .iter()
+            .any(|r| r["stage"] == "preparing")
     }
 
     fn set_error(&self, e: Option<String>) {
@@ -245,9 +393,14 @@ impl IosIntegration {
             })),
             "has_token": self.secret(TOKEN).is_some(),
             "has_key": self.secret(KEY).is_some(),
-            "app": if app_ready { serde_json::to_value(&fetched).unwrap_or(Value::Null) } else { Value::Null },
+            "app": fetched.as_ref().filter(|_| app_ready).map(|f| json!({
+                "version": f.version,
+                "updated_at": f.updated_at,
+                "fetched_at": f.fetched_at,
+                "size": f.size,
+            })),
             "error": error,
-            "requests": self.requests(),
+            "requests": self.staged(self.requests(), fetched.as_ref()),
         })
     }
 
@@ -418,9 +571,17 @@ impl IosIntegration {
     }
 
     /// Fetch the latest release's app when it changed (new release, or
-    /// re-signed for a new iPhone). Quiet when not configured.
+    /// re-signed for a new iPhone). Quiet when not configured. Called every
+    /// `POLL_PREPARING`; checks every `POLL_EVERY` unless an iPhone is being
+    /// prepared.
     pub async fn poll(self: &Arc<Self>) {
-        self.renew_via().await;
+        let now = now_unix();
+        if now - self.last_poll.load(Ordering::Relaxed) >= POLL_EVERY {
+            self.last_poll.store(now, Ordering::Relaxed);
+            self.renew_via().await;
+        } else if !self.preparing() {
+            return;
+        }
         if self.github().is_ok() && self.secret(KEY).is_some() {
             self.start_fetch();
         }
@@ -478,6 +639,23 @@ impl IosIntegration {
         let ipa = self.dir.join("app.ipa");
         if let Some(k) = &known {
             if k.asset_id == id && k.updated_at == updated_at && ipa.is_file() {
+                if k.devices.is_none() {
+                    let path = ipa.clone();
+                    let devices = tokio::task::spawn_blocking(move || {
+                        provisioned_devices(&std::fs::read(path).ok()?).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if devices.is_some() {
+                        let _guard = self.files.lock().unwrap_or_else(|e| e.into_inner());
+                        let fetched = Fetched {
+                            devices,
+                            ..k.clone()
+                        };
+                        self.save("fetched.json", &Some(fetched))?;
+                    }
+                }
                 return Ok(json!({ "version": k.version, "changed": false }));
             }
         }
@@ -507,10 +685,15 @@ impl IosIntegration {
             }
             data.extend_from_slice(&chunk);
         }
-        let plain = tokio::task::spawn_blocking(move || decrypt(&key, &data))
-            .await
-            .map_err(|_| err(500, "decrypt"))?
-            .map_err(|e| err(409, format!("The app {e}.")))?;
+        let (plain, devices) = tokio::task::spawn_blocking(move || {
+            decrypt(&key, &data).map(|plain| {
+                let devices = provisioned_devices(&plain).ok();
+                (plain, devices)
+            })
+        })
+        .await
+        .map_err(|_| err(500, "decrypt"))?
+        .map_err(|e| err(409, format!("The app {e}.")))?;
         let version = tag.trim_start_matches('v').to_owned();
         let fetched = Fetched {
             version: version.clone(),
@@ -518,6 +701,7 @@ impl IosIntegration {
             updated_at,
             fetched_at: now_unix(),
             size: plain.len() as u64,
+            devices,
         };
         let _guard = self.files.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = self.dir.join("app.ipa.part");
@@ -572,6 +756,7 @@ impl IosIntegration {
             requested_at: now_unix(),
             state: "pending".into(),
             message: None,
+            approved_at: None,
         };
         let settings: Settings = self.load("settings.json");
         let auto = settings.auto_approve && auto_allowed(&list, actor, settings.per_user());
@@ -592,13 +777,17 @@ impl IosIntegration {
 
     /// The signed-in user's requests (portal).
     pub fn mine(&self, actor: &str) -> Value {
-        let list: Vec<Value> = self
+        let fetched: Option<Fetched> = self.load("fetched.json");
+        let mine = self
             .requests()
             .into_iter()
             .filter(|r| r.user == actor)
-            .map(|r| json!({"id": r.id, "name": r.name, "product": r.product, "state": r.state, "requested_at": r.requested_at}))
             .collect();
-        let fetched: Option<Fetched> = self.load("fetched.json");
+        let list: Vec<Value> = self
+            .staged(mine, fetched.as_ref())
+            .into_iter()
+            .map(|r| json!({"id": r["id"], "name": r["name"], "product": r["product"], "state": r["state"], "stage": r["stage"], "requested_at": r["requested_at"]}))
+            .collect();
         let available = fetched.filter(|_| self.dir.join("app.ipa").is_file());
         let settings: Settings = self.load("settings.json");
         json!({
@@ -657,6 +846,7 @@ impl IosIntegration {
             if let Some(r) = list.iter_mut().find(|r| r.id == id) {
                 r.state = if ok { "approved" } else { "failed" }.into();
                 r.message = Some(message.clone());
+                r.approved_at = ok.then(now_unix);
             }
             self.save("requests.json", &Some(list))?;
         }
@@ -701,6 +891,7 @@ mod tests {
             requested_at: 0,
             state: state.into(),
             message: None,
+            approved_at: None,
         };
         let list = vec![
             r("alice", "approved"),
@@ -718,6 +909,44 @@ mod tests {
         ));
         assert!(auto_allowed(&list, "carol", 2));
         assert!(!auto_allowed(&list, "bob", 1));
+    }
+
+    #[test]
+    fn the_app_lists_the_iphones_it_installs_on() {
+        // Made by Python's zipfile: the app's profile (compressed) lists two
+        // iPhones, the extension's (stored) one of them.
+        let ipa = include_bytes!("testdata/profiles.ipa");
+        assert_eq!(
+            provisioned_devices(ipa).expect("profiles"),
+            ["447C2B96BB63020799BBD2C659A98AF8EDF3B525"]
+        );
+        assert!(provisioned_devices(b"not a zip").is_err());
+        assert!(provisioned_devices(&ipa[..ipa.len() - 30]).is_err());
+    }
+
+    #[test]
+    fn an_approved_iphone_is_ready_once_the_app_has_it() {
+        let mut r = Request {
+            id: "x".into(),
+            user: "alice".into(),
+            username: String::new(),
+            name: String::new(),
+            udid: "447c2b96bb63020799bbd2c659a98af8edf3b525".into(),
+            product: String::new(),
+            ios: String::new(),
+            requested_at: 0,
+            state: "pending".into(),
+            message: None,
+            approved_at: None,
+        };
+        let has = vec!["447C2B96BB63020799BBD2C659A98AF8EDF3B525".to_owned()];
+        assert_eq!(stage(&r, Some(&has), 100), "pending");
+        r.state = "approved".into();
+        r.approved_at = Some(100);
+        assert_eq!(stage(&r, Some(&[]), 200), "preparing");
+        assert_eq!(stage(&r, Some(&[]), 100 + PREPARING), "delayed");
+        assert_eq!(stage(&r, Some(&has), 200), "ready");
+        assert_eq!(stage(&r, None, 200), "approved");
     }
 
     #[test]
