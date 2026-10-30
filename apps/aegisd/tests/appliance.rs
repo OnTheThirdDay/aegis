@@ -13,6 +13,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// These tests start gateways on ports picked by [`free_port`]: run in
+/// parallel, two of them could pick the same port between its release and
+/// the gateway binding it. One gateway test at a time.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -127,6 +132,7 @@ async fn start_client_via(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().await;
     tokio::time::timeout(Duration::from_secs(90), async {
         let tmp = tempfile::tempdir().expect("tmp");
         let data = tmp.path().join("data");
@@ -789,6 +795,7 @@ fn revisions(data: &Path) -> i64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_session_limits_are_upgraded_once_and_operator_values_kept() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().await;
     tokio::time::timeout(Duration::from_secs(60), async {
         let tmp = tempfile::tempdir().expect("tmp");
         // Pre-0.2 defaults: 31 concurrent connections per device.
@@ -820,6 +827,7 @@ async fn legacy_session_limits_are_upgraded_once_and_operator_values_kept() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cloudflare_device_port_is_one_of_cloudflares() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().await;
     tokio::time::timeout(Duration::from_secs(60), async {
         let tmp = tempfile::tempdir().expect("tmp");
         let data = tmp.path().join("cf");
@@ -880,6 +888,7 @@ async fn cloudflare_device_port_is_one_of_cloudflares() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_is_offered_to_devices_only_once_turned_on_and_complete() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().await;
     tokio::time::timeout(Duration::from_secs(60), async {
         let tmp = tempfile::tempdir().expect("tmp");
         let data = tmp.path().join("quic");
@@ -965,6 +974,7 @@ async fn quic_is_offered_to_devices_only_once_turned_on_and_complete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn console_upgrades_go_through_the_updater_files() {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().await;
     tokio::time::timeout(Duration::from_secs(60), async {
         let tmp = tempfile::tempdir().expect("tmp");
         let data = tmp.path().join("updates");
