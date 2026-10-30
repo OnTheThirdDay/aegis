@@ -27,6 +27,7 @@ Until now the gateway had an IPC-only, 15-minute, coded event ring. Devices had 
    - The gateway holds at most 16 device reports and 16 MiB of them in total, also dropped after 60 minutes.
 3. **What is recorded.**
    - **Core events:** finite codes and reason groups, as before (session opened/closed, stream failures by reason, reconnects, handshakes, throttling, configuration activation, authentication failures). Byte accounting and routine successes are only counted.
+   - A closed session carries its cause (`session.closed cause=…`, 1.1.7): `keepalive_timeout` (nothing came back), `connection_reset`, `transport_eof`, `peer_closed`, `write_timeout` and so on. That tells a path that went silent from one the network cut or the other side closed. A gateway handshake that timed out or was cut off is not reported as a rejected certificate.
    - **Component notes:** a bounded error message (at most 300 characters, at most 8 attributes). Examples: why a device's connection attempt failed and at which stage (WebSocket, TLS, session); why the gateway rejected a TLS handshake or session; failed enroll/renew requests; failing integrations (Cloudflare connector down).
    - **Never recorded:** destinations, visited sites, payload, stream IDs.
    - Error messages may contain the server's own address. That is why recording needs an explicit action on each side.

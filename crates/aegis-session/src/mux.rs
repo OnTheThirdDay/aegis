@@ -504,6 +504,7 @@ impl Shared {
                 .encode(),
             ));
         }
+        let cause = err.cause();
         st.closed = Some(err);
         for e in st.streams.values_mut() {
             e.open_waiter = None;
@@ -513,7 +514,7 @@ impl Shared {
         st.incoming_tx = None;
         self.closed_tx.send_replace(true);
         self.writer.notify_one();
-        self.obs.record(Event::SessionClosed);
+        self.obs.record(Event::SessionClosed { cause });
     }
 }
 
