@@ -37,6 +37,32 @@ impl SessionError {
             SessionError::Closed(r) => r.group(),
         }
     }
+
+    /// Why the session ended, as a short code for diagnostics: tells a
+    /// silent path (`keepalive_timeout`) from one cut by the network
+    /// (`connection_reset`) or closed by the other side (`peer_closed`).
+    pub fn cause(&self) -> &'static str {
+        match self {
+            SessionError::Protocol(_) => "protocol_error",
+            SessionError::Io(kind) => match kind {
+                std::io::ErrorKind::ConnectionReset => "connection_reset",
+                std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+                std::io::ErrorKind::BrokenPipe => "broken_pipe",
+                std::io::ErrorKind::UnexpectedEof => "transport_eof",
+                std::io::ErrorKind::TimedOut => "io_timeout",
+                _ => "io_error",
+            },
+            SessionError::HandshakeTimeout => "handshake_timeout",
+            SessionError::KeepaliveTimeout => "keepalive_timeout",
+            SessionError::WriteTimeout => "write_timeout",
+            SessionError::ResetDrainTimeout => "reset_drain_timeout",
+            SessionError::IdentityMismatch => "identity_mismatch",
+            SessionError::Budget => "budget",
+            SessionError::Closed(_) => "closed_locally",
+            SessionError::PeerClosed => "peer_closed",
+            SessionError::ControlOverload => "control_overload",
+        }
+    }
 }
 
 impl fmt::Display for SessionError {
