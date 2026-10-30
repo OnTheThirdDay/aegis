@@ -2,12 +2,18 @@ import AegisCore
 import Flutter
 import Foundation
 import NetworkExtension
+import UIKit
 
 /// The Flutter channel `aegisborne/client` on iOS (lib/client.dart). Joined
 /// servers live in the App Group container, shared with the packet tunnel
 /// (AegisTunnel), which runs the connection; the app starts and stops it
 /// through NETunnelProviderManager and asks it for status. Results are the
 /// Rust core's JSON, as on Android.
+///
+/// Diagnostics record in the extension (where the connection runs): while
+/// it runs the app passes the calls on; otherwise starting a recording
+/// connects with it, and the last outcome (and a report the extension
+/// saved because it couldn't send it) comes from the shared container.
 final class AegisChannel {
     static let appGroup = "group.borne.aegis.app"
     static let tunnelBundle = "borne.aegis.app.tunnel"
@@ -62,7 +68,24 @@ final class AegisChannel {
         case "forget":
             forget(args["id"] as? String ?? "", result)
         case "connect":
-            connect(result)
+            connect(nil, result)
+        case "diagStatus":
+            diag("diag-status", local: { aegis_diag_status(dir) }, result)
+        case "diagStart":
+            let minutes = args["minutes"] as? Int ?? 15
+            diag("diag-start:\(minutes)", local: nil, result) {
+                // Not running: record from the connection's start.
+                self.connect(["diagMinutes": NSNumber(value: minutes)], result)
+            }
+        case "diagStop":
+            let send = args["send"] as? Bool ?? false
+            diag("diag-stop:\(send ? 1 : 0)", local: { aegis_diag_stop(dir, send ? 1 : 0) }, result)
+        case "diagSend":
+            diag("diag-send", local: { aegis_diag_send(dir) }, result)
+        case "diagDiscard":
+            diag("diag-discard", local: { aegis_diag_discard(dir) }, result)
+        case "diagShare":
+            share(result)
         case "disconnect":
             withManager { manager in
                 manager?.connection.stopVPNTunnel()
@@ -103,9 +126,89 @@ final class AegisChannel {
         }
     }
 
+    /// The extension's session while it runs (connecting or connected).
+    private func running(_ done: @escaping (NETunnelProviderSession?) -> Void) {
+        withManager { manager in
+            guard let session = manager?.connection as? NETunnelProviderSession else { return done(nil) }
+            switch session.status {
+            case .connected, .connecting, .reasserting: done(session)
+            default: done(nil)
+            }
+        }
+    }
+
+    /// A diagnostics call: to the extension while it runs; otherwise to the
+    /// core here (`local`), or `otherwise`.
+    private func diag(
+        _ message: String,
+        local: (() -> UnsafeMutablePointer<CChar>?)?,
+        _ result: @escaping FlutterResult,
+        otherwise: (() -> Void)? = nil
+    ) {
+        running { session in
+            if let session {
+                do {
+                    try session.sendProviderMessage(Data(message.utf8)) { data in
+                        let text = data.flatMap { String(data: $0, encoding: .utf8) }
+                        DispatchQueue.main.async { result(text ?? Self.failure("The VPN didn't answer.")) }
+                    }
+                } catch {
+                    result(Self.failure("The VPN didn't answer: \(error.localizedDescription)"))
+                }
+            } else if let local {
+                self.background(result) { Self.core(local) }
+            } else {
+                otherwise?()
+            }
+        }
+    }
+
+    /// Offer the recorded report to another app (chat, mail, AirDrop): one
+    /// the extension saved after it couldn't send it, or a fresh one from
+    /// the running extension.
+    private func share(_ result: @escaping FlutterResult) {
+        let present = { (path: String?) in
+            DispatchQueue.main.async {
+                guard let path, FileManager.default.fileExists(atPath: path) else {
+                    result(Self.failure("There is no report to share. Record one first."))
+                    return
+                }
+                let sheet = UIActivityViewController(activityItems: [URL(fileURLWithPath: path)], applicationActivities: nil)
+                let root = UIApplication.shared.connectedScenes
+                    .compactMap { ($0 as? UIWindowScene)?.keyWindow?.rootViewController }
+                    .first
+                guard let root else {
+                    result(Self.failure("Could not show the share sheet."))
+                    return
+                }
+                // iPad: anchored to the screen.
+                sheet.popoverPresentationController?.sourceView = root.view
+                sheet.popoverPresentationController?.sourceRect = CGRect(x: root.view.bounds.midX, y: root.view.bounds.midY, width: 0, height: 0)
+                root.present(sheet, animated: true)
+                result(Self.ok)
+            }
+        }
+        running { session in
+            guard let session else {
+                let status = Self.object(Self.core { aegis_diag_status(Self.dir) })
+                present((status["result"] as? [String: Any])?["file"] as? String)
+                return
+            }
+            do {
+                try session.sendProviderMessage(Data("diag-save".utf8)) { data in
+                    let saved = Self.object(data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+                    present(saved["path"] as? String)
+                }
+            } catch {
+                present(nil)
+            }
+        }
+    }
+
     /// Save the VPN configuration (iOS asks the user the first time) and
-    /// start the tunnel for the selected server.
-    private func connect(_ result: @escaping FlutterResult) {
+    /// start the tunnel for the selected server, with `options` for the
+    /// extension.
+    private func connect(_ options: [String: NSObject]?, _ result: @escaping FlutterResult) {
         let servers = Self.object(Self.core { aegis_servers(Self.dir) })
         let selected = servers["selected"] as? String
         let host = (servers["servers"] as? [[String: Any]])?
@@ -130,7 +233,7 @@ final class AegisChannel {
                     DispatchQueue.main.async {
                         self.manager = manager
                         do {
-                            try manager.connection.startVPNTunnel()
+                            try manager.connection.startVPNTunnel(options: options)
                             result(Self.ok)
                         } catch {
                             result(Self.failure("Could not start the VPN: \(error.localizedDescription)"))

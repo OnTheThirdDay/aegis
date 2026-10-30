@@ -1404,7 +1404,7 @@ async function renderDiagnostics() {
       el("li", {}, ["Start recording here."]),
       el("li", {}, ["On the device, open the AegisBorne app → Troubleshooting → Start recording."]),
       el("li", {}, ["Reproduce the problem, then press Stop and send in the app (it also sends by itself when its recording ends)."]),
-      el("li", {}, ["Read the analysis below. A device that can't reach this server can Save to file instead; import that file here."]),
+      el("li", {}, ["Read the analysis below. A device that can't reach this server can't send its report: on a computer it uses Save to file, on a phone Share report (sent to you by chat or mail). Import that file here."]),
     ]),
   ]));
 

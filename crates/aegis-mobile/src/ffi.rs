@@ -101,6 +101,106 @@ pub extern "C" fn aegis_status() -> *mut c_char {
     ret(crate::status())
 }
 
+/// Start recording diagnostics for `minutes` (1 to 60); `about` describes
+/// the phone.
+///
+/// # Safety
+/// `dir` and `about` are NUL-terminated strings (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_start(
+    dir: *const c_char,
+    minutes: u32,
+    about: *const c_char,
+) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let (dir, about) = unsafe { (arg(dir), arg(about)) };
+    ret(crate::diag::start(&dir, u64::from(minutes), &about))
+}
+
+/// Stop recording; with `send` non-zero, send the report. Blocks.
+///
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_stop(dir: *const c_char, send: i32) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::diag::stop(&dir, send != 0))
+}
+
+/// Send the recorded report to the selected server. Blocks.
+///
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_send(dir: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::diag::send_now(&dir))
+}
+
+/// The tunnel is ending: send a recording that wasn't sent, or save it to
+/// a file when that fails. Blocks.
+///
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_finish(dir: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::diag::finish(&dir))
+}
+
+/// Save the recorded report to a file to share; `{"path"}`.
+///
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_save(dir: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::diag::save(&dir))
+}
+
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_discard(dir: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::diag::discard(&dir))
+}
+
+/// Record a problem the platform side saw (no-op unless recording).
+///
+/// # Safety
+/// `text` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_note(text: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let text = unsafe { arg(text) };
+    ret(crate::diag::note(&text))
+}
+
+/// The recording's state and the last send's outcome.
+///
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_diag_status(dir: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::diag::status(&dir))
+}
+
 /// Release a string returned by any `aegis_` function.
 ///
 /// # Safety
@@ -144,6 +244,12 @@ mod tests {
         let bad = call(unsafe { aegis_enroll(dir.as_ptr(), std::ptr::null()) });
         assert_eq!(bad["ok"], false);
         assert_eq!(call(aegis_status())["state"], "disconnected");
+        // SAFETY: valid NUL-terminated strings for the calls.
+        let diag = call(unsafe { aegis_diag_status(dir.as_ptr()) });
+        assert_eq!(diag["state"], "off");
+        // SAFETY: as above.
+        let nothing = call(unsafe { aegis_diag_save(dir.as_ptr()) });
+        assert_eq!(nothing["ok"], false);
         // SAFETY: freeing null is allowed.
         unsafe { aegis_free(std::ptr::null_mut()) };
     }
