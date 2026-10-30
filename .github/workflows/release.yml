@@ -197,7 +197,7 @@ jobs:
     # macOS runners bill 10x: only for releases, both architectures in one job.
     needs: plan
     if: needs.plan.outputs.channel == 'release'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -207,6 +207,8 @@ jobs:
       - name: Build
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          # Matches LSMinimumSystemVersion in macos-dmg.sh, whatever the runner's SDK.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           set -euo pipefail
           cargo build --locked --release --target aarch64-apple-darwin -p aegis-client
