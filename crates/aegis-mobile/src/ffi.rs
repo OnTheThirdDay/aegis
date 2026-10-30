@@ -101,6 +101,19 @@ pub extern "C" fn aegis_status() -> *mut c_char {
     ret(crate::status())
 }
 
+/// A newer app from the selected server: `{"version", "install"}` (the
+/// link iOS installs it from), or `{"version": null}`. Blocks.
+///
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_check_update(dir: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::check_update(&dir))
+}
+
 /// Start recording diagnostics for `minutes` (1 to 60); `about` describes
 /// the phone.
 ///

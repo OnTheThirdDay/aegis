@@ -366,6 +366,11 @@ async fn appliance_console_invite_enroll_tunnel_renew_revoke() {
             aegis_join::update::check(&device_dir, "linux-x86_64", "1.0.0").await.expect("check"),
             None
         );
+        // An iPhone asks the same way; this gateway serves no iPhone app.
+        assert_eq!(
+            aegis_join::update::check_ios(&device_dir, "1.0.0").await.expect("check ios"),
+            None
+        );
         // Nothing for a platform without a signed build.
         let dest = tmp.path().join("update.bin");
         let mut unsigned = offered.clone();

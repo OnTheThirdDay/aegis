@@ -477,7 +477,8 @@ fn device_certificate(body: &Value) -> Result<String, ApiError> {
 
 /// The latest app build for the device's platform (`update_query`), or
 /// null. Like the endpoint query: not secret, certificate checked, no rate
-/// limit spent.
+/// limit spent. For `ios`, also the iPhone app this gateway serves, with an
+/// install link (`ios`): iOS updates install like the first install.
 async fn update_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
     let certificate_pem = device_certificate(&body)?;
     let platform = body["update_query"]["platform"]
@@ -487,16 +488,23 @@ async fn update_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
         .to_owned();
     let anchor = device_trust_anchor(ctx)?;
     let c = ctx.clone();
-    blocking(move || {
-        authenticate_device(&c, &anchor, &certificate_pem, 0)?;
+    let ios = platform == "ios";
+    let (latest, device) = blocking(move || {
+        let device = authenticate_device(&c, &anchor, &certificate_pem, 0)?;
         let latest = signed_builds(&c)
             .into_iter()
             .map(|(v, _)| v)
             .filter(|v| v["platform"].as_str() == Some(platform.as_str()))
             .max_by_key(version_key);
-        Ok(json!({ "update": latest }))
+        Ok((latest, device.node_id))
     })
-    .await
+    .await?;
+    let offer = if ios {
+        super::ios::device_offer(ctx, &device).await
+    } else {
+        None
+    };
+    Ok(json!({ "update": latest, "ios": offer }))
 }
 
 /// One piece of a signed app build (`update_download`: file and offset).

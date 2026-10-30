@@ -20,6 +20,8 @@ final class AegisChannel {
     private let queue = DispatchQueue(label: "aegis.core")
     /// The VPN configuration, once loaded.
     private var manager: NETunnelProviderManager?
+    /// The install link of the update the server offered last.
+    private var updateLink: String?
 
     static var dir: String {
         let base = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
@@ -86,6 +88,26 @@ final class AegisChannel {
             diag("diag-discard", local: { aegis_diag_discard(dir) }, result)
         case "diagShare":
             share(result)
+        case "checkUpdate":
+            // A newer app from the server: installed like the first time,
+            // through iOS (ADR-0017, ADR-0019).
+            queue.async {
+                let text = Self.core { aegis_check_update(dir) }
+                let link = Self.object(text)["install"] as? String
+                DispatchQueue.main.async {
+                    self.updateLink = link
+                    result(text)
+                }
+            }
+        case "installUpdate":
+            guard let link = updateLink, let url = URL(string: link) else {
+                result(Self.failure("No update is offered."))
+                return
+            }
+            // iOS asks the user, closes the app and installs the new version.
+            UIApplication.shared.open(url) { opened in
+                result(opened ? Self.ok : Self.failure("iOS didn't open the install link."))
+            }
         case "disconnect":
             withManager { manager in
                 manager?.connection.stopVPNTunnel()
