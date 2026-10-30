@@ -113,5 +113,6 @@ jobs:
           (cd "$w/x" && zip -qry ../resigned.ipa Payload)
           "$py" .github/scripts/ios-ipa-crypt.py encrypt "$w/resigned.ipa" "$w/out.enc"
           mv "$w/out.enc" "$w/aegis-client-ios.ipa.enc"
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$w/aegis-client-ios.ipa.enc"
+          # GitHub's API sometimes answers 500; try again rather than fail.
+          for i in 1 2 3 4 5; do gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$w/aegis-client-ios.ipa.enc" && break; [ "$i" = 5 ] && exit 1; sleep $((i * 10)); done
           echo "Re-signed the iPhone app of $tag for every registered iPhone."
