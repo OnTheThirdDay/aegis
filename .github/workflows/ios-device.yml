@@ -6,6 +6,12 @@ name: iOS device
 # isn't rebuilt: its Ad Hoc profiles are replaced by fresh ones listing every
 # registered iPhone, and it is signed again. Every gateway then fetches it.
 #
+# Several approvals close together: each run registers its iPhone right
+# away (no queue, so none is lost), while re-signing runs one at a time. A
+# re-sign still waiting may be replaced by a newer one; that is fine, since
+# the newer one starts after every earlier registration and its profiles
+# list them all.
+#
 # Secrets: APPLE_API_KEY_ID, APPLE_API_ISSUER_ID, APPLE_API_KEY_P8,
 # APPLE_DIST_P12_B64, APPLE_DIST_P12_PASSWORD, AEGIS_IOS_APP_KEY (RELEASING.md).
 
@@ -24,20 +30,38 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: ios-device
-  cancel-in-progress: false
+env:
+  APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+  APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+  APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
 
 jobs:
   register:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 10
     env:
       NAME: ${{ github.event.client_payload.name || inputs.name }}
       UDID: ${{ github.event.client_payload.udid || inputs.udid }}
-      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Register the iPhone
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q cryptography
+          "$RUNNER_TEMP/venv/bin/python" .github/scripts/ios-profiles.py add-device "$NAME" "$UDID"
+
+  resign:
+    needs: register
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # One at a time; a newer waiting one replaces an older (see above).
+    concurrency:
+      group: ios-resign
+      cancel-in-progress: false
+    env:
       APPLE_DIST_P12_B64: ${{ secrets.APPLE_DIST_P12_B64 }}
       APPLE_DIST_P12_PASSWORD: ${{ secrets.APPLE_DIST_P12_PASSWORD }}
       AEGIS_IOS_APP_KEY: ${{ secrets.AEGIS_IOS_APP_KEY }}
@@ -60,10 +84,6 @@ jobs:
           echo "$RCODESIGN_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/apple-codesign-$RCODESIGN-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
-      - name: Register the iPhone
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/venv/bin/python" .github/scripts/ios-profiles.py add-device "$NAME" "$UDID"
       - name: Re-sign the current app
         run: |
           set -euo pipefail
