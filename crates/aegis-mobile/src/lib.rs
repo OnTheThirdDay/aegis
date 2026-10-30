@@ -343,7 +343,8 @@ pub fn stop() -> Value {
 
 /// Ask the selected server for a newer version of this app (blocking; the
 /// answer is reused for a few hours). `{"version": "1.2.0"}` when one signed
-/// by the release workflow is offered, else `{"version": null}`.
+/// by the release workflow is offered, else `{"version": null}`. On iOS the
+/// offer carries `install`, the link iOS installs it from.
 pub fn check_update(dir: &str) -> Value {
     let c = match client() {
         Ok(c) => c,
@@ -352,6 +353,9 @@ pub fn check_update(dir: &str) -> Value {
     let Some(platform) = aegis_join::update::platform() else {
         return ok(json!({"version": null}));
     };
+    if platform == "ios" {
+        return check_ios_update(c, dir);
+    }
     let cached = lock(&c.offer)
         .as_ref()
         .filter(|(at, _)| at.elapsed() < UPDATE_CHECK)
@@ -379,6 +383,27 @@ pub fn check_update(dir: &str) -> Value {
         }
     };
     ok(json!({"version": offer.map(|o| o.version), "current": env!("CARGO_PKG_VERSION")}))
+}
+
+/// [`check_update`] on iOS: a fresh install link each time (they last an
+/// hour), so nothing is cached.
+fn check_ios_update(c: &Client, dir: &str) -> Value {
+    let server = match Servers::open(dir).map(|s| s.selected()) {
+        Ok(Some(s)) => s,
+        Ok(None) => return ok(json!({"version": null})),
+        Err(e) => return fail(e),
+    };
+    match c.rt.block_on(aegis_join::update::check_ios(
+        &server.dir,
+        env!("CARGO_PKG_VERSION"),
+    )) {
+        Ok(offer) => ok(json!({
+            "version": offer.as_ref().map(|o| o.version.clone()),
+            "install": offer.map(|o| o.install),
+            "current": env!("CARGO_PKG_VERSION"),
+        })),
+        Err(e) => fail(e),
+    }
 }
 
 /// Download the offered update into the folder `into` (blocking), checking

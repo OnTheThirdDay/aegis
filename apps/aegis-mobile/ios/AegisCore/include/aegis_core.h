@@ -24,6 +24,9 @@ char *aegis_start_tunnel(const char *dir);
 char *aegis_stop(void);
 /// Connection state and counters.
 char *aegis_status(void);
+/// A newer app from the selected server: {"version", "install"} (the
+/// itms-services link to open), or {"version": null}. Blocks.
+char *aegis_check_update(const char *dir);
 /// Diagnostics: record for 1-60 minutes; about describes the phone.
 char *aegis_diag_start(const char *dir, uint32_t minutes, const char *about);
 /// Stop recording; with send non-zero, send the report. Blocks.

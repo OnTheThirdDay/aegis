@@ -48,6 +48,8 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 - **Install:**
   - An `itms-services://` link to a manifest. iOS fetches the manifest and the app itself, without the user's session, so both links carry a token valid for an hour.
   - The links use the portal's public address, which needs a publicly trusted certificate (Cloudflare Tunnel or Let's Encrypt).
+- **Downloads iOS makes:** the manifest and the app answer `HEAD` (iOS asks for the app's size first and waits forever at "Waiting…" when refused) and single byte ranges (`206`), with an explicit `Content-Length`.
+- **Updating from the app (1.1.5):** the iPhone app asks its gateway for updates like the other apps (a device-authenticated `update_query` for `ios`). The gateway answers with the version of the iPhone app it serves and an install link bound to the device, valid an hour. The app offers the update when that version is newer, and opens the link: iOS asks the user, closes the app and installs over it, keeping its data (same bundle ID and team). iOS checks Apple's signature and that the build is for this iPhone; the app accepts only an `itms-services` link to an HTTPS manifest. Needs the iPhone app integration and the portal's public address on that gateway.
 - **Older iPhones:** the portal's pages work in Safari on iOS 12 (the iPhone 6's last): a `replaceChildren` fallback, no `?.`, a clipboard fallback. Registering works there too; the app itself needs iOS 16.
 - **Portal routes:** these are its only additions. The token-carrying routes need no session; everything else needs a signed-in user.
 

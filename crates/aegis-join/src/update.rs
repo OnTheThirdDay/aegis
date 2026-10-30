@@ -169,6 +169,45 @@ pub async fn check(
     Ok(update.acceptable(platform, current).ok().map(|()| update))
 }
 
+/// A newer iPhone app the gateway serves (ADR-0019). It installs like the
+/// first install, through iOS: `install` is the `itms-services` link iOS
+/// opens, and iOS itself checks Apple's signature, that the build is for
+/// this iPhone and that it comes from the same team as the installed app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IosOffer {
+    pub version: String,
+    pub install: String,
+}
+
+/// An install link iOS can open: a manifest over HTTPS.
+fn install_link_ok(link: &str) -> bool {
+    link.len() <= 2048
+        && link.starts_with("itms-services://?action=download-manifest&url=https%3A%2F%2F")
+        && link.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Ask the gateway for an iPhone app newer than `current`.
+pub async fn check_ios(dir: &DeviceDir, current: &str) -> Result<Option<IosOffer>, JoinError> {
+    let (url, edge, cert) = request(dir)?;
+    let body = json!({"certificate_pem": cert, "update_query": {"platform": "ios"}});
+    let (status, bytes) = http::post_json(&url, &edge, &body).await?;
+    if status != 200 {
+        return Err(rejected(status, &bytes));
+    }
+    let response: Value =
+        serde_json::from_slice(&bytes).map_err(|_| JoinError::Untrusted("malformed response"))?;
+    Ok(ios_offer(&response["ios"], current))
+}
+
+fn ios_offer(v: &Value, current: &str) -> Option<IosOffer> {
+    let version = v["version"].as_str()?;
+    let install = v["install"].as_str()?;
+    (newer(version, current) && install_link_ok(install)).then(|| IosOffer {
+        version: version.to_owned(),
+        install: install.to_owned(),
+    })
+}
+
 /// Download `update` to `dest`, in pieces, checking its size and SHA-256.
 /// A partial download (`dest` + `.part`) is resumed. `dest` exists only
 /// once the whole file matched.
@@ -231,6 +270,33 @@ pub async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iphone_offers_must_be_newer_and_install_from_https() {
+        let link = "itms-services://?action=download-manifest&url=https%3A%2F%2Fgw.example.test%2Fportal%2Fapi%2Fv1%2Fios%2Fmanifest%2Ft";
+        let offer = |version: &str, install: &str| {
+            ios_offer(&json!({"version": version, "install": install}), "1.1.4")
+        };
+        assert_eq!(
+            offer("1.1.5", link),
+            Some(IosOffer {
+                version: "1.1.5".into(),
+                install: link.into()
+            })
+        );
+        assert_eq!(offer("1.1.4", link), None, "not newer");
+        assert_eq!(offer("1.1.3", link), None, "older");
+        assert_eq!(offer("1.1.5", "https://gw.example.test/app.ipa"), None);
+        assert_eq!(
+            offer(
+                "1.1.5",
+                "itms-services://?action=download-manifest&url=http%3A%2F%2Fgw"
+            ),
+            None,
+            "plain HTTP"
+        );
+        assert_eq!(ios_offer(&Value::Null, "1.1.4"), None);
+    }
 
     /// Signed with `openssl pkeyutl -sign -rawin` and a throwaway key, as
     /// the release workflow signs (.github/scripts/sign-updates.sh).
