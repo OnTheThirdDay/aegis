@@ -18,6 +18,9 @@ char *aegis_select(const char *dir, const char *id);
 char *aegis_forget(const char *dir, const char *id);
 /// How the packet tunnel sets up its interface: addresses, routes, DNS, MTU.
 char *aegis_vpn_config(void);
+/// Before the tunnel's settings apply: look up the gateway's names (the VPN
+/// answers them with their real addresses). Blocks.
+char *aegis_prepare_tunnel(const char *dir);
 /// Connect on this process's packet tunnel interface (the extension).
 char *aegis_start_tunnel(const char *dir);
 /// Disconnect. Blocks until stopped.

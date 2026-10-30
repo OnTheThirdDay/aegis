@@ -318,7 +318,7 @@ pub(crate) async fn reach(dir: &DeviceDir, sink: &DiagnosticSink) {
 }
 
 /// Host and port of a `wss://host[:port]/…` address (443 by default).
-fn host_port(url: &str) -> (String, u16) {
+pub(crate) fn host_port(url: &str) -> (String, u16) {
     let authority = crate::host_of(url);
     let (host, port) = match authority.strip_prefix('[') {
         Some(v6) => match v6.split_once("]:") {

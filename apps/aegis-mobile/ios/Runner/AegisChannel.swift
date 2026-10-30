@@ -49,6 +49,12 @@ final class AegisChannel {
     static let ok = #"{"ok":true}"#
 
     func register(messenger: FlutterBinaryMessenger) {
+        // iPhones sold in mainland China ask whether an app may use the
+        // network the first time it uses Apple's networking; the core's own
+        // sockets never trigger the question and fail until it's allowed.
+        if let url = URL(string: "https://captive.apple.com/hotspot-detect.html") {
+            URLSession.shared.dataTask(with: url) { _, _, _ in }.resume()
+        }
         let channel = FlutterMethodChannel(name: "aegisborne/client", binaryMessenger: messenger)
         channel.setMethodCallHandler { [weak self] call, result in
             self?.handle(call, result)
