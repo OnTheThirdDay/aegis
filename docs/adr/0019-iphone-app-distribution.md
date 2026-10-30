@@ -30,6 +30,7 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 
 - **Settings:** the repository, a GitHub token (fine-grained, that repository only, Contents read and write) and the app key. The token and key go in the gateway's secret store.
 - **Fetching:** every 10 minutes, and on demand, the gateway checks the latest release's asset. When it changed (a new release or a re-signed build), it downloads it, decrypts it and keeps it as `ios/app.ipa`. Fetching always runs in the background: the console never waits on GitHub, which can be slow or blocked, and calls to GitHub's API that the console does wait on (approving) give up after 20 seconds.
+- **Ready to install:** after each fetch the gateway reads which iPhones the app installs on (the UDIDs in the provisioning profiles inside it, the app's and its extension's). An approved iPhone shows as **ready to install** once it's among them; until then it's **preparing**, and after 30 minutes **delayed** (the workflow likely failed). While an iPhone is preparing, the gateway checks GitHub every minute instead of every 10.
 - **Through another gateway (optional):** a gateway that can't reach GitHub directly (GitHub's downloads are blocked in places, such as mainland China) reaches it through one of the owner's other gateways.
   - It joins that gateway as a device, with an invitation created there (pasted under **Reach GitHub through another gateway**).
   - Its GitHub requests then go through a built-in client: a local HTTP proxy into the tunnel, started when first needed. Nothing else of its traffic changes.
@@ -43,7 +44,7 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 - **Register this iPhone:**
   - A registration profile (`register.mobileconfig`, Apple's "Profile Service") whose link carries a one-time token, tied to the user, valid 30 minutes.
   - iOS posts the iPhone's UDID, model, iOS version and name back to that link. The gateway reads them from the plist inside the signed post and records a request.
-  - Safari returns to the portal, which says the request is waiting for approval.
+  - Safari returns to the portal, which shows the iPhone's progress: waiting for approval, preparing the app, ready to install. The card updates by itself every 30 seconds while the iPhone waits, and Install is the main button once it's ready.
 - **Install:**
   - An `itms-services://` link to a manifest. iOS fetches the manifest and the app itself, without the user's session, so both links carry a token valid for an hour.
   - The links use the portal's public address, which needs a publicly trusted certificate (Cloudflare Tunnel or Let's Encrypt).
@@ -55,7 +56,7 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 - **Adding a friend:**
   1. The friend presses Register in the portal.
   2. The administrator presses Approve in that gateway's console.
-  3. Within minutes every gateway serves an app that installs on that iPhone, and the friend presses Install.
+  3. Within minutes every gateway serves an app that installs on that iPhone. The friend's portal shows **ready to install**, and they press Install.
 - **Removed or replaced iPhones** still use one of the 100 yearly slots until the membership year renews.
 - **A gateway's GitHub token** can read the repository's releases and start its workflows. Anyone with the token could register an iPhone (using a slot), but not obtain the Apple key or certificate.
 - **The app key decrypts the app and nothing else.** Rotating it means a new secret, a new release, and the new key on each gateway.
