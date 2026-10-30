@@ -29,7 +29,8 @@ Without help, adding a friend meant reading the UDID with a third-party site, re
 **Each gateway (`integrations/ios.rs`, console: Integrations → iPhone app)**
 
 - **Settings:** the repository, a GitHub token (fine-grained, that repository only, Contents read and write) and the app key. The token and key go in the gateway's secret store.
-- **Fetching:** every 10 minutes, and on demand, the gateway checks the latest release's asset. When it changed (a new release or a re-signed build), it downloads it, decrypts it and keeps it as `ios/app.ipa`.
+- **Fetching:** every 10 minutes, and on demand, the gateway checks the latest release's asset. When it changed (a new release or a re-signed build), it downloads it, decrypts it and keeps it as `ios/app.ipa`. Fetching always runs in the background: the console never waits on GitHub, which can be slow or blocked, and calls to GitHub's API that the console does wait on (approving) give up after 20 seconds.
+- **Proxy (optional):** a gateway that can't reach GitHub directly (GitHub's downloads are blocked in places, such as mainland China) uses an `http://host:port` proxy for its GitHub requests. Friends' iPhones never contact GitHub either way: they reach only their gateway.
 - **Requests:** users' iPhone requests, which the administrator approves (this starts the workflow) or removes. Up to 500 are kept; the same iPhone keeps one request.
 
 **The user portal (Devices → iPhone app; `handlers/ios.rs`)**

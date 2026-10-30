@@ -19,7 +19,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 pub const ID: &str = "ios";
@@ -35,6 +36,9 @@ const AAD: &[u8] = b"aegisborne-ipa/1";
 const MAX_BYTES: u64 = 400 * 1024 * 1024;
 /// Requests kept (pending, approved or failed).
 const MAX_REQUESTS: usize = 500;
+/// GitHub's API, while the console waits (under the gateway's 30-second
+/// idle limit): reading the latest release, starting the workflow.
+const API_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn err(status: u16, code: impl Into<String>) -> (u16, String) {
     (status, code.into())
@@ -44,6 +48,10 @@ fn err(status: u16, code: impl Into<String>) -> (u16, String) {
 struct Settings {
     /// `owner/name` of the repository whose releases carry the app.
     repository: Option<String>,
+    /// An HTTP proxy for GitHub (`http://host:port`), for a gateway that
+    /// can't reach it directly (GitHub's downloads are blocked in places).
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -77,6 +85,22 @@ pub struct IosIntegration {
     /// Serialises changes to the files in `dir`.
     files: Mutex<()>,
     last_error: Mutex<Option<String>>,
+    /// A fetch runs in the background; one at a time.
+    fetching: AtomicBool,
+}
+
+/// An `http://host:port` proxy (no path, no credentials in the clear).
+fn valid_proxy(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("http://") else {
+        return false;
+    };
+    let rest = rest.trim_end_matches('/');
+    !rest.is_empty()
+        && rest.len() <= 255
+        && !rest.contains(['/', '@', '?', '#', ' '])
+        && rest
+            .rsplit_once(':')
+            .is_some_and(|(h, port)| !h.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
 }
 
 /// An iPhone UDID: 40 hex digits (older models) or `XXXXXXXX-XXXXXXXXXXXXXXXX`.
@@ -126,6 +150,7 @@ impl IosIntegration {
             dir,
             files: Mutex::new(()),
             last_error: Mutex::new(None),
+            fetching: AtomicBool::new(false),
         }
     }
 
@@ -187,7 +212,9 @@ impl IosIntegration {
             "description": "Ad Hoc builds of the iPhone app for registered iPhones: users register their iPhone in the portal, you approve it here, and they install the app from the portal.",
             "enabled": configured,
             "state": if !configured { "off" } else if error.is_some() { "error" } else if app_ready { "active" } else { "pending" },
+            "fetching": self.fetching.load(Ordering::Relaxed),
             "repository": settings.repository,
+            "proxy": settings.proxy,
             "has_token": self.secret(TOKEN).is_some(),
             "has_key": self.secret(KEY).is_some(),
             "app": if app_ready { serde_json::to_value(&fetched).unwrap_or(Value::Null) } else { Value::Null },
@@ -196,26 +223,38 @@ impl IosIntegration {
         })
     }
 
-    /// `{repository?, token?, key?}`: the repository whose releases carry
-    /// the app, a GitHub token that can read its releases and start its
-    /// workflows, and the app's decryption key (base64, 32 bytes).
-    pub async fn configure(&self, actor: &str, body: Value) -> Result<Value, (u16, String)> {
+    /// `{repository?, proxy?, token?, key?}`: the repository whose releases
+    /// carry the app, an HTTP proxy for GitHub ("" for none), a GitHub token
+    /// that can read its releases and start its workflows, and the app's
+    /// decryption key (base64, 32 bytes). Then fetches the app in the
+    /// background.
+    pub async fn configure(
+        self: &Arc<Self>,
+        actor: &str,
+        body: Value,
+    ) -> Result<Value, (u16, String)> {
         let app = self
             .app
             .upgrade()
             .ok_or_else(|| err(503, "appliance_unavailable"))?;
-        if let Some(r) = body.get("repository").and_then(Value::as_str) {
-            let r = r.trim();
-            if !valid_repository(r) {
-                return Err(err(400, "the repository must look like owner/name"));
-            }
+        {
             let _guard = self.files.lock().unwrap_or_else(|e| e.into_inner());
-            self.save(
-                "settings.json",
-                &Settings {
-                    repository: Some(r.to_owned()),
-                },
-            )?;
+            let mut settings: Settings = self.load("settings.json");
+            if let Some(r) = body.get("repository").and_then(Value::as_str) {
+                let r = r.trim();
+                if !valid_repository(r) {
+                    return Err(err(400, "the repository must look like owner/name"));
+                }
+                settings.repository = Some(r.to_owned());
+            }
+            if let Some(p) = body.get("proxy").and_then(Value::as_str) {
+                let p = p.trim();
+                if !p.is_empty() && !valid_proxy(p) {
+                    return Err(err(400, "the proxy must look like http://host:port"));
+                }
+                settings.proxy = (!p.is_empty()).then(|| p.trim_end_matches('/').to_owned());
+            }
+            self.save("settings.json", &settings)?;
         }
         if let Some(t) = body.get("token").and_then(Value::as_str).map(str::trim) {
             if t.is_empty() || t.len() > 512 || !t.bytes().all(|b| b.is_ascii_graphic()) {
@@ -233,15 +272,37 @@ impl IosIntegration {
             app.secrets.put(KEY, k, true).map_err(|e| err(500, e.0))?;
         }
         self.audit(actor, "ios.configured", json!({}));
-        let fetched = self.fetch().await;
-        Ok(json!({ "fetched": fetched.is_ok(), "status": self.status() }))
+        self.set_error(None);
+        let started = self.start_fetch();
+        Ok(json!({ "fetching": started, "status": self.status() }))
     }
 
-    fn client() -> Result<reqwest::Client, (u16, String)> {
-        reqwest::Client::builder()
+    /// Fetch in the background (the console never waits on GitHub, which can
+    /// be slow or blocked). False when one is already running.
+    pub fn start_fetch(self: &Arc<Self>) -> bool {
+        if self.fetching.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = me.fetch_now().await;
+            me.fetching.store(false, Ordering::Release);
+        });
+        true
+    }
+
+    /// For GitHub: through the configured proxy, if any.
+    fn client(&self) -> Result<reqwest::Client, (u16, String)> {
+        let settings: Settings = self.load("settings.json");
+        let mut builder = reqwest::Client::builder()
             .user_agent(concat!("aegisborne/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(600));
+        if let Some(p) = settings.proxy {
+            builder = builder
+                .proxy(reqwest::Proxy::all(&p).map_err(|e| err(400, format!("proxy {p}: {e}")))?);
+        }
+        builder
             .build()
             .map_err(|e| err(500, format!("HTTP client: {e}")))
     }
@@ -259,13 +320,20 @@ impl IosIntegration {
 
     /// Fetch the latest release's app when it changed (new release, or
     /// re-signed for a new iPhone). Quiet when not configured.
-    pub async fn poll(&self) {
+    pub async fn poll(self: &Arc<Self>) {
         if self.github().is_ok() && self.secret(KEY).is_some() {
-            let _ = self.fetch().await;
+            self.start_fetch();
         }
     }
 
-    pub async fn fetch(&self) -> Result<Value, (u16, String)> {
+    /// "Check GitHub now": starts a fetch; the status shows the outcome.
+    pub fn fetch(self: &Arc<Self>) -> Result<Value, (u16, String)> {
+        self.github()?;
+        let started = self.start_fetch();
+        Ok(json!({ "fetching": true, "started": started }))
+    }
+
+    async fn fetch_now(&self) -> Result<Value, (u16, String)> {
         let result = self.fetch_inner().await;
         self.set_error(result.as_ref().err().map(|e| e.1.clone()));
         result
@@ -279,11 +347,12 @@ impl IosIntegration {
         let key = base64::engine::general_purpose::STANDARD
             .decode(key)
             .map_err(|_| err(409, "the stored app key is not base64"))?;
-        let client = Self::client()?;
+        let client = self.client()?;
         let body = client
             .get(format!(
                 "https://api.github.com/repos/{repo}/releases/latest"
             ))
+            .timeout(API_TIMEOUT)
             .bearer_auth(&token)
             .header("Accept", "application/vnd.github+json")
             .send()
@@ -445,8 +514,10 @@ impl IosIntegration {
             .find(|r| r.id == id)
             .ok_or_else(|| err(404, "no such request"))?;
         let (repo, token) = self.github()?;
-        let response = Self::client()?
+        let response = self
+            .client()?
             .post(format!("https://api.github.com/repos/{repo}/dispatches"))
+            .timeout(API_TIMEOUT)
             .bearer_auth(&token)
             .header("Accept", "application/vnd.github+json")
             .header("Content-Type", "application/json")
@@ -459,7 +530,7 @@ impl IosIntegration {
             )
             .send()
             .await
-            .map_err(|e| err(502, format!("GitHub: {e}")))?;
+            .map_err(|e| err(502, format!("Could not reach GitHub ({e}). If this server can't reach it directly, set a proxy.")))?;
         let ok = response.status().is_success();
         let message = if ok {
             "Sent to GitHub: the iPhone is registered and the app re-signed within a few minutes."
@@ -506,6 +577,17 @@ impl IosIntegration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxies() {
+        assert!(valid_proxy("http://127.0.0.1:10809"));
+        assert!(valid_proxy("http://proxy.lan:8080/"));
+        assert!(!valid_proxy("https://proxy:8080"));
+        assert!(!valid_proxy("http://user:pass@proxy:8080"));
+        assert!(!valid_proxy("http://proxy"));
+        assert!(!valid_proxy("http://proxy:0"));
+        assert!(!valid_proxy("socks5://proxy:1080"));
+    }
 
     #[test]
     fn udids_and_repositories() {

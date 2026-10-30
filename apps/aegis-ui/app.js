@@ -666,23 +666,24 @@ async function iphoneCard() {
 /** The console's side: GitHub settings and iPhones waiting for approval. */
 function iosCard(/** @type {any} */ i) {
   const repo = /** @type {HTMLInputElement} */ (el("input", { value: i.repository || "", placeholder: "owner/name", autocomplete: "off" }));
+  const proxy = /** @type {HTMLInputElement} */ (el("input", { value: i.proxy || "", placeholder: "http://host:port (optional)", autocomplete: "off" }));
   const token = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_token ? "saved — leave empty to keep it" : "GitHub token" }));
   const key = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_key ? "saved — leave empty to keep it" : "base64 (the AEGIS_IOS_APP_KEY secret)" }));
   const save = button("Save");
   busy(save, async () => {
     /** @type {Record<string, string>} */
-    const body = { repository: repo.value.trim() };
+    const body = { repository: repo.value.trim(), proxy: proxy.value.trim() };
     if (token.value.trim()) body.token = token.value.trim();
     if (key.value.trim()) body.key = key.value.trim();
-    const { data } = await api("POST", "/integrations/ios/configure", { body });
-    notice(data.fetched ? "Saved. The iPhone app was fetched from GitHub." : "Saved. " + (data.status.error || "The app isn't on GitHub yet."), !data.fetched);
-    setTimeout(() => view("integrations"), 700);
+    await api("POST", "/integrations/ios/configure", { body });
+    notice("Saved. Fetching the app from GitHub in the background; this page shows the result.");
+    setTimeout(() => view("integrations"), 4000);
   });
   const check = button("Check GitHub now", "ghost");
   busy(check, async () => {
-    const { data } = await api("POST", "/integrations/ios/fetch", { body: {} });
-    notice(data.changed ? "Fetched AegisBorne " + data.version + "." : "Already up to date (" + data.version + ").");
-    setTimeout(() => view("integrations"), 700);
+    await api("POST", "/integrations/ios/fetch", { body: {} });
+    notice("Checking GitHub in the background; this page shows the result.");
+    setTimeout(() => view("integrations"), 4000);
   });
   const rows = (i.requests || []).map((/** @type {any} */ r) => {
     const approve = button(r.state === "failed" ? "Retry" : "Approve", "small");
@@ -707,12 +708,14 @@ function iosCard(/** @type {any} */ i) {
     ]);
   });
   return el("section", { class: "card integration" }, [
-    el("div", { class: "row spread" }, [el("h2", {}, [i.name]), pill(i.state)]),
+    el("div", { class: "row spread" }, [el("h2", {}, [i.name]), pill(i.fetching ? "fetching…" : i.state)]),
     el("p", { class: "muted" }, [i.description]),
+    i.fetching ? el("p", { class: "muted" }, ["Fetching the app from GitHub… (refresh this page to see the result)"]) : null,
     i.app ? el("p", {}, ["App on this server: AegisBorne " + i.app.version + " (" + fmtBytes(i.app.size) + "), fetched " + new Date(i.app.fetched_at * 1000).toLocaleString() + "."]) : null,
     i.error ? el("p", { class: "err-text" }, [i.error]) : null,
     el("div", { class: "cols" }, [
       field("GitHub repository", repo, "Whose releases carry the app."),
+      field("Proxy for GitHub", proxy, "Only if this server can't reach GitHub directly (GitHub's downloads are blocked in some countries): an HTTP proxy that can, e.g. http://127.0.0.1:10809. Leave empty otherwise."),
       field("GitHub token", token, "Fine-grained, this repository only: Contents read and write (reads releases, starts the iPhone workflow)."),
       field("App key", key, "Decrypts the app: the repository's AEGIS_IOS_APP_KEY."),
     ]),
