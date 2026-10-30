@@ -92,32 +92,38 @@ fn nanos(ms: u64) -> String {
     (u128::from(ms) * 1_000_000).to_string()
 }
 
+fn log_record(rec: &Record) -> Value {
+    let mut a = vec![kv("event.name", s(&rec.code))];
+    a.extend(
+        rec.attrs
+            .iter()
+            .map(|(k, v)| kv(&format!("aegis.{k}"), s(v))),
+    );
+    if rec.repeat > 1 {
+        a.push(kv("aegis.repeat", i(rec.repeat)));
+    }
+    json!({
+        "timeUnixNano": nanos(rec.time_unix_ms),
+        "severityNumber": rec.severity.number(),
+        "severityText": rec.severity.as_str(),
+        "body": s(&rec.code),
+        "attributes": a,
+    })
+}
+
 impl Report {
     /// One `resourceLogs` entry.
     pub fn to_otlp_resource(&self) -> Value {
+        let mut records: Vec<Value> = self.recording.records.iter().map(log_record).collect();
+        records.push(self.summary_record());
+        let mut resource = self.resource_head();
+        resource["scopeLogs"][0]["logRecords"] = Value::Array(records);
+        resource
+    }
+
+    /// The summary log record: counts per event kind and dropped records.
+    fn summary_record(&self) -> Value {
         let r = &self.recording;
-        let mut records: Vec<Value> = r
-            .records
-            .iter()
-            .map(|rec| {
-                let mut a = vec![kv("event.name", s(&rec.code))];
-                a.extend(
-                    rec.attrs
-                        .iter()
-                        .map(|(k, v)| kv(&format!("aegis.{k}"), s(v))),
-                );
-                if rec.repeat > 1 {
-                    a.push(kv("aegis.repeat", i(rec.repeat)));
-                }
-                json!({
-                    "timeUnixNano": nanos(rec.time_unix_ms),
-                    "severityNumber": rec.severity.number(),
-                    "severityText": rec.severity.as_str(),
-                    "body": s(&rec.code),
-                    "attributes": a,
-                })
-            })
-            .collect();
         let mut summary = vec![
             kv("event.name", s(SUMMARY)),
             kv("aegis.dropped", i(r.dropped)),
@@ -127,13 +133,18 @@ impl Report {
                 .iter()
                 .map(|(k, n)| kv(&format!("aegis.count.{k}"), i(*n))),
         );
-        records.push(json!({
+        json!({
             "timeUnixNano": nanos(r.ended_unix_ms),
             "severityNumber": Severity::Info.number(),
             "severityText": Severity::Info.as_str(),
             "body": s(SUMMARY),
             "attributes": summary,
-        }));
+        })
+    }
+
+    /// The resource, with an empty `logRecords`.
+    fn resource_head(&self) -> Value {
+        let r = &self.recording;
         let service = match self.role {
             Role::Gateway => "aegisd",
             Role::Client => "aegis-client",
@@ -149,9 +160,28 @@ impl Report {
             ]},
             "scopeLogs": [{
                 "scope": { "name": SCOPE, "version": "1" },
-                "logRecords": records,
+                "logRecords": [],
             }],
         })
+    }
+
+    /// The OTLP/JSON document of [`to_otlp`](Self::to_otlp), written record
+    /// by record (without building the whole document in memory).
+    fn write_otlp(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        let head = self.resource_head().to_string();
+        // The head ends with the empty array: `…"logRecords":[]}]}`.
+        let open = head
+            .rfind("[]")
+            .ok_or_else(|| std::io::Error::other("unexpected resource layout"))?;
+        out.write_all(b"{\"resourceLogs\":[")?;
+        out.write_all(&head.as_bytes()[..=open])?;
+        for rec in &self.recording.records {
+            serde_json::to_writer(&mut *out, &log_record(rec))?;
+            out.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut *out, &self.summary_record())?;
+        out.write_all(&head.as_bytes()[open + 1..])?;
+        out.write_all(b"]}")
     }
 
     pub fn to_otlp(&self) -> Value {
@@ -264,13 +294,13 @@ impl Report {
     /// compressed size fits in `max`.
     pub fn to_gzip(&mut self, max: usize) -> Vec<u8> {
         use flate2::{write::GzEncoder, Compression};
-        use std::io::Write;
         loop {
-            let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-            let body = self.to_otlp().to_string();
-            let out = gz
-                .write_all(body.as_bytes())
-                .and_then(|()| gz.finish())
+            let mut gz =
+                std::io::BufWriter::new(GzEncoder::new(Vec::new(), Compression::default()));
+            let out = self
+                .write_otlp(&mut gz)
+                .and_then(|()| gz.into_inner().map_err(|e| e.into_error()))
+                .and_then(|gz| gz.finish())
                 .unwrap_or_default();
             if out.len() <= max || self.recording.records.is_empty() {
                 return out;
@@ -396,6 +426,24 @@ mod tests {
         assert_eq!(rec["severityNumber"], 13);
         let back = Report::from_otlp(&doc).expect("parse");
         assert_eq!(back, vec![r]);
+    }
+
+    #[test]
+    fn streamed_document_matches_the_built_one() {
+        let mut r = sample();
+        let mut out = Vec::new();
+        r.write_otlp(&mut out).expect("write");
+        let streamed: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(streamed, r.to_otlp());
+        r.recording.records.clear();
+        let mut out = Vec::new();
+        r.write_otlp(&mut out).expect("write");
+        let streamed: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(streamed, r.to_otlp());
+        assert_eq!(
+            Report::from_gzip(&r.to_gzip(usize::MAX)).expect("gzip"),
+            vec![r]
+        );
     }
 
     #[test]

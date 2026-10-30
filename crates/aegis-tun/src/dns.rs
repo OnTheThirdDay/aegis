@@ -8,12 +8,13 @@
 //! answer, which keeps apps on the IPv4 addresses this pool hands out.
 //!
 //! A few names can be pinned to their real addresses instead
-//! ([`FakeDns::pin`]): on a desktop the client node itself resolves the
-//! gateway through the system resolver, which the VPN answers, and must
-//! reach the real gateway, whose addresses stay off the VPN.
+//! ([`FakeDns::pin`], and [`FakeDns::pin6`] for `AAAA`): on a desktop the
+//! client node itself resolves the gateway through the system resolver,
+//! which the VPN answers, and must reach the real gateway, whose addresses
+//! stay off the VPN.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// The pool: 198.18.0.0/15 (benchmarking range, never a real destination).
 const POOL_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
@@ -24,8 +25,12 @@ pub const SERVER: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 const FIRST: u32 = 2;
 /// Answer TTL: short enough that a recycled address is rarely still cached.
 const TTL: u32 = 120;
+/// For pinned names: their addresses may be replaced while the VPN runs
+/// (a phone's gateway, see `aegis_mobile::resolve`).
+const PINNED_TTL: u32 = 10;
 
 const TYPE_A: u16 = 1;
+const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
 /// Name ⇄ pool address mapping. Addresses are handed out in turn; once the
@@ -35,6 +40,7 @@ pub struct FakeDns {
     by_ip: HashMap<Ipv4Addr, String>,
     next: u32,
     pinned: HashMap<String, Vec<Ipv4Addr>>,
+    pinned6: HashMap<String, Vec<Ipv6Addr>>,
 }
 
 impl Default for FakeDns {
@@ -44,6 +50,7 @@ impl Default for FakeDns {
             by_ip: HashMap::new(),
             next: FIRST,
             pinned: HashMap::new(),
+            pinned6: HashMap::new(),
         }
     }
 }
@@ -80,23 +87,71 @@ impl FakeDns {
     /// Answer `name` with these real addresses from now on (an empty list
     /// gives an empty answer).
     pub fn pin(&mut self, name: &str, addrs: Vec<Ipv4Addr>) {
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
-        self.pinned.insert(name, addrs);
+        self.pinned.insert(pin_key(name), addrs);
+    }
+
+    /// Answer `AAAA` queries for `name` with these real addresses (the
+    /// name's `A` queries get only what [`pin`](Self::pin) gave, if any).
+    pub fn pin6(&mut self, name: &str, addrs: Vec<Ipv6Addr>) {
+        self.pinned6.insert(pin_key(name), addrs);
+    }
+
+    /// The names pinned with [`pin6`](Self::pin6) and their addresses.
+    pub fn pins6(&self) -> Vec<(String, Vec<Ipv6Addr>)> {
+        let mut pins: Vec<_> = self
+            .pinned6
+            .iter()
+            .map(|(n, a)| (n.clone(), a.clone()))
+            .collect();
+        pins.sort();
+        pins
+    }
+
+    /// The pinned names and their addresses.
+    pub fn pins(&self) -> Vec<(String, Vec<Ipv4Addr>)> {
+        let mut pins: Vec<_> = self
+            .pinned
+            .iter()
+            .map(|(n, a)| (n.clone(), a.clone()))
+            .collect();
+        pins.sort();
+        pins
     }
 
     /// Answer one DNS query packet (UDP payload). `None` for packets that
     /// aren't a single standard query, which are dropped.
     pub fn answer(&mut self, query: &[u8]) -> Option<Vec<u8>> {
         let q = Question::parse(query)?;
-        let ips = if q.qtype != TYPE_A || q.qclass != CLASS_IN {
-            Vec::new()
-        } else if let Some(real) = self.pinned.get(&q.name) {
-            real.clone()
-        } else {
-            vec![self.address_for(&q.name)]
+        let pinned = self.pinned.contains_key(&q.name) || self.pinned6.contains_key(&q.name);
+        let ttl = if pinned { PINNED_TTL } else { TTL };
+        let records: Vec<(u16, Vec<u8>)> = match (q.qtype, q.qclass) {
+            (TYPE_A, CLASS_IN) if pinned => self
+                .pinned
+                .get(&q.name)
+                .map(|ips| {
+                    ips.iter()
+                        .map(|ip| (TYPE_A, ip.octets().to_vec()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            (TYPE_A, CLASS_IN) => vec![(TYPE_A, self.address_for(&q.name).octets().to_vec())],
+            (TYPE_AAAA, CLASS_IN) => self
+                .pinned6
+                .get(&q.name)
+                .map(|ips| {
+                    ips.iter()
+                        .map(|ip| (TYPE_AAAA, ip.octets().to_vec()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
         };
-        Some(q.response(query, &ips))
+        Some(q.response(query, &records, ttl))
     }
+}
+
+fn pin_key(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// The question of a standard query.
@@ -155,27 +210,27 @@ impl Question {
         })
     }
 
-    /// The response: the query's ID, RD and question, and an `A` record
-    /// for each of `ips` (at most 16).
-    fn response(&self, query: &[u8], ips: &[Ipv4Addr]) -> Vec<u8> {
-        let ips = &ips[..ips.len().min(16)];
-        let mut r = Vec::with_capacity(self.end + 16 * ips.len());
+    /// The response: the query's ID, RD and question, and the `records`
+    /// (type, data; at most 16).
+    fn response(&self, query: &[u8], records: &[(u16, Vec<u8>)], ttl: u32) -> Vec<u8> {
+        let records = &records[..records.len().min(16)];
+        let mut r = Vec::with_capacity(self.end + 28 * records.len());
         r.extend_from_slice(&query[0..2]);
         let rd = query[2] & 0x01;
         // QR, RD copied, RA; NOERROR.
         r.extend_from_slice(&[0x80 | rd, 0x80]);
         r.extend_from_slice(&1u16.to_be_bytes());
-        r.extend_from_slice(&(ips.len() as u16).to_be_bytes());
+        r.extend_from_slice(&(records.len() as u16).to_be_bytes());
         r.extend_from_slice(&[0, 0, 0, 0]);
         r.extend_from_slice(&query[12..self.end]);
-        for ip in ips {
+        for (rtype, data) in records {
             // Name: pointer to the question's name at offset 12.
             r.extend_from_slice(&[0xC0, 0x0C]);
-            r.extend_from_slice(&TYPE_A.to_be_bytes());
+            r.extend_from_slice(&rtype.to_be_bytes());
             r.extend_from_slice(&CLASS_IN.to_be_bytes());
-            r.extend_from_slice(&TTL.to_be_bytes());
-            r.extend_from_slice(&4u16.to_be_bytes());
-            r.extend_from_slice(&ip.octets());
+            r.extend_from_slice(&ttl.to_be_bytes());
+            r.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            r.extend_from_slice(data);
         }
         r
     }
@@ -249,6 +304,26 @@ mod tests {
         assert!(dns.by_name.is_empty(), "no pool address used");
         let r = dns.answer(&query(9, "gw.example.com", 28)).expect("answer");
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "no AAAA");
+        // With IPv6 pinned too: AAAA answers, with the short TTL.
+        let v6: Ipv6Addr = "2606:4700:3034::6815:4f8".parse().expect("v6");
+        dns.pin6("gw.example.com", vec![v6]);
+        let r = dns.answer(&query(9, "gw.example.com", 28)).expect("answer");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "one AAAA");
+        assert_eq!(&r[r.len() - 16..], &v6.octets());
+        let rdata_len = &r[r.len() - 18..r.len() - 16];
+        assert_eq!(rdata_len, &[0, 16]);
+        let ttl = &r[r.len() - 22..r.len() - 18];
+        assert_eq!(ttl, &PINNED_TTL.to_be_bytes());
+        // A name pinned for IPv6 only gets no pool address for A.
+        dns.pin6("v6only.example.com", vec![v6]);
+        let r = dns
+            .answer(&query(9, "v6only.example.com", 1))
+            .expect("answer");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0);
+        assert!(dns.by_name.is_empty());
+        // Other names still get no AAAA.
+        let r = dns.answer(&query(9, "example.org", 28)).expect("answer");
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0);
     }
 
     #[test]

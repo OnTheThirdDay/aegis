@@ -294,6 +294,12 @@ impl Tunnel {
             self.note_failure("websocket", kind, ReasonGroup::Transport, &e);
             ReasonGroup::Transport
         })?;
+        // Whether the gateway agreed to padded framing: a report then tells
+        // whether padding was involved in a failure.
+        if let Some(d) = self.obs.diagnostics().filter(|d| d.is_recording()) {
+            let padded = if ws.is_padded() { "true" } else { "false" };
+            d.note(Severity::Info, "client.websocket", &[("padded", padded)]);
+        }
         let (tls_stream, gateway) = tls::connect(
             Arc::clone(&self.tls),
             &self.server_name,

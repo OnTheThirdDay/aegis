@@ -66,6 +66,11 @@ Until now the gateway had an IPC-only, 15-minute, coded event ring. Devices had 
      - recordings that don't overlap.
    - It also says when a side is missing, and "No problems found" when nothing points to a failure.
 
+**Phones (1.1.8):**
+- A recording holds at most 1 MB (5 MB elsewhere): an iPhone's VPN extension may use about 50 MB in all, the held records take several times their accounted size, and a report is built from a copy of them. Reports are written to gzip record by record instead of from one JSON document in memory (which peaked at hundreds of MB for a full 5 MB recording).
+- A recording belongs to the server selected when it started: it is saved under that server's device name and sent to that server, even after switching servers.
+- iOS shares the report an earlier extension saved when the running one recorded nothing.
+
 ## Consequences
 
 - Operators get a guided flow: start on the server, start on the device, reproduce, read the findings.

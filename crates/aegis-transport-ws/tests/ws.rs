@@ -99,3 +99,169 @@ fn url_validation() {
     assert_eq!(u.host, "::1");
     assert_eq!(u.port, 8080);
 }
+
+#[tokio::test]
+async fn new_ends_pad() {
+    // Both ends new: padded, and bytes still arrive in order.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let ws = accept(tcp, &WsServerConfig::default())
+            .await
+            .expect("upgrade");
+        assert!(ws.is_padded());
+        let (mut r, mut w) = tokio::io::split(ws);
+        tokio::io::copy(&mut r, &mut w).await.expect("echo");
+        w.shutdown().await.expect("close");
+    });
+    let ws = connect(&client(format!("ws://127.0.0.1:{port}/agp")))
+        .await
+        .expect("connect");
+    assert!(ws.is_padded());
+    let (mut r, mut w) = tokio::io::split(ws);
+    let data: Vec<u8> = (0..300_007u32).map(|i| (i % 249) as u8).collect();
+    let expected = data.clone();
+    let writer = tokio::spawn(async move {
+        for chunk in data.chunks(5003) {
+            w.write_all(chunk).await.expect("write");
+        }
+        w.shutdown().await.expect("close");
+    });
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).await.expect("read");
+    writer.await.expect("join");
+    assert_eq!(got, expected);
+    server.await.expect("server");
+}
+
+#[tokio::test]
+async fn a_new_client_talks_plainly_to_an_old_gateway() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let old_gateway = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.expect("upgrade");
+        let m = ws.next().await.expect("message").expect("ok");
+        assert_eq!(m, Message::Binary(b"hello".to_vec().into()), "unpadded");
+        ws.send(m).await.expect("echo");
+    });
+    let ws = connect(&client(format!("ws://127.0.0.1:{port}/agp")))
+        .await
+        .expect("connect");
+    assert!(!ws.is_padded());
+    let (mut r, mut w) = tokio::io::split(ws);
+    w.write_all(b"hello").await.expect("write");
+    w.flush().await.expect("flush");
+    let mut got = [0u8; 5];
+    r.read_exact(&mut got).await.expect("read");
+    assert_eq!(&got, b"hello");
+    old_gateway.await.expect("old gateway");
+}
+
+#[tokio::test]
+async fn an_old_client_talks_plainly_to_a_new_gateway() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let gateway = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let ws = accept(tcp, &WsServerConfig::default())
+            .await
+            .expect("upgrade");
+        assert!(!ws.is_padded());
+        let (mut r, mut w) = tokio::io::split(ws);
+        let mut got = [0u8; 5];
+        r.read_exact(&mut got).await.expect("read");
+        w.write_all(&got).await.expect("echo");
+        w.flush().await.expect("flush");
+    });
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("tcp");
+    let (mut ws, resp) = tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/agp"), tcp)
+        .await
+        .expect("old client");
+    assert!(resp
+        .headers()
+        .get(aegis_transport_ws::PADDING_HEADER)
+        .is_none());
+    ws.send(Message::Binary(b"hello".to_vec().into()))
+        .await
+        .expect("send");
+    let m = ws.next().await.expect("message").expect("ok");
+    assert_eq!(m, Message::Binary(b"hello".to_vec().into()));
+    gateway.await.expect("gateway");
+}
+
+#[tokio::test]
+async fn the_first_messages_do_not_show_the_handshake_sizes() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // A gateway that agrees to padding and records the raw messages.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let gateway = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        // The callback signature (and its large error type) is tungstenite's.
+        #[allow(clippy::result_large_err)]
+        let agree = |_: &Request, mut resp: Response| {
+            resp.headers_mut().insert(
+                aegis_transport_ws::PADDING_HEADER,
+                HeaderValue::from_static("padded-1"),
+            );
+            Ok(resp)
+        };
+        let mut ws = tokio_tungstenite::accept_hdr_async(tcp, agree)
+            .await
+            .expect("upgrade");
+        let mut sizes = Vec::new();
+        while let Some(Ok(Message::Binary(m))) = ws.next().await {
+            let payload = usize::from(u16::from_be_bytes([m[0], m[1]]));
+            sizes.push((payload, m.len()));
+        }
+        sizes
+    });
+    let ws = connect(&client(format!("ws://127.0.0.1:{port}/agp")))
+        .await
+        .expect("connect");
+    let (_r, mut w) = tokio::io::split(ws);
+    // A ClientHello-sized write, then a certificate-flight-sized one.
+    w.write_all(&[1u8; 517]).await.expect("write");
+    w.write_all(&[2u8; 4000]).await.expect("write");
+    w.shutdown().await.expect("close");
+    let sizes = gateway.await.expect("gateway");
+    assert_eq!(sizes.iter().map(|s| s.0).sum::<usize>(), 4517);
+    assert!(sizes.len() >= 4, "the 4000 bytes are split: {sizes:?}");
+    for (payload, len) in &sizes {
+        assert!(*payload <= 1400, "{sizes:?}");
+        assert!(*len >= payload + 2 + 32, "padded: {sizes:?}");
+    }
+}
+
+#[tokio::test]
+async fn every_address_of_a_name_is_tried() {
+    // `localhost` is ::1 and 127.0.0.1; only the IPv4 one listens here.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let s = aegis_transport_ws::connect_host("localhost", port, Duration::from_secs(5))
+        .await
+        .expect("connect");
+    assert!(s.peer_addr().expect("peer").is_ipv4());
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead_port = dead.local_addr().expect("addr").port();
+    drop(dead);
+    assert!(
+        aegis_transport_ws::connect_host("localhost", dead_port, Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+}

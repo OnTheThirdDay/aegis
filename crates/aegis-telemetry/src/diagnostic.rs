@@ -128,6 +128,8 @@ struct Session {
     stopped: bool,
     records: VecDeque<Record>,
     bytes: usize,
+    /// The size cap of this recording ([`MAX_BYTES`] or the sink's limit).
+    limit: usize,
     counts: BTreeMap<String, u64>,
     dropped: u64,
 }
@@ -150,7 +152,7 @@ impl Session {
             }
         }
         let size = r.approx_bytes();
-        while self.bytes + size > MAX_BYTES {
+        while self.bytes + size > self.limit {
             let Some(old) = self.records.pop_front() else {
                 break;
             };
@@ -166,6 +168,8 @@ impl Session {
 #[derive(Debug, Default)]
 pub struct DiagnosticSink {
     state: Mutex<Option<Session>>,
+    /// Size cap of recordings; 0 means [`MAX_BYTES`].
+    limit: usize,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -322,6 +326,17 @@ impl DiagnosticSink {
         DiagnosticSink::default()
     }
 
+    /// A sink whose recordings hold at most `max_bytes` (below
+    /// [`MAX_BYTES`]): for a process with a small memory limit, such as an
+    /// iPhone's VPN extension. The held records take several times their
+    /// accounted size in memory, and a report is built from a copy.
+    pub fn with_limit(max_bytes: usize) -> Self {
+        DiagnosticSink {
+            limit: max_bytes.min(MAX_BYTES),
+            ..DiagnosticSink::default()
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Session>> {
         let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if slot
@@ -349,6 +364,11 @@ impl DiagnosticSink {
             stopped: false,
             records: VecDeque::new(),
             bytes: 0,
+            limit: if self.limit == 0 {
+                MAX_BYTES
+            } else {
+                self.limit
+            },
             counts: BTreeMap::new(),
             dropped: 0,
         });

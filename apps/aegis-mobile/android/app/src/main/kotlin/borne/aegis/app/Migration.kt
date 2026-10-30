@@ -26,6 +26,8 @@ object Migration {
     const val AUTHORITY = "net.aegis.app.migration"
     const val PERMISSION = "borne.aegis.app.permission.MIGRATE"
     const val EXPORT = "export"
+    /** AegisBorne confirms that it keeps every exported server. */
+    const val IMPORTED = "imported"
 
     /** The AegisBorne APK inside the legacy build (added by CI). */
     private const val BUNDLED_APK = "aegisborne.apk"
@@ -46,7 +48,7 @@ object Migration {
         installed(context, pkg) &&
             context.packageManager.checkSignatures(context.packageName, pkg) == PackageManager.SIGNATURE_MATCH
 
-    /** Set in the old app once its servers were handed over. */
+    /** Set in the old app once AegisBorne confirmed it keeps its servers. */
     private fun movedFlag(context: Context) = File(context.filesDir, "moved-to-aegisborne")
 
     /** Set in AegisBorne once it took the old app's servers (never again). */
@@ -77,8 +79,16 @@ object Migration {
                 out.putByteArray(rel, f.readBytes())
             }
         out.putStringArrayList("files", paths)
-        movedFlag(context).writeText("")
         return out
+    }
+
+    /**
+     * AegisBorne holds the servers now ([IMPORTED]): only then does the old
+     * app say they moved and offer to uninstall itself, which deletes its
+     * copy of the identities.
+     */
+    fun confirmMoved(context: Context) {
+        movedFlag(context).writeText("")
     }
 
     /**
@@ -123,10 +133,32 @@ object Migration {
         } catch (e: SecurityException) {
             return result.put("legacy", "untrusted").toString()
         } ?: return result.put("legacy", "outdated").toString()
-        val n = importFiles(File(Native.dir(context)), files)
+        val dir = File(Native.dir(context))
+        val n = try {
+            importFiles(dir, files)
+        } catch (e: java.io.IOException) {
+            // Nothing is confirmed: the old app keeps its servers, and
+            // opening AegisBorne again tries again.
+            return JSONObject().put("ok", false).put("error", "Could not take the servers over: ${e.message}").toString()
+        }
+        if (!holdsAll(dir, files)) {
+            return JSONObject().put("ok", false).put("error", "Could not take every server over; open AegisBorne again to retry.").toString()
+        }
         importedFlag(context).writeText("")
+        try {
+            context.contentResolver.call(Uri.parse("content://$AUTHORITY"), IMPORTED, null, null)
+        } catch (_: Exception) {
+            // An old app that doesn't ask for this confirmation.
+        }
         return result.put("imported", n).toString()
     }
+
+    /** Every server in the export is in [dir] now. */
+    private fun holdsAll(dir: File, files: Bundle): Boolean =
+        (files.getStringArrayList("files") ?: arrayListOf())
+            .mapNotNull { p -> p.split('/').takeIf { it.size >= 3 && it[0] == "servers" }?.get(1) }
+            .filter { SERVER_ID.matches(it) }
+            .all { File(dir, "servers/$it").isDirectory }
 
     private fun importFiles(dir: File, files: Bundle): Int {
         val paths = files.getStringArrayList("files") ?: return 0
@@ -149,7 +181,8 @@ object Migration {
             }
             val target = File(dir, "servers/$id")
             target.parentFile?.mkdirs()
-            if (tmp.renameTo(target)) added++
+            if (!tmp.renameTo(target)) throw java.io.IOException("could not keep server $id")
+            added++
         }
         staging.deleteRecursively()
         val selected = files.getByteArray("servers/selected")?.toString(Charsets.UTF_8)?.trim()

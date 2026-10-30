@@ -21,6 +21,7 @@
 
 #[cfg(unix)]
 mod fd;
+mod resolve;
 
 #[cfg(target_os = "android")]
 mod android;
@@ -50,8 +51,9 @@ const RENEWAL_CHECK: Duration = Duration::from_secs(6 * 3600);
 /// whenever no session is up) the tunnel is checked end to end.
 const TICK: Duration = Duration::from_secs(2);
 const PROBE_EVERY: u32 = 15;
-/// How long an answer to "is there a newer app?" is reused.
-const UPDATE_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// How long an answer to "is there a newer app?" is reused (for the server
+/// that gave it).
+const UPDATE_CHECK: Duration = Duration::from_secs(15 * 60);
 /// While recording diagnostics, the VPN's counters are noted every this
 /// many status refreshes (a minute).
 const STATS_EVERY: u32 = 30;
@@ -101,14 +103,15 @@ struct Client {
     snapshot: Arc<Mutex<Snapshot>>,
     stats: Mutex<Arc<packet::Stats>>,
     running: Mutex<Option<Running>>,
-    /// The last update check: when, and the signed build offered (ADR-0017).
-    offer: Mutex<Option<(Instant, Option<Update>)>>,
+    /// The last update check: when, which server answered, and the signed
+    /// build it offered (ADR-0017). Downloads come from that same server.
+    offer: Mutex<Option<(Instant, String, Option<Update>)>>,
     /// An update download in progress: bytes done and total.
     progress: Arc<Mutex<Option<(u64, u64)>>>,
     diag: diag::Diag,
-    /// The gateway's names and their real addresses, looked up before the
-    /// VPN took over DNS ([`prepare_tunnel`]).
-    pins: Mutex<Vec<(String, Vec<Ipv4Addr>)>>,
+    /// The gateway's names and their real addresses (IPv4 and IPv6),
+    /// looked up before the VPN took over DNS ([`prepare_tunnel`]).
+    pins: Mutex<Vec<(String, Vec<IpAddr>)>>,
 }
 
 fn client() -> Result<&'static Client, String> {
@@ -278,7 +281,7 @@ pub fn prepare_tunnel(dir: &str) -> Value {
 /// The gateway's names (connection, enrollment and renewal, QUIC) with
 /// their real IPv4 addresses. Addresses of the VPN's pool are stale
 /// answers from an earlier connection and are skipped.
-async fn gateway_pins(dir: &DeviceDir) -> Vec<(String, Vec<Ipv4Addr>)> {
+async fn gateway_pins(dir: &DeviceDir) -> Vec<(String, Vec<IpAddr>)> {
     let Ok(d) = dir.load() else {
         return Vec::new();
     };
@@ -296,17 +299,22 @@ async fn gateway_pins(dir: &DeviceDir) -> Vec<(String, Vec<Ipv4Addr>)> {
             tokio::net::lookup_host((host.clone(), 0)),
         )
         .await;
-        let mut found: Vec<Ipv4Addr> = match lookup {
+        // IPv6 too, where this network has it (the system answers AAAA only
+        // then): Android reaches the gateway over IPv6 there, often by a
+        // better route.
+        let mut found: Vec<IpAddr> = match lookup {
             Ok(Ok(addrs)) => addrs
-                .filter_map(|a| match a.ip() {
-                    IpAddr::V4(ip) if !dns::FakeDns::in_pool(ip) => Some(ip),
-                    _ => None,
+                .map(|a| a.ip())
+                .filter(|ip| match ip {
+                    IpAddr::V4(ip) => !dns::FakeDns::in_pool(*ip),
+                    IpAddr::V6(ip) => global_v6(ip),
                 })
                 .collect(),
             _ => Vec::new(),
         };
-        found.dedup();
-        found.truncate(8);
+        let mut seen = std::collections::HashSet::new();
+        found.retain(|ip| seen.insert(*ip));
+        found.truncate(16);
         if !found.is_empty() {
             pins.push((host, found));
         }
@@ -366,8 +374,13 @@ where
     *lock(&c.stats) = Arc::clone(&stats);
     let mut names = dns::FakeDns::default();
     for (host, addrs) in lock(&c.pins).iter() {
-        names.pin(host, addrs.clone());
+        let (v4, v6) = split_ips(addrs);
+        names.pin(host, v4);
+        if !v6.is_empty() {
+            names.pin6(host, v6);
+        }
     }
+    let names = Arc::new(Mutex::new(names));
     {
         let mut s = lock(&c.snapshot);
         *s = Snapshot {
@@ -401,10 +414,17 @@ pub fn stop() -> Value {
         Err(e) => return fail(e),
     };
     let running = lock(&c.running).take();
-    if let Some(r) = running {
+    if let Some(mut r) = running {
         let _ = r.stop.send(true);
-        let _ =
-            c.rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), r.task).await });
+        // A session that does not end in time is cancelled: it must not
+        // write its state over a later session's.
+        let ended = c
+            .rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut r.task).await });
+        if ended.is_err() {
+            r.task.abort();
+            let _ = c.rt.block_on(r.task);
+        }
     }
     let mut s = lock(&c.snapshot);
     s.state = State::Disconnected;
@@ -427,18 +447,21 @@ pub fn check_update(dir: &str) -> Value {
     if platform == "ios" {
         return check_ios_update(c, dir);
     }
+    let server = match Servers::open(dir).map(|s| s.selected()) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            *lock(&c.offer) = None;
+            return ok(json!({"version": null}));
+        }
+        Err(e) => return fail(e),
+    };
     let cached = lock(&c.offer)
         .as_ref()
-        .filter(|(at, _)| at.elapsed() < UPDATE_CHECK)
-        .map(|(_, offer)| offer.clone());
+        .filter(|(at, id, _)| at.elapsed() < UPDATE_CHECK && *id == server.id)
+        .map(|(_, _, offer)| offer.clone());
     let offer = match cached {
         Some(offer) => offer,
         None => {
-            let server = match Servers::open(dir).map(|s| s.selected()) {
-                Ok(Some(s)) => s,
-                Ok(None) => return ok(json!({"version": null})),
-                Err(e) => return fail(e),
-            };
             let checked = c.rt.block_on(aegis_join::update::check(
                 &server.dir,
                 platform,
@@ -446,7 +469,7 @@ pub fn check_update(dir: &str) -> Value {
             ));
             match checked {
                 Ok(offer) => {
-                    *lock(&c.offer) = Some((Instant::now(), offer.clone()));
+                    *lock(&c.offer) = Some((Instant::now(), server.id.clone(), offer.clone()));
                     offer
                 }
                 Err(e) => return fail(e),
@@ -485,12 +508,18 @@ pub fn download_update(dir: &str, into: &str) -> Value {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
-    let Some(offer) = lock(&c.offer).as_ref().and_then(|(_, o)| o.clone()) else {
+    let Some((offered_by, offer)) = lock(&c.offer)
+        .as_ref()
+        .and_then(|(_, id, o)| Some((id.clone(), o.clone()?)))
+    else {
         return fail("No update is offered.");
     };
-    let server = match Servers::open(dir).map(|s| s.selected()) {
-        Ok(Some(s)) => s,
-        Ok(None) => return fail("Join a server first."),
+    // From the server that offered it, which may no longer be selected.
+    let server = match Servers::open(dir).map(|s| s.list()) {
+        Ok(list) => match list.into_iter().find(|s| s.id == offered_by) {
+            Some(s) => s,
+            None => return fail("No update is offered."),
+        },
         Err(e) => return fail(e),
     };
     if let Err(e) = std::fs::create_dir_all(into) {
@@ -557,7 +586,7 @@ async fn session<D>(
     device: D,
     snapshot: Arc<Mutex<Snapshot>>,
     stats: Arc<packet::Stats>,
-    names: dns::FakeDns,
+    names: Arc<Mutex<dns::FakeDns>>,
     diag: Arc<DiagnosticSink>,
     mut stop: watch::Receiver<bool>,
 ) where
@@ -570,7 +599,11 @@ async fn session<D>(
         })
     };
     diag.note(Severity::Info, "client.connect", &[]);
-    if let Err(e) = aegis_join::renew_if_due(&dir, false).await {
+    let Some(renewed) = unless_stopped(&mut stop, aegis_join::renew_if_due(&dir, false)).await
+    else {
+        return;
+    };
+    if let Err(e) = renewed {
         diag.note(
             Severity::Warn,
             "client.renew.failed",
@@ -585,11 +618,17 @@ async fn session<D>(
             ));
         }
     }
-    let node = match start_node(&dir, &snapshot, &diag).await {
-        Ok(n) => n,
-        Err(e) => {
+    let node = match unless_stopped(&mut stop, start_node(&dir, &snapshot, &diag)).await {
+        None => return,
+        Some(Ok(n)) => n,
+        Some(Err(e)) => {
             diag.note(Severity::Error, "client.start.failed", &[("error", &e)]);
-            diag::reach(&dir, &diag).await;
+            if unless_stopped(&mut stop, diag::reach(&dir, &diag))
+                .await
+                .is_none()
+            {
+                return;
+            }
             return fail_with(e);
         }
     };
@@ -597,10 +636,10 @@ async fn session<D>(
         node.shutdown(Duration::from_secs(1)).await;
         return fail_with("the local proxy did not start".into());
     };
-    let packets = tokio::spawn(packet::run(
+    let packets = tokio::spawn(packet::run_shared(
         device,
         socks,
-        names,
+        Arc::clone(&names),
         Arc::clone(&stats),
         stop.clone(),
     ));
@@ -610,6 +649,10 @@ async fn session<D>(
     // The last health check's outcome: a failure after a pass (or the
     // first one) checks the gateway's address too.
     let mut last_check = None;
+    // Health checks failed in a row, and when the gateway's addresses were
+    // last looked up again.
+    let mut failed_checks = 0u32;
+    let mut repinned: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -632,7 +675,10 @@ async fn session<D>(
         let transport = node.ctx.tunnel_transport();
         let probe = ticks % PROBE_EVERY == 1 || gauges.sessions_active == 0;
         let verified = if probe {
-            Some(aegis_join::verify_tunnel(socks).await)
+            match unless_stopped(&mut stop, aegis_join::verify_tunnel(socks)).await {
+                Some(v) => Some(v),
+                None => break,
+            }
         } else {
             None
         };
@@ -640,14 +686,35 @@ async fn session<D>(
             Some(true) => diag.count("client.check.ok"),
             Some(false) => {
                 diag.note(Severity::Warn, "client.check.failed", &[]);
-                if last_check != Some(false) {
-                    diag::reach(&dir, &diag).await;
+                if last_check != Some(false)
+                    && unless_stopped(&mut stop, diag::reach(&dir, &diag))
+                        .await
+                        .is_none()
+                {
+                    break;
                 }
             }
             None => {}
         }
         if verified.is_some() {
             last_check = verified;
+        }
+        match verified {
+            Some(true) => failed_checks = 0,
+            Some(false) => failed_checks += 1,
+            None => {}
+        }
+        // Reconnecting keeps failing: the gateway's pinned addresses may be
+        // the problem (one ISP slowing or blocking them), so get current
+        // ones. Not while it works, and at most once a minute.
+        if failed_checks >= REPIN_AFTER && repinned.is_none_or(|t| t.elapsed() >= REPIN_EVERY) {
+            repinned = Some(Instant::now());
+            if unless_stopped(&mut stop, repin(&names, &diag))
+                .await
+                .is_none()
+            {
+                break;
+            }
         }
         if ticks.is_multiple_of(STATS_EVERY) && diag.is_recording() {
             let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed).to_string();
@@ -688,7 +755,12 @@ async fn session<D>(
         });
         if renewal_checked.elapsed() >= RENEWAL_CHECK {
             renewal_checked = Instant::now();
-            match aegis_join::renew_if_due(&dir, false).await {
+            let Some(renewed) =
+                unless_stopped(&mut stop, aegis_join::renew_if_due(&dir, false)).await
+            else {
+                break;
+            };
+            match renewed {
                 Ok(true) => {
                     let _ = node.ctx.reload_certificates();
                 }
@@ -708,6 +780,89 @@ async fn session<D>(
         s.state = State::Disconnected;
         s.connected_since = None;
     });
+}
+
+/// A routable IPv6 address (not loopback, link-local or unique-local, the
+/// VPN's own range among them).
+fn global_v6(ip: &std::net::Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && first & 0xffc0 != 0xfe80
+        && first & 0xfe00 != 0xfc00
+}
+
+fn split_ips(ips: &[IpAddr]) -> (Vec<Ipv4Addr>, Vec<std::net::Ipv6Addr>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for ip in ips {
+        match ip {
+            IpAddr::V4(ip) => v4.push(*ip),
+            IpAddr::V6(ip) => v6.push(*ip),
+        }
+    }
+    (v4, v6)
+}
+
+/// Health checks failed in a row before the gateway's addresses are looked
+/// up again, and how often at most.
+const REPIN_AFTER: u32 = 2;
+const REPIN_EVERY: Duration = Duration::from_secs(60);
+
+/// Look the pinned gateway names up again (public resolvers, bypassing the
+/// tunnel) and answer them with the fresh addresses first, the earlier
+/// ones after. Without answers, the earlier ones rotate, so the next
+/// connection tries another first. Only pinned names (iOS) are affected.
+async fn repin(names: &Mutex<dns::FakeDns>, diag: &DiagnosticSink) {
+    let pins = lock(names).pins();
+    for (host, old) in pins {
+        let fresh = resolve::lookup(&host).await;
+        let (next, source) = if fresh.is_empty() {
+            let mut rotated = old.clone();
+            if !rotated.is_empty() {
+                rotated.rotate_left(1);
+            }
+            (rotated, "rotated")
+        } else {
+            let mut next = fresh;
+            next.extend(
+                old.iter()
+                    .filter(|ip| !next.contains(ip))
+                    .collect::<Vec<_>>(),
+            );
+            next.truncate(resolve::MAX_ADDRS);
+            (next, "looked_up")
+        };
+        let list = next
+            .iter()
+            .map(Ipv4Addr::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        diag.note(
+            Severity::Warn,
+            "client.gateway.addresses",
+            &[("host", &host), ("source", source), ("addresses", &list)],
+        );
+        lock(names).pin(&host, next);
+    }
+    let pins6 = lock(names).pins6();
+    for (host, mut addrs) in pins6 {
+        if addrs.len() > 1 {
+            addrs.rotate_left(1);
+            lock(names).pin6(&host, addrs);
+        }
+    }
+}
+
+/// `fut`, unless the session is asked to stop first (then `None`).
+async fn unless_stopped<F: std::future::Future>(
+    stop: &mut watch::Receiver<bool>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        r = fut => Some(r),
+        _ = stop.wait_for(|s| *s) => None,
+    }
 }
 
 /// iOS ends a VPN extension that uses more than about 50 MB, so there the

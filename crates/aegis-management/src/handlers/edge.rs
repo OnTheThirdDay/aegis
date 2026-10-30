@@ -475,10 +475,34 @@ fn device_certificate(body: &Value) -> Result<String, ApiError> {
         .ok_or_else(|| ApiError::bad_request("invalid_body"))
 }
 
+/// How far a signed request's time may be from the gateway's.
+const SIGNATURE_SKEW: i64 = 600;
+
+/// Whether `body` carries a recent `signature` of `message(signed_at)` by
+/// the key of the certificate `der`.
+fn signed_by(body: &Value, der: &[u8], message: impl Fn(i64) -> Vec<u8>) -> bool {
+    use base64::Engine as _;
+    let Some(signed_at) = body.get("signed_at").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(signature) = body
+        .get("signature")
+        .and_then(Value::as_str)
+        .filter(|s| s.len() <= 1024)
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+    else {
+        return false;
+    };
+    (signed_at - db::now_unix()).abs() <= SIGNATURE_SKEW
+        && aegis_identity::pki::verify_with_certificate(der, &message(signed_at), &signature)
+}
+
 /// The latest app build for the device's platform (`update_query`), or
 /// null. Like the endpoint query: not secret, certificate checked, no rate
 /// limit spent. For `ios`, also the iPhone app this gateway serves, with an
-/// install link (`ios`): iOS updates install like the first install.
+/// install link (`ios`): iOS updates install like the first install. That
+/// link downloads the app, so it needs the request signed with the device
+/// key (a certificate is not secret); unsigned requests get no link.
 async fn update_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
     let certificate_pem = device_certificate(&body)?;
     let platform = body["update_query"]["platform"]
@@ -491,18 +515,18 @@ async fn update_query(ctx: &Ctx, body: Value) -> Result<Value, ApiError> {
     let ios = platform == "ios";
     let (latest, device) = blocking(move || {
         let device = authenticate_device(&c, &anchor, &certificate_pem, 0)?;
+        let holds_key = signed_by(&body, &device.der, aegis_identity::pki::ios_offer_message);
         let latest = signed_builds(&c)
             .into_iter()
             .map(|(v, _)| v)
             .filter(|v| v["platform"].as_str() == Some(platform.as_str()))
             .max_by_key(version_key);
-        Ok((latest, device.node_id))
+        Ok((latest, holds_key.then_some(device.node_id)))
     })
     .await?;
-    let offer = if ios {
-        super::ios::device_offer(ctx, &device).await
-    } else {
-        None
+    let offer = match device {
+        Some(device) if ios => super::ios::device_offer(ctx, &device).await,
+        _ => None,
     };
     Ok(json!({ "update": latest, "ios": offer }))
 }
