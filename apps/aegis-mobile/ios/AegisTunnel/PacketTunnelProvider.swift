@@ -110,6 +110,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             fail("The VPN settings are incomplete.")
             return
         }
+        // The gateway's names must be looked up before the settings apply:
+        // after that, this extension's lookups go to the VPN's own DNS too.
+        queue.async {
+            _ = Self.core { aegis_prepare_tunnel(Self.dir) }
+            self.apply(settings, fail: fail, completionHandler: completionHandler)
+        }
+    }
+
+    private func apply(
+        _ settings: NEPacketTunnelNetworkSettings,
+        fail: @escaping (String) -> Void,
+        completionHandler: @escaping (Error?) -> Void
+    ) {
         setTunnelNetworkSettings(settings) { error in
             if let error {
                 fail("iOS refused the VPN settings: \(error.localizedDescription)")

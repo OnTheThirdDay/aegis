@@ -35,6 +35,7 @@ use aegis_join::{DeviceDir, JoinError, Ports, Servers};
 use aegis_telemetry::{DiagnosticSink, Severity};
 use aegis_tun::{dns, packet, routes};
 use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -105,6 +106,9 @@ struct Client {
     /// An update download in progress: bytes done and total.
     progress: Arc<Mutex<Option<(u64, u64)>>>,
     diag: diag::Diag,
+    /// The gateway's names and their real addresses, looked up before the
+    /// VPN took over DNS ([`prepare_tunnel`]).
+    pins: Mutex<Vec<(String, Vec<Ipv4Addr>)>>,
 }
 
 fn client() -> Result<&'static Client, String> {
@@ -125,6 +129,7 @@ fn client() -> Result<&'static Client, String> {
                 offer: Mutex::default(),
                 progress: Arc::default(),
                 diag: diag::Diag::default(),
+                pins: Mutex::default(),
             })
         })
         .as_ref()
@@ -248,6 +253,67 @@ pub fn start(dir: &str, fd: i32) -> Value {
     start_device(dir, fd, false)
 }
 
+/// Before the VPN takes over DNS (iOS: before the tunnel's settings apply):
+/// look up the selected gateway's names, so the VPN answers them with their
+/// real addresses. Everything else gets the VPN's own addresses, and the
+/// extension's lookups go through it too, so without this the gateway's
+/// name would point back into the tunnel and the connection would never
+/// come up. Blocking; best effort (the count of names pinned).
+pub fn prepare_tunnel(dir: &str) -> Value {
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let server = match Servers::open(dir).map(|s| s.selected()) {
+        Ok(Some(s)) => s,
+        Ok(None) => return fail("Join a server first."),
+        Err(e) => return fail(e),
+    };
+    let pins = c.rt.block_on(gateway_pins(&server.dir));
+    let n = pins.len();
+    *lock(&c.pins) = pins;
+    ok(json!({ "pinned": n }))
+}
+
+/// The gateway's names (connection, enrollment and renewal, QUIC) with
+/// their real IPv4 addresses. Addresses of the VPN's pool are stale
+/// answers from an earlier connection and are skipped.
+async fn gateway_pins(dir: &DeviceDir) -> Vec<(String, Vec<Ipv4Addr>)> {
+    let Ok(d) = dir.load() else {
+        return Vec::new();
+    };
+    let mut hosts = vec![diag::host_port(&d.url).0, diag::host_port(&d.enroll_url).0];
+    hosts.extend(d.quic.as_deref().map(|q| diag::host_port(q).0));
+    hosts.sort();
+    hosts.dedup();
+    let mut pins = Vec::new();
+    for host in hosts {
+        if host.is_empty() || host.parse::<IpAddr>().is_ok() {
+            continue;
+        }
+        let lookup = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::lookup_host((host.clone(), 0)),
+        )
+        .await;
+        let mut found: Vec<Ipv4Addr> = match lookup {
+            Ok(Ok(addrs)) => addrs
+                .filter_map(|a| match a.ip() {
+                    IpAddr::V4(ip) if !dns::FakeDns::in_pool(ip) => Some(ip),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        found.dedup();
+        found.truncate(8);
+        if !found.is_empty() {
+            pins.push((host, found));
+        }
+    }
+    pins
+}
+
 /// [`start`] on the iOS packet tunnel's utun interface, which this process
 /// finds itself (the system doesn't hand its descriptor over).
 #[cfg(target_vendor = "apple")]
@@ -298,6 +364,10 @@ where
     let (stop_tx, stop_rx) = watch::channel(false);
     let stats = Arc::new(packet::Stats::default());
     *lock(&c.stats) = Arc::clone(&stats);
+    let mut names = dns::FakeDns::default();
+    for (host, addrs) in lock(&c.pins).iter() {
+        names.pin(host, addrs.clone());
+    }
     {
         let mut s = lock(&c.snapshot);
         *s = Snapshot {
@@ -312,6 +382,7 @@ where
         device,
         Arc::clone(&c.snapshot),
         stats,
+        names,
         Arc::clone(&c.diag.sink),
         stop_rx,
     ));
@@ -486,6 +557,7 @@ async fn session<D>(
     device: D,
     snapshot: Arc<Mutex<Snapshot>>,
     stats: Arc<packet::Stats>,
+    names: dns::FakeDns,
     diag: Arc<DiagnosticSink>,
     mut stop: watch::Receiver<bool>,
 ) where
@@ -528,7 +600,7 @@ async fn session<D>(
     let packets = tokio::spawn(packet::run(
         device,
         socks,
-        dns::FakeDns::default(),
+        names,
         Arc::clone(&stats),
         stop.clone(),
     ));

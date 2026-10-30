@@ -88,6 +88,21 @@ pub unsafe extern "C" fn aegis_start_tunnel(dir: *const c_char) -> *mut c_char {
     ret(crate::start_tunnel(&dir))
 }
 
+/// Before the tunnel's settings apply: look up the gateway's names while
+/// the normal network still answers, so the VPN can answer them with their
+/// real addresses. Blocks.
+///
+/// # Safety
+/// `dir` is a NUL-terminated string (or null).
+#[cfg(target_vendor = "apple")]
+#[no_mangle]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn aegis_prepare_tunnel(dir: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller's guarantee.
+    let dir = unsafe { arg(dir) };
+    ret(crate::prepare_tunnel(&dir))
+}
+
 /// Disconnect. Blocks until the node stopped.
 #[no_mangle]
 #[allow(unsafe_code)]
