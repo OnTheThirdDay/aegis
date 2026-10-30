@@ -250,7 +250,7 @@ pub struct DnsGuard(#[allow(dead_code)] Engine);
 
 /// Block DNS everywhere but through the interface `tun_index` and loopback.
 pub fn block_dns_outside(tun_index: u32) -> io::Result<DnsGuard> {
-    let mut engine = Engine::open(true, "AegisNet VPN: DNS only through the VPN")?;
+    let mut engine = Engine::open(true, "AegisBorne VPN: DNS only through the VPN")?;
     engine.transaction(|e| {
         e.add_sublayer(DNS_SUBLAYER, u16::MAX)?;
         for layer in LAYERS {
@@ -294,7 +294,7 @@ fn delete_kill_switch(e: &mut Engine) {
 /// may only go through the VPN interface `tun` (when up), to loopback,
 /// local networks and `allow`, and to DNS servers while `tun` is `None`.
 pub fn kill_switch(tun: Option<u32>, allow: &[Ipv4Addr]) -> io::Result<()> {
-    let mut engine = Engine::open(false, "AegisNet VPN: kill switch")?;
+    let mut engine = Engine::open(false, "AegisBorne VPN: kill switch")?;
     engine.transaction(|e| {
         delete_kill_switch(e);
         e.add_sublayer(KILL_SUBLAYER, u16::MAX - 1)?;
@@ -347,7 +347,7 @@ pub fn kill_switch(tun: Option<u32>, allow: &[Ipv4Addr]) -> io::Result<()> {
 
 /// Turn the kill switch off (nothing to do when it is off).
 pub fn remove_kill_switch() -> io::Result<()> {
-    let mut engine = Engine::open(false, "AegisNet VPN: kill switch")?;
+    let mut engine = Engine::open(false, "AegisBorne VPN: kill switch")?;
     engine.transaction(|e| {
         delete_kill_switch(e);
         Ok(())
@@ -357,7 +357,7 @@ pub fn remove_kill_switch() -> io::Result<()> {
 /// Whether the kill switch's filters are in place.
 #[allow(unsafe_code)]
 pub fn kill_switch_present() -> bool {
-    let Ok(engine) = Engine::open(false, "AegisNet VPN: kill switch") else {
+    let Ok(engine) = Engine::open(false, "AegisBorne VPN: kill switch") else {
         return false;
     };
     let mut sublayer: *mut FWPM_SUBLAYER0 = null_mut();

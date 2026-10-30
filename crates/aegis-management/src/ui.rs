@@ -27,7 +27,10 @@ fn portal_index() -> &'static str {
         INDEX
             .replace("href=\"/style.css\"", "href=\"/portal/style.css\"")
             .replace("src=\"/app.js\"", "src=\"/portal/app.js\"")
-            .replace("<title>AegisNet Console</title>", "<title>AegisNet</title>")
+            .replace(
+                "<title>AegisBorne Console</title>",
+                "<title>AegisBorne</title>",
+            )
     })
 }
 

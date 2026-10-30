@@ -67,7 +67,7 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
        - the operator's HTTP and HTTPS verification sites must load through SOCKS.
    - **ACME:** instant-acme 0.8.5 with ring, over our existing reqwest/rustls client (no extra TLS stack).
      - HTTP-01 uses a responder that listens only during an order.
-     - DNS-01 uses AegisNet-labelled TXT records via Cloudflare, deleted by id afterwards.
+     - DNS-01 uses AegisBorne-labelled TXT records via Cloudflare, deleted by id afterwards.
      - The certificate is published as an **SNI alternate** on the edge. The private edge certificate stays the default, so already-enrolled devices keep working; a failed renewal keeps the valid certificate.
    - **OTel** remains the existing consent-bound exporter.
 8. **HTTP forward proxy.** The client's HTTP inbound also forwards absolute-form `http://` requests, so an OS system proxy works for plain-HTTP sites.
@@ -75,7 +75,7 @@ SPEC-12 §0.2/§11.3 had deferred UI work and §0.5/§10.3 forbade a non-loopbac
    - The body length must be exact; chunked uploads get 411.
    - After the declared body, client bytes are discarded, so a reused keep-alive connection can never send a second request to the first origin.
 9. **Portable client.** `aegis-client` is an eframe/glow GUI: one executable, no installer, no admin rights.
-   - **Data:** stored in `AegisNet-data` next to the exe, falling back to the app-data folder.
+   - **Data:** stored in `AegisBorne-data` next to the exe, falling back to the app-data folder.
    - **Privacy:** no logs are written.
    - **Windows system proxy:** set via `reg.exe` with no console window. The previous values are saved and restored on disconnect, on exit, and at the next start after a crash.
    - **Shared code:** the GUI and `aegisctl join/connect/renew` share `aegis-join`.

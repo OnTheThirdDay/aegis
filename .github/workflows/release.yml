@@ -210,7 +210,7 @@ jobs:
           cargo build --locked --release --target aarch64-apple-darwin -p aegis-client
           cargo build --locked --release --target x86_64-apple-darwin -p aegis-client
           mkdir -p out
-          # One universal AegisNet.app in a disk image.
+          # One universal AegisBorne.app in a disk image.
           bash .github/scripts/macos-dmg.sh "$VERSION" \
             target/aarch64-apple-darwin/release/aegis-client \
             target/x86_64-apple-darwin/release/aegis-client \
@@ -271,18 +271,123 @@ jobs:
         run: |
           set -euo pipefail
           flutter --disable-analytics >/dev/null
-          flutter build apk --release --split-per-abi --target-platform android-arm64 \
-            --build-name "$VERSION" --build-number "$GITHUB_RUN_NUMBER"
+          build() {
+            flutter build apk --release --flavor "$1" --split-per-abi --target-platform android-arm64 \
+              --build-name "$VERSION" --build-number "$GITHUB_RUN_NUMBER"
+          }
           mkdir -p ../../out
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ../../out/aegis-client-android-arm64.apk
+          # AegisBorne (borne.aegis.app).
+          build borne
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-borne-release.apk ../../out/aegis-client-android-arm64.apk
+          # The last update of the old app ID (AegisNet, net.aegis.app): it
+          # carries AegisBorne, installs it and hands the servers over
+          # (Migration.kt). It installs over AegisBorne only with the same key.
+          if [ -n "${AEGIS_ANDROID_KEYSTORE:-}" ]; then
+            mkdir -p android/app/src/legacy/assets
+            cp ../../out/aegis-client-android-arm64.apk android/app/src/legacy/assets/aegisborne.apk
+            build legacy
+            cp build/app/outputs/flutter-apk/app-arm64-v8a-legacy-release.apk ../../out/aegisnet-update-android-arm64.apk
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: client-android
           path: out/
           retention-days: 7
 
+  ios:
+    # The iOS app as an Ad Hoc build for the iPhones registered on the
+    # account (ADR-0018). Skipped until the Apple secrets are set
+    # (RELEASING.md); then every build includes every registered iPhone.
+    needs: plan
+    if: needs.plan.outputs.channel != 'none'
+    # Optional for a release: a failure here (no iPhone registered yet, an
+    # expired certificate) is reported but doesn't hold the others back.
+    continue-on-error: true
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      FLUTTER_VERSION: 3.44.4
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_DIST_P12_B64: ${{ secrets.APPLE_DIST_P12_B64 }}
+      APPLE_DIST_P12_PASSWORD: ${{ secrets.APPLE_DIST_P12_PASSWORD }}
+      AEGIS_IOS_APP_KEY: ${{ secrets.AEGIS_IOS_APP_KEY }}
+    steps:
+      - name: Apple secrets
+        id: apple
+        run: |
+          # The app is only ever published encrypted (its profile lists every
+          # registered iPhone), so the app key is required too.
+          if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_DIST_P12_B64" ] && [ -n "$AEGIS_IOS_APP_KEY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::The Apple secrets are not set: no iOS build (RELEASING.md)"
+          fi
+      - uses: actions/checkout@v7
+        if: steps.apple.outputs.ready
+        with:
+          persist-credentials: false
+      - name: Toolchains
+        if: steps.apple.outputs.ready
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios
+          git clone -q --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q cryptography
+      - uses: Swatinem/rust-cache@v2
+        if: steps.apple.outputs.ready
+        with:
+          key: ios
+      - name: Rust core
+        if: steps.apple.outputs.ready
+        run: TARGETS=aarch64-apple-ios bash apps/aegis-mobile/scripts/build-rust-ios.sh
+      - name: Signing
+        if: steps.apple.outputs.ready
+        run: |
+          set -euo pipefail
+          # The distribution certificate in a keychain of its own.
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          pw=$(openssl rand -hex 16)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          echo "$APPLE_DIST_P12_B64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -k "$kc" -P "$APPLE_DIST_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/dist.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$pw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          # Fresh Ad Hoc profiles with every registered iPhone.
+          "$RUNNER_TEMP/venv/bin/python" .github/scripts/ios-profiles.py install
+      - name: App
+        if: steps.apple.outputs.ready
+        working-directory: apps/aegis-mobile
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          flutter --disable-analytics >/dev/null
+          flutter build ipa --release --build-name "$VERSION" --build-number "$GITHUB_RUN_NUMBER" \
+            --export-options-plist=ios/ExportOptions.plist
+          mkdir -p ../../out
+          # Encrypted for the gateways (ADR-0019); the plain app isn't published.
+          "$RUNNER_TEMP/venv/bin/python" ../../.github/scripts/ios-ipa-crypt.py encrypt \
+            build/ios/ipa/*.ipa ../../out/aegis-client-ios.ipa.enc
+      - name: Remove the keychain
+        if: always() && steps.apple.outputs.ready
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+      - uses: actions/upload-artifact@v7
+        if: steps.apple.outputs.ready
+        with:
+          name: client-ios
+          path: out/
+          retention-days: 7
+
   image:
-    needs: [plan, gateway, clients, clients-macos, android]
+    needs: [plan, gateway, clients, clients-macos, android, ios]
     # clients-macos is skipped for staging; any failure still stops here.
     if: needs.plan.outputs.channel != 'none' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
@@ -312,10 +417,21 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           CHANNEL: ${{ needs.plan.outputs.channel }}
           TAG: ${{ needs.plan.outputs.tag }}
+          AEGIS_UPDATE_SIGNING_KEY: ${{ secrets.AEGIS_UPDATE_SIGNING_KEY }}
         run: |
           set -euo pipefail
           cp deploy/Dockerfile.prebuilt context/Dockerfile
           chmod 0755 context/bin/*/* context/clients/*
+          # Releases sign their client builds as app updates, which the
+          # gateway offers its devices (ADR-0017). Staging builds reuse the
+          # release's version number, so they are never offered.
+          if [ "$CHANNEL" = release ]; then
+            if [ -n "$AEGIS_UPDATE_SIGNING_KEY" ]; then
+              bash .github/scripts/sign-updates.sh context/clients "$VERSION"
+            else
+              echo "::warning::AEGIS_UPDATE_SIGNING_KEY is not set: this release's apps won't be offered as updates"
+            fi
+          fi
           # The image's installer installs this image's tag by default.
           if [ "$CHANNEL" = release ]; then tag=$VERSION; else tag=$TAG; fi
           sed -e "s|^RELEASE_IMAGE=\"@IMAGE@\"|RELEASE_IMAGE=\"$IMAGE:$tag\"|" \
@@ -358,7 +474,7 @@ jobs:
           sbom: true
 
   release:
-    needs: [plan, gateway, clients, clients-macos, android, image]
+    needs: [plan, gateway, clients, clients-macos, android, ios, image]
     if: needs.plan.outputs.channel == 'release' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 15

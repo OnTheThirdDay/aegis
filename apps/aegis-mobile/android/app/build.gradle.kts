@@ -16,7 +16,7 @@ fun signing(name: String, env: String): String? =
     keyProperties.getProperty(name) ?: System.getenv(env)
 
 android {
-    namespace = "net.aegis.app"
+    namespace = "borne.aegis.app"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -26,7 +26,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "net.aegis.app"
+        applicationId = "borne.aegis.app"
         minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
@@ -37,6 +37,20 @@ android {
             ndk {
                 abiFilters += listOf("arm64-v8a", "x86_64")
             }
+        }
+    }
+
+    // borne: AegisBorne (borne.aegis.app). legacy: the last update of the
+    // old app ID, AegisNet (net.aegis.app), which installs AegisBorne and
+    // hands its servers over (Migration.kt). Build with --flavor.
+    flavorDimensions += "app"
+    productFlavors {
+        create("borne") {
+            dimension = "app"
+        }
+        create("legacy") {
+            dimension = "app"
+            applicationId = "net.aegis.app"
         }
     }
 

@@ -5,6 +5,7 @@ pub mod acme;
 pub mod cloudflare;
 pub mod connector;
 pub mod connector_update;
+pub mod ios;
 pub mod probe;
 
 use crate::services::Appliance;
@@ -19,6 +20,7 @@ pub type ActionFuture = Pin<Box<dyn Future<Output = ActionResult> + Send>>;
 pub struct Integrations {
     app: Weak<Appliance>,
     cloudflare: OnceLock<Arc<cloudflare::CloudflareIntegration>>,
+    ios: OnceLock<Arc<ios::IosIntegration>>,
     acme: Arc<acme::AcmeIntegration>,
 }
 
@@ -27,6 +29,7 @@ impl Integrations {
         Integrations {
             acme: Arc::new(acme::AcmeIntegration::new(app.clone())),
             cloudflare: OnceLock::new(),
+            ios: OnceLock::new(),
             app,
         }
     }
@@ -42,6 +45,16 @@ impl Integrations {
             &app.dir,
         ));
         Some(Arc::clone(self.cloudflare.get_or_init(|| c)))
+    }
+
+    /// Created lazily, like Cloudflare: it keeps files in the data directory.
+    pub fn ios(&self) -> Option<Arc<ios::IosIntegration>> {
+        if let Some(i) = self.ios.get() {
+            return Some(Arc::clone(i));
+        }
+        let app = self.app.upgrade()?;
+        let i = Arc::new(ios::IosIntegration::new(self.app.clone(), &app.dir));
+        Some(Arc::clone(self.ios.get_or_init(|| i)))
     }
 
     /// Restart integrations that were active before a restart.
@@ -79,12 +92,16 @@ impl Integrations {
             list.push(cf.status());
         }
         list.push(self.acme.status());
+        if let Some(i) = self.ios() {
+            list.push(i.status());
+        }
         list.push(telemetry);
         Value::Array(list)
     }
 
     pub fn dispatch(&self, id: &str, action: &str, actor: &str, body: Value) -> ActionFuture {
         let cf = self.cloudflare();
+        let ios = self.ios();
         let acme = Arc::clone(&self.acme);
         let (id, action, actor) = (id.to_owned(), action.to_owned(), actor.to_owned());
         Box::pin(async move {
@@ -99,6 +116,19 @@ impl Integrations {
                         "restart" => cf.restart().await,
                         "update-connector" => cf.update_connector(&actor).await,
                         "connector-auto-update" => cf.set_auto_update(&actor, &body),
+                        _ => Err((404, format!("unknown action {a}"))),
+                    }
+                }
+                ("ios", a) => {
+                    let ios = ios.ok_or((503, "appliance_unavailable".to_owned()))?;
+                    match a {
+                        "configure" => ios.configure(&actor, body).await,
+                        "fetch" => ios.fetch().await,
+                        "approve" => ios.approve(&actor, &body).await,
+                        "reject" => ios.reject(&actor, &body),
+                        // From the user portal (the management API checks who).
+                        "request" => ios.request(&actor, &body),
+                        "mine" => Ok(ios.mine(&actor)),
                         _ => Err((404, format!("unknown action {a}"))),
                     }
                 }

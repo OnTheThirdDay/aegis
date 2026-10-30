@@ -182,7 +182,7 @@ fn current_user() -> Result<String, String> {
 
 /// Run this executable with `args` as administrator, and the outcome.
 async fn elevated(args: Vec<String>) -> Result<(), String> {
-    let report = std::env::temp_dir().join(format!("aegisnet-vpn-{}.txt", std::process::id()));
+    let report = std::env::temp_dir().join(format!("aegisborne-vpn-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&report);
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let report_arg = report.to_string_lossy().into_owned();

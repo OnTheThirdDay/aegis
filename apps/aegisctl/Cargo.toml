@@ -1,6 +1,6 @@
 [package]
 name = "aegisctl"
-description = "AegisNet local CLI: offline validation, local PKI, privileged IPC and API client."
+description = "AegisBorne local CLI: offline validation, local PKI, privileged IPC and API client."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

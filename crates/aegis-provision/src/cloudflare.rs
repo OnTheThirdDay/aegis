@@ -237,7 +237,7 @@ impl Cloudflare {
         json!({"ingress":[{"hostname":p.desired.hostname,"path":path,"service":service},{"service":"http_status:404"}]})
     }
 
-    /// The stored routing is exactly what an earlier AegisNet wrote.
+    /// The stored routing is exactly what an earlier AegisBorne wrote.
     fn legacy_ingress(actual: &Value, p: &Plan) -> bool {
         match (
             Self::routing(actual),

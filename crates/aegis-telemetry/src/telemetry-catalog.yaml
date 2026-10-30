@@ -1,4 +1,4 @@
-registry_name: aegisnet_private_internal_and_coarse_export
+registry_name: aegisborne_private_internal_and_coarse_export
 schema_version: '0.3'
 upstream_semconv: 1.44.0
 privacy_default: 'off'

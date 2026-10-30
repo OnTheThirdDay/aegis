@@ -93,7 +93,7 @@ impl Appliance {
         self.secrets.root().join(appliance::ROOT_KEY).exists()
     }
 
-    fn audit(&self, actor: &str, action: &'static str, metadata: Value) {
+    pub(crate) fn audit(&self, actor: &str, action: &'static str, metadata: Value) {
         let _ = self.store.tx(|c| {
             aegis_storage::append_audit(
                 c,
@@ -356,6 +356,18 @@ pub async fn diagnostics_loop(app: Arc<Appliance>) {
             } else {
                 diagnostics.count("integration.ok");
             }
+        }
+    }
+}
+
+/// The iPhone app: fetch it from GitHub when a release or a re-signed
+/// build (a newly registered iPhone) is out.
+pub async fn ios_loop(app: Arc<Appliance>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(600));
+    loop {
+        tick.tick().await;
+        if let Some(ios) = app.integrations.ios() {
+            ios.poll().await;
         }
     }
 }

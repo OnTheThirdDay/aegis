@@ -1,4 +1,4 @@
-package net.aegis.app
+package borne.aegis.app
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -21,8 +21,8 @@ import java.util.concurrent.Executors
  */
 class AegisVpnService : VpnService() {
     companion object {
-        const val ACTION_CONNECT = "net.aegis.app.CONNECT"
-        const val ACTION_DISCONNECT = "net.aegis.app.DISCONNECT"
+        const val ACTION_CONNECT = "borne.aegis.app.CONNECT"
+        const val ACTION_DISCONNECT = "borne.aegis.app.DISCONNECT"
         private const val CHANNEL = "vpn"
         private const val NOTIFICATION = 1
         private const val WATCH_MS = 2000L

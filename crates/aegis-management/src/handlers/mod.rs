@@ -5,6 +5,7 @@ mod auth;
 pub(crate) mod devices;
 pub mod diagnostics;
 pub mod edge;
+pub(crate) mod ios;
 mod nodes;
 mod profiles;
 mod provision;
@@ -63,6 +64,14 @@ pub fn routes(_ctx: Ctx) -> Router<Ctx> {
         )
         .route("/api/v1/system/downloads", get(appliance::downloads))
         .route("/downloads/{name}", get(appliance::download_file))
+        .route("/api/v1/ios", get(ios::status))
+        .route(
+            "/api/v1/ios/register.mobileconfig",
+            get(ios::register_profile),
+        )
+        .route("/api/v1/ios/udid/{token}", post(ios::udid))
+        .route("/api/v1/ios/manifest/{token}", get(ios::manifest))
+        .route("/api/v1/ios/app/{token}", get(ios::app))
         .route("/api/v1/integrations", get(appliance::integrations))
         .route(
             "/api/v1/integrations/{id}/{action}",

@@ -233,7 +233,7 @@ pub(crate) struct BootstrapClaimPermit {
     _permit: OwnedSemaphorePermit,
 }
 
-fn random_token() -> String {
+pub(crate) fn random_token() -> String {
     let mut b = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut b);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -687,6 +687,18 @@ impl ManagementContext {
         mfa: bool,
         portal: bool,
     ) -> Result<(String, Principal), ApiError> {
+        self.change_password_with_hasher(principal_id, current, new, mfa, portal, hash_password)
+    }
+
+    fn change_password_with_hasher(
+        &self,
+        principal_id: &str,
+        current: &str,
+        new: &str,
+        mfa: bool,
+        portal: bool,
+        hasher: impl FnOnce(&str) -> Result<String, ApiError>,
+    ) -> Result<(String, Principal), ApiError> {
         check_password_policy(new)?;
         if current == new {
             return Err(ApiError::bad_request("weak_password")
@@ -704,8 +716,15 @@ impl ManagementContext {
             Self::failure_in(limiter, &p.username);
             return Err(ApiError::forbidden().detail("current password is incorrect"));
         }
-        let hash = hash_password(new)?;
+        let hash = hasher(new)?;
         store.tx(|c| {
+            // The account may have changed while the new password was being
+            // hashed (an administrator reset or disable): replace only the
+            // password that was just verified.
+            let now = db::get_principal(c, &p.id)?;
+            if now.password_hash != p.password_hash || now.status != "active" {
+                return Err(db::StoreError::Conflict("account changed".into()));
+            }
             db::set_password(c, &p.id, &hash, false)?;
             db::append_audit(
                 c,
@@ -1155,6 +1174,44 @@ mod tests {
         ctx.update_user("test-owner", &user.id, None, Some("disabled"))
             .expect("disable");
         assert!(!ctx.auth.sessions.lock().expect("lock").contains_key(&key));
+    }
+
+    #[test]
+    fn a_password_change_never_undoes_a_reset_made_meanwhile() {
+        let store = Arc::new(db::Store::open_in_memory().expect("store"));
+        let ctx = context(Arc::clone(&store));
+        insert_owner(&store);
+        let (id, temporary) = ctx
+            .create_user("test-owner", "operator", &["operator".into()])
+            .expect("user");
+        let mut reset = None;
+        let err = ctx
+            .change_password_with_hasher(
+                &id,
+                &temporary,
+                "a new long password",
+                false,
+                false,
+                |new| {
+                    // The owner resets the account while the new one is hashed.
+                    reset = Some(ctx.reset_password("test-owner", &id).expect("reset"));
+                    hash_password(new)
+                },
+            )
+            .expect_err("stale change refused");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        // The reset stands: its password works and must still be changed.
+        let reset = reset.expect("reset password");
+        let row = store.read(|c| db::get_principal(c, &id)).expect("row");
+        assert!(verify_password(&reset, &row.password_hash));
+        assert!(store
+            .read(|c| db::must_change_password(c, &id))
+            .expect("flag"));
+        // Without a reset in between, the change goes through.
+        ctx.change_password(&id, &reset, "a new long password", false, false)
+            .expect("change");
+        let row = store.read(|c| db::get_principal(c, &id)).expect("row");
+        assert!(verify_password("a new long password", &row.password_hash));
     }
 
     #[test]

@@ -75,6 +75,8 @@ pub struct ManagementContext {
     /// Directory of client app builds offered to signed-in users.
     pub downloads_dir: Mutex<Option<PathBuf>>,
     pub(crate) download_digests: Mutex<std::collections::HashMap<String, (u64, String)>>,
+    /// Links handed to iOS for registering an iPhone and installing the app.
+    pub(crate) ios_links: Mutex<std::collections::HashMap<String, handlers::ios::IosLink>>,
     /// Concurrent user-portal connections.
     pub(crate) portal_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -160,6 +162,7 @@ impl ManagementContext {
             appliance: Mutex::new(None),
             downloads_dir: Mutex::new(None),
             download_digests: Mutex::new(std::collections::HashMap::new()),
+            ios_links: Mutex::new(std::collections::HashMap::new()),
             portal_slots: Arc::new(tokio::sync::Semaphore::new(portal::MAX_CONNECTIONS)),
             coord,
             metrics,

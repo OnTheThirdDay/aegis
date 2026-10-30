@@ -6,8 +6,41 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::Duration;
 
-const BINARY: &str = "/Library/PrivilegedHelperTools/net.aegisnet.vpn";
-const PLIST: &str = "/Library/LaunchDaemons/net.aegisnet.vpn.plist";
+const BINARY: &str = "/Library/PrivilegedHelperTools/borne.aegis.vpn";
+const PLIST: &str = "/Library/LaunchDaemons/borne.aegis.vpn.plist";
+
+/// The helper as versions from before the rename to AegisBorne installed it.
+const OLD_LABEL: &str = "net.aegisnet.vpn";
+const OLD_FILES: [&str; 3] = [
+    "/Library/LaunchDaemons/net.aegisnet.vpn.plist",
+    "/Library/PrivilegedHelperTools/net.aegisnet.vpn",
+    "/var/run/aegisnet-vpn.sock",
+];
+const OLD_ANCHOR: &str = "com.apple/aegisnet";
+const OLD_STATE_DIR: &str = "/Library/Application Support/AegisNet";
+
+/// Remove the helper of a version from before the rename. Its journal moves
+/// to the new state folder first, so the new helper undoes what the old one
+/// left behind. Like any update of the helper, this releases its kill
+/// switch.
+fn remove_previous() {
+    let _ = launchctl(&["bootout", &format!("system/{OLD_LABEL}")]);
+    let _ = super::pfctl(&["-a", OLD_ANCHOR, "-F", "all"], None);
+    for path in OLD_FILES {
+        let _ = std::fs::remove_file(path);
+    }
+    let old = std::path::Path::new(OLD_STATE_DIR);
+    if !old.is_dir() {
+        return;
+    }
+    let new = std::path::Path::new(super::daemon::STATE_DIR);
+    let (from, to) = (old.join("vpn-journal.json"), new.join("vpn-journal.json"));
+    if from.exists() && !to.exists() && std::fs::create_dir_all(new).is_ok() {
+        let _ = std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::rename(&from, &to);
+    }
+    let _ = std::fs::remove_dir_all(old);
+}
 
 fn launchctl(args: &[&str]) -> Result<(), String> {
     let out = Command::new("/bin/launchctl")
@@ -48,6 +81,7 @@ pub fn install(uid: &str) -> Result<(), String> {
     if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
         return Err("invalid user".into());
     }
+    remove_previous();
     let target = format!("system/{LABEL}");
     let _ = launchctl(&["bootout", &target]);
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -79,6 +113,7 @@ pub fn install(uid: &str) -> Result<(), String> {
 
 /// Stop and remove the helper.
 pub fn uninstall() -> Result<(), String> {
+    remove_previous();
     let _ = launchctl(&["bootout", &format!("system/{LABEL}")]);
     // A kill switch the helper left blocking goes with it.
     let _ = super::pfctl(&["-a", super::ANCHOR, "-F", "all"], None);

@@ -178,7 +178,7 @@ async fn route_edge_inner(
             body.extend_from_slice(&chunk[..n]);
         }
     }
-    let (status, payload) = hook(route, body).await;
+    let (status, content_type, payload) = hook(route, body).await;
     let reason = match status {
         200 => "OK",
         201 => "Created",
@@ -190,7 +190,7 @@ async fn route_edge_inner(
         _ => "Error",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     let _ = io.write_all(head.as_bytes()).await;
@@ -717,7 +717,7 @@ mod tests {
         let s2 = Arc::clone(&seen);
         let hook: crate::EdgeHook = Arc::new(move |_req, body| {
             *s2.lock().expect("lock") = Some(body);
-            Box::pin(async { (200, b"{}".to_vec()) })
+            Box::pin(async { (200, "application/json", b"{}".to_vec()) })
         });
         let route = tokio::spawn(async move {
             let io: Box<dyn Duplex> = Box::new(server);

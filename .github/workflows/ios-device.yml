@@ -1,0 +1,96 @@
+name: iOS device
+
+# Register an iPhone on the Apple team and re-sign the current iPhone app
+# for it (ADR-0019). Started by a gateway when an administrator approves a
+# user's iPhone (repository dispatch "ios-device"), or by hand. The app
+# isn't rebuilt: its Ad Hoc profiles are replaced by fresh ones listing every
+# registered iPhone, and it is signed again. Every gateway then fetches it.
+#
+# Secrets: APPLE_API_KEY_ID, APPLE_API_ISSUER_ID, APPLE_API_KEY_P8,
+# APPLE_DIST_P12_B64, APPLE_DIST_P12_PASSWORD, AEGIS_IOS_APP_KEY (RELEASING.md).
+
+on:
+  repository_dispatch:
+    types: [ios-device]
+  workflow_dispatch:
+    inputs:
+      name:
+        description: A name for the iPhone (e.g. "Alice's iPhone")
+        required: true
+      udid:
+        description: Its UDID
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-device
+  cancel-in-progress: false
+
+jobs:
+  register:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      NAME: ${{ github.event.client_payload.name || inputs.name }}
+      UDID: ${{ github.event.client_payload.udid || inputs.udid }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_DIST_P12_B64: ${{ secrets.APPLE_DIST_P12_B64 }}
+      APPLE_DIST_P12_PASSWORD: ${{ secrets.APPLE_DIST_P12_PASSWORD }}
+      AEGIS_IOS_APP_KEY: ${{ secrets.AEGIS_IOS_APP_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      RCODESIGN: "0.29.0"
+      RCODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Tools
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q cryptography
+          # rcodesign: Apple code signing on Linux (pinned).
+          archive="apple-codesign-$RCODESIGN-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/$RCODESIGN/$archive"
+          echo "$RCODESIGN_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apple-codesign-$RCODESIGN-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+      - name: Register the iPhone
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/venv/bin/python" .github/scripts/ios-profiles.py add-device "$NAME" "$UDID"
+      - name: Re-sign the current app
+        run: |
+          set -euo pipefail
+          py="$RUNNER_TEMP/venv/bin/python"
+          w="$RUNNER_TEMP/app"
+          mkdir -p "$w"
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" -p aegis-client-ios.ipa.enc -D "$w"; then
+            echo "::notice::Release $tag has no iPhone app yet: the iPhone is registered and the next release includes it."
+            exit 0
+          fi
+          "$py" .github/scripts/ios-ipa-crypt.py decrypt "$w/aegis-client-ios.ipa.enc" "$w/app.ipa"
+          mkdir "$w/x"
+          (cd "$w/x" && unzip -q ../app.ipa)
+          app="$w/x/Payload/Runner.app"
+          # Fresh profiles listing every registered iPhone.
+          "$py" .github/scripts/ios-profiles.py install "$w/profiles"
+          cp "$w/profiles/borne.aegis.app.mobileprovision" "$app/embedded.mobileprovision"
+          cp "$w/profiles/borne.aegis.app.tunnel.mobileprovision" "$app/PlugIns/AegisTunnel.appex/embedded.mobileprovision"
+          echo "$APPLE_DIST_P12_B64" | base64 --decode > "$w/dist.p12"
+          printf '%s' "$APPLE_DIST_P12_PASSWORD" > "$w/dist.pw"
+          # Nested code (the tunnel, Flutter's frameworks) is signed first;
+          # entitlements are kept from the existing signatures.
+          rcodesign sign --p12-file "$w/dist.p12" --p12-password-file "$w/dist.pw" "$app"
+          rm -f "$w/dist.p12" "$w/dist.pw"
+          (cd "$w/x" && zip -qry ../resigned.ipa Payload)
+          "$py" .github/scripts/ios-ipa-crypt.py encrypt "$w/resigned.ipa" "$w/out.enc"
+          mv "$w/out.enc" "$w/aegis-client-ios.ipa.enc"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$w/aegis-client-ios.ipa.enc"
+          echo "Re-signed the iPhone app of $tag for every registered iPhone."

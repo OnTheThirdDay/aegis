@@ -203,7 +203,7 @@ pub async fn web_ca(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult {
             (header::CONTENT_TYPE, "application/x-pem-file"),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=\"aegisnet-web-ca.pem\"",
+                "attachment; filename=\"aegisborne-web-ca.pem\"",
             ),
         ],
         pem,
@@ -562,7 +562,7 @@ pub async fn device_ca(
                 (header::CONTENT_TYPE, "application/x-pem-file"),
                 (
                     header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"aegisnet-device-root-key.pem\"",
+                    "attachment; filename=\"aegisborne-device-root-key.pem\"",
                 ),
                 (header::CACHE_CONTROL, "no-store"),
             ],
@@ -586,8 +586,15 @@ fn download_name_ok(name: &str) -> bool {
 
 fn download_label(name: &str) -> String {
     let n = name.to_ascii_lowercase();
+    if n.starts_with("aegisnet-update") {
+        // The last update of the old Android app: it moves a phone's
+        // servers to AegisBorne.
+        return "AegisNet update for Android (moves an AegisNet phone to AegisBorne)".into();
+    }
     let os = if n.contains("android") || n.ends_with(".apk") {
         "Android"
+    } else if n.ends_with(".ipa") {
+        "iOS"
     } else if n.contains("windows") || n.ends_with(".exe") {
         "Windows"
     } else if n.contains("macos") || n.contains("darwin") {
@@ -604,7 +611,7 @@ fn download_label(name: &str) -> String {
     } else {
         ""
     };
-    format!("AegisNet client for {os}{arch}")
+    format!("AegisBorne client for {os}{arch}")
 }
 
 fn downloads_dir(ctx: &crate::ManagementContext) -> Option<std::path::PathBuf> {
@@ -634,7 +641,14 @@ pub async fn downloads(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult 
             let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
                 continue;
             };
-            if !download_name_ok(&name) || !meta.is_file() || meta.len() > MAX_DOWNLOAD_BYTES {
+            // FILE.update: the signed description of an app update (ADR-0017);
+            // .enc: the iPhone app, served through the portal (ADR-0019).
+            if !download_name_ok(&name)
+                || name.ends_with(".update")
+                || name.ends_with(".enc")
+                || !meta.is_file()
+                || meta.len() > MAX_DOWNLOAD_BYTES
+            {
                 continue;
             }
             let cached = c
@@ -738,14 +752,14 @@ fn file_sha256(path: &std::path::Path) -> std::io::Result<String> {
 const FILE_CHUNK: usize = 64 * 1024;
 
 /// A response body read from a file of known length, one chunk at a time.
-struct FileBody {
+pub(crate) struct FileBody {
     file: tokio::fs::File,
     remaining: u64,
     buf: Box<[u8]>,
 }
 
 impl FileBody {
-    fn new(file: tokio::fs::File, len: u64) -> Self {
+    pub(crate) fn new(file: tokio::fs::File, len: u64) -> Self {
         FileBody {
             file,
             remaining: len,
@@ -838,12 +852,13 @@ mod tests {
     fn download_labels() {
         assert_eq!(
             download_label("aegis-client-android-arm64.apk"),
-            "AegisNet client for Android (ARM64)"
+            "AegisBorne client for Android (ARM64)"
         );
         assert_eq!(
             download_label("aegis-client-windows-x86_64.exe"),
-            "AegisNet client for Windows (x64)"
+            "AegisBorne client for Windows (x64)"
         );
+        assert!(download_label("aegisnet-update-android-arm64.apk").starts_with("AegisNet update"));
         assert_eq!(download_label("notes.txt"), "notes.txt");
         assert!(download_name_ok("aegis-client-android-arm64.apk"));
     }

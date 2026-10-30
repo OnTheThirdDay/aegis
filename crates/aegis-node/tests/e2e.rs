@@ -1673,3 +1673,59 @@ async fn an_unreachable_quic_port_falls_back_to_websocket() {
     );
     drop(silent);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_waiting_for_its_flows_stays_within_the_buffer_budget() {
+    // A gateway that accepts connections and never answers: every flow
+    // waits to open while the app keeps sending.
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let gw = stalled.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = stalled.accept().await {
+            held.push(s);
+        }
+    });
+    let dir = tempfile::tempdir().expect("tmp");
+    let secrets = dir.path().join("secrets");
+    let _pki = provision(&secrets);
+    let limit: u64 = 4 * 1024 * 1024;
+    let toml = format!(
+        "{}\n[core]\nprocess_buffer_budget_bytes = {limit}\npeer_buffer_budget_bytes = {limit}\nsession_window_bytes = 2097152\n",
+        client_toml(dir.path(), &secrets, gw)
+    );
+    let client = start(StartOptions {
+        config: parse_toml(&toml).expect("client cfg"),
+        store_path: dir.path().join("client.db"),
+        failpoints: None,
+    })
+    .await
+    .expect("client start");
+    let (_control, relay) = socks_udp_associate(client.bound_addr("socks").expect("socks")).await;
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let payload = vec![5u8; 60_000];
+    let mut peak = 0;
+    for round in 0..32u16 {
+        for d in 0..16u8 {
+            let dest = aegis_contracts::Destination::parse_authority(&format!(
+                "93.184.216.{}:{}",
+                d + 1,
+                4000 + round % 2
+            ))
+            .expect("dest");
+            let _ = socket
+                .send_to(&aegis_inbound_socks::encode_udp(&dest, &payload), relay)
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        peak = peak.max(client.ctx.budget.used());
+    }
+    // Queued datagrams are charged against the budget, and capped by it.
+    assert!(peak > 0, "waiting datagrams are accounted for");
+    assert!(peak <= limit, "used {peak} of {limit}");
+    client.shutdown(Duration::from_secs(1)).await;
+}

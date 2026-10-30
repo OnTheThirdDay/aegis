@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The old app keeps its name until it is uninstalled. -->
+    <string name="app_name">AegisNet</string>
+</resources>

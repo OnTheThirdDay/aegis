@@ -1,4 +1,4 @@
-//! AGP/1 — the AegisNet inner protocol (03 §3). Not V2Ray compatible.
+//! AGP/1 — the AegisBorne inner protocol (03 §3). Not V2Ray compatible.
 //!
 //! Layering: `Transport duplex → TLS 1.3 mTLS → AGP framing → streams`.
 //! This crate only encodes/decodes; session semantics live in `aegis-session`.

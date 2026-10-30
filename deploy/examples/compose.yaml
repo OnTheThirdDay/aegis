@@ -1,12 +1,12 @@
 # Local Compose topology (pairs with a copy of gateway.toml whose WebSocket
 # inbound and cloudflare.origin_bind use 0.0.0.0:18080 on the private bridge).
-# Build the image locally first:  docker build -f deploy/Dockerfile -t aegisnet/gateway:dev .
+# Build the image locally first:  docker build -f deploy/Dockerfile -t aegisborne/gateway:dev .
 # cloudflared: use the current release tag (github.com/cloudflare/cloudflared/releases)
 # and move to each new one; containers never update themselves (--no-autoupdate).
-name: aegisnet
+name: aegisborne
 services:
   gateway:
-    image: aegisnet/gateway:dev
+    image: aegisborne/gateway:dev
     user: "10001:10001"
     read_only: true
     security_opt:

@@ -65,9 +65,10 @@ impl DatagramFlow {
         self.shared.send_frame_cap()
     }
 
-    /// Queue one datagram. `Ok(false)` means it was dropped: empty, or the
-    /// send buffer is full. Larger than [`max_datagram`](Self::max_datagram)
-    /// is an `InvalidInput` error; a closed flow or session is an error too.
+    /// Queue one datagram. `Ok(false)` means it was dropped (and counted):
+    /// empty, larger than [`max_datagram`](Self::max_datagram), or the send
+    /// buffer is full. Only a closed flow or session is an error: one packet
+    /// the tunnel can't carry doesn't end the flow.
     pub fn send(&self, datagram: &[u8]) -> io::Result<bool> {
         let shared = &self.shared;
         let mut st = shared.lock();
@@ -81,13 +82,7 @@ impl DatagramFlow {
         if e.state == StreamState::Reset {
             return Err(reset_err(e.reset_reason));
         }
-        if datagram.len() > shared.send_frame_cap() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "datagram larger than the tunnel carries",
-            ));
-        }
-        if datagram.is_empty() {
+        if datagram.is_empty() || datagram.len() > shared.send_frame_cap() {
             st.dgram_dropped += 1;
             return Ok(false);
         }

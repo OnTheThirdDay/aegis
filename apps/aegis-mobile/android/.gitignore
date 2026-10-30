@@ -12,3 +12,6 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+
+# The AegisBorne APK the legacy build carries (copied in by CI).
+/app/src/legacy/assets/

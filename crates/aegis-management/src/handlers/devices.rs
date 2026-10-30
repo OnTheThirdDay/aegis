@@ -84,12 +84,15 @@ pub async fn list(
     }
     let c = ctx.clone();
     let me = p.id.clone();
-    let rows = blocking(move || {
+    let (rows, owners) = blocking(move || {
         Ok(c.coord.store().read(|c| {
             if all {
-                db::list_nodes(c, None, 100)
+                Ok((
+                    db::list_nodes(c, None, 100)?,
+                    Some(db::node_owner_names(c)?),
+                ))
             } else {
-                db::list_owned_nodes(c, &me)
+                Ok((db::list_owned_nodes(c, &me)?, None))
             }
         })?)
     })
@@ -97,7 +100,19 @@ pub async fn list(
     let items: Vec<Value> = rows
         .iter()
         .filter(|n| n.role == "client")
-        .map(device_json)
+        .map(|n| {
+            let mut v = device_json(n);
+            // Administrators see whose device it is: the account that
+            // created its invitation (`username` null: since deleted; no
+            // owner: enrolled another way).
+            if let Some(owners) = &owners {
+                v["owner"] = match owners.get(&n.id) {
+                    Some(name) => json!({ "username": name }),
+                    None => Value::Null,
+                };
+            }
+            v
+        })
         .collect();
     Ok(json(StatusCode::OK, &json!({ "items": items }), &[]))
 }

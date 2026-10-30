@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package the macOS client as AegisNet.app (universal binary, ad-hoc signed;
+# Package the macOS client as AegisBorne.app (universal binary, ad-hoc signed;
 # no Apple Developer ID) in a disk image with a link to /Applications.
 #
 # Usage: macos-dmg.sh VERSION ARM64_BINARY X86_64_BINARY OUTPUT.dmg
@@ -13,7 +13,7 @@ output=$4
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 root="$work/root"
-app="$root/AegisNet.app"
+app="$root/AegisBorne.app"
 mkdir -p "$app/Contents/MacOS"
 
 lipo -create -output "$app/Contents/MacOS/aegis-client" "$arm64" "$x86_64"
@@ -25,11 +25,11 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleDisplayName</key><string>AegisNet</string>
+  <key>CFBundleDisplayName</key><string>AegisBorne</string>
   <key>CFBundleExecutable</key><string>aegis-client</string>
-  <key>CFBundleIdentifier</key><string>net.aegisnet.client</string>
+  <key>CFBundleIdentifier</key><string>borne.aegis.client</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleName</key><string>AegisNet</string>
+  <key>CFBundleName</key><string>AegisBorne</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${version}</string>
   <key>CFBundleVersion</key><string>${version}</string>
@@ -45,4 +45,4 @@ codesign --force --sign - "$app"
 codesign --verify "$app"
 
 ln -s /Applications "$root/Applications"
-hdiutil create -quiet -volname AegisNet -srcfolder "$root" -ov -format UDZO "$output"
+hdiutil create -quiet -volname AegisBorne -srcfolder "$root" -ov -format UDZO "$output"

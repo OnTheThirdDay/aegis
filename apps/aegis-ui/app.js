@@ -1,5 +1,5 @@
 // @ts-check
-// AegisNet web console. Dependency-free; served by the gateway under a strict
+// AegisBorne web console. Dependency-free; served by the gateway under a strict
 // CSP (no inline script or style, no remote assets). All dynamic text is
 // inserted with textContent, never innerHTML.
 "use strict";
@@ -315,7 +315,7 @@ function showLogin(why) {
   });
   v.append(form);
   if (PORTAL) {
-    v.append(el("p", { class: "muted small narrow" }, ["This is the AegisNet user portal: add your devices, remove old ones and download the app. Administrators sign in with two-factor authentication."]));
+    v.append(el("p", { class: "muted small narrow" }, ["This is the AegisBorne user portal: add your devices, remove old ones and download the app. Administrators sign in with two-factor authentication."]));
   } else {
     v.append(bootstrapCard());
   }
@@ -416,7 +416,7 @@ async function renderOverview() {
     step(!!c.server_address_set, "Tell devices how to reach this server",
       conn.public_host ? "Devices connect to " + conn.public_host + (conn.public_port && conn.public_port !== 443 ? ":" + conn.public_port : "") + (conn.mode && conn.mode !== "direct" ? " via " + conn.mode : "") : "Set the server address, or connect a Cloudflare Tunnel for access from anywhere.",
       "connectivity", "Set up connectivity"),
-    step((c.devices_enrolled || 0) > 0, "Add your first device", (c.devices_enrolled || 0) + " device(s) enrolled. Create an invitation and paste it into the AegisNet client app.", "devices", "Invite a device"),
+    step((c.devices_enrolled || 0) > 0, "Add your first device", (c.devices_enrolled || 0) + " device(s) enrolled. Create an invitation and paste it into the AegisBorne client app.", "devices", "Invite a device"),
   ]);
   if (info.runtime && info.runtime.certificates && info.runtime.certificates.issuer_renewal_due) {
     const go = button("Renew the device issuer", "small");
@@ -536,6 +536,10 @@ async function renderDevices() {
   const all = can("nodes:read");
   if (can("devices:self")) v.append(inviteCard());
   v.append(await downloadsCard());
+  if (can("devices:self")) {
+    const iphone = await iphoneCard();
+    if (iphone) v.append(iphone);
+  }
   const { data } = await api("GET", "/devices" + (all ? "?scope=all" : ""));
   const rows = data.items.map((/** @type {any} */ n) => {
     const revoke = button("Revoke", "danger small");
@@ -547,8 +551,13 @@ async function renderDevices() {
       setTimeout(() => view("devices"), 700);
     });
     const d = inDays(n.certificate_expires_at);
+    // Whose device: the account that created its invitation.
+    const owner = !n.owner ? el("span", { class: "muted" }, ["—"])
+      : n.owner.username == null ? el("span", { class: "muted" }, ["deleted account"])
+      : n.owner.username;
     return el("tr", {}, [
       el("td", {}, [el("strong", {}, [n.name])]),
+      ...(all ? [el("td", {}, [owner])] : []),
       el("td", {}, [pill(n.status)]),
       el("td", {}, [when(n.created_at)]),
       el("td", {}, [n.status === "revoked" ? "—" : d == null ? "—" : d + " days (auto-renews)"]),
@@ -557,7 +566,7 @@ async function renderDevices() {
   });
   v.append(card(all ? "All devices" : "My devices", [
     rows.length
-      ? el("table", {}, [el("thead", {}, [el("tr", {}, [el("th", {}, ["Name"]), el("th", {}, ["Status"]), el("th", {}, ["Enrolled"]), el("th", {}, ["Certificate"]), el("th", {}, [""])])]), el("tbody", {}, rows)])
+      ? el("table", {}, [el("thead", {}, [el("tr", {}, [el("th", {}, ["Name"]), ...(all ? [el("th", {}, ["Owner"])] : []), el("th", {}, ["Status"]), el("th", {}, ["Enrolled"]), el("th", {}, ["Certificate"]), el("th", {}, [""])])]), el("tbody", {}, rows)])
       : el("p", { class: "muted" }, ["No devices yet. Create an invitation above."]),
   ]));
 }
@@ -586,7 +595,7 @@ function inviteCard() {
       code,
       el("div", { class: "row" }, [copyBtn, dl, done]),
       el("ol", { class: "steps" }, [
-        el("li", {}, ["Install and open the AegisNet client app on the device (downloads below)."]),
+        el("li", {}, ["Install and open the AegisBorne client app on the device (downloads below)."]),
         el("li", {}, ["Choose ", el("em", {}, ["Add server"]), " and paste this code (or open the .aegis file)."]),
         el("li", {}, ["Click ", el("em", {}, ["Connect"]), ". The device creates its own key; the code cannot be reused."]),
       ]),
@@ -614,6 +623,106 @@ async function downloadsCard() {
   } catch {
     return el("span");
   }
+}
+
+/** The iPhone app: register this iPhone, then install (Ad Hoc, ADR-0019). */
+async function iphoneCard() {
+  let data;
+  try {
+    ({ data } = await api("GET", "/ios"));
+  } catch {
+    return null;
+  }
+  if (!data.enabled) return null;
+  /** @type {Record<string, [string, boolean]>} */
+  const outcomes = {
+    "#ios-registered": ["Your iPhone was sent for approval. Once the administrator approves it, the Install button below works on it (allow a few minutes).", false],
+    "#ios-expired": ["That registration link expired. Press Register this iPhone again.", true],
+    "#ios-failed": ["The registration didn't come through. Press Register this iPhone again.", true],
+  };
+  const outcome = outcomes[location.hash];
+  if (outcome) history.replaceState(null, "", location.pathname);
+  /** @type {Record<string, string>} */
+  const label = { pending: "waiting for approval", approved: "approved", failed: "failed — ask your administrator" };
+  const requests = data.requests.map((/** @type {any} */ r) =>
+    el("li", {}, [r.name + (r.product ? " (" + r.product + ")" : "") + " — ", pill(label[r.state] || r.state)]));
+  const register = el("a", { class: "button" + (data.install ? " ghost" : ""), href: BASE + "/api/v1/ios/register.mobileconfig" }, ["Register this iPhone"]);
+  const install = data.install ? el("a", { class: "button", href: data.install }, ["Install AegisBorne " + data.app.version]) : null;
+  return card("iPhone app", [
+    outcome ? el("p", { class: outcome[1] ? "err-text" : "ok-text" }, [outcome[0]]) : null,
+    el("p", { class: "muted" }, ["On your iPhone, in Safari. The app installs only on iPhones the administrator approved (iOS 16 or later)."]),
+    el("ol", { class: "steps" }, [
+      el("li", {}, ["Press ", el("em", {}, ["Register this iPhone"]), ", then open Settings → Profile Downloaded and install it. It only sends this iPhone's identifier, and doesn't stay installed."]),
+      el("li", {}, ["Wait for the administrator's approval."]),
+      el("li", {}, ["Press ", el("em", {}, ["Install"]), "."]),
+    ]),
+    requests.length ? el("ul", {}, requests) : null,
+    el("div", { class: "row" }, [register, install]),
+    !data.install && data.app ? el("p", { class: "muted small" }, ["Installing needs the portal's public address (ask your administrator)."]) : null,
+    !data.app ? el("p", { class: "muted small" }, ["The app isn't on this server yet."]) : null,
+  ]);
+}
+
+/** The console's side: GitHub settings and iPhones waiting for approval. */
+function iosCard(/** @type {any} */ i) {
+  const repo = /** @type {HTMLInputElement} */ (el("input", { value: i.repository || "", placeholder: "owner/name", autocomplete: "off" }));
+  const token = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_token ? "saved — leave empty to keep it" : "GitHub token" }));
+  const key = /** @type {HTMLInputElement} */ (el("input", { type: "password", autocomplete: "off", placeholder: i.has_key ? "saved — leave empty to keep it" : "base64 (the AEGIS_IOS_APP_KEY secret)" }));
+  const save = button("Save");
+  busy(save, async () => {
+    /** @type {Record<string, string>} */
+    const body = { repository: repo.value.trim() };
+    if (token.value.trim()) body.token = token.value.trim();
+    if (key.value.trim()) body.key = key.value.trim();
+    const { data } = await api("POST", "/integrations/ios/configure", { body });
+    notice(data.fetched ? "Saved. The iPhone app was fetched from GitHub." : "Saved. " + (data.status.error || "The app isn't on GitHub yet."), !data.fetched);
+    setTimeout(() => view("integrations"), 700);
+  });
+  const check = button("Check GitHub now", "ghost");
+  busy(check, async () => {
+    const { data } = await api("POST", "/integrations/ios/fetch", { body: {} });
+    notice(data.changed ? "Fetched AegisBorne " + data.version + "." : "Already up to date (" + data.version + ").");
+    setTimeout(() => view("integrations"), 700);
+  });
+  const rows = (i.requests || []).map((/** @type {any} */ r) => {
+    const approve = button(r.state === "failed" ? "Retry" : "Approve", "small");
+    approve.disabled = r.state === "approved";
+    busy(approve, async () => {
+      const { data } = await api("POST", "/integrations/ios/approve", { body: { id: r.id } });
+      notice(data.message);
+      setTimeout(() => view("integrations"), 700);
+    });
+    const remove = button("Remove", "ghost small");
+    busy(remove, async () => {
+      if (!confirm("Remove the request for " + r.name + "?")) return;
+      await api("POST", "/integrations/ios/reject", { body: { id: r.id } });
+      view("integrations");
+    });
+    return el("tr", {}, [
+      el("td", {}, [el("strong", {}, [r.name]), el("div", { class: "muted small" }, [[r.product, r.ios].filter(Boolean).join(" · ")])]),
+      el("td", {}, [r.username || "—"]),
+      el("td", {}, [new Date(r.requested_at * 1000).toLocaleString()]),
+      el("td", {}, [pill(r.state), r.message ? el("div", { class: "muted small" }, [r.message]) : null]),
+      el("td", {}, [el("div", { class: "row" }, [approve, remove])]),
+    ]);
+  });
+  return el("section", { class: "card integration" }, [
+    el("div", { class: "row spread" }, [el("h2", {}, [i.name]), pill(i.state)]),
+    el("p", { class: "muted" }, [i.description]),
+    i.app ? el("p", {}, ["App on this server: AegisBorne " + i.app.version + " (" + fmtBytes(i.app.size) + "), fetched " + new Date(i.app.fetched_at * 1000).toLocaleString() + "."]) : null,
+    i.error ? el("p", { class: "err-text" }, [i.error]) : null,
+    el("div", { class: "cols" }, [
+      field("GitHub repository", repo, "Whose releases carry the app."),
+      field("GitHub token", token, "Fine-grained, this repository only: Contents read and write (reads releases, starts the iPhone workflow)."),
+      field("App key", key, "Decrypts the app: the repository's AEGIS_IOS_APP_KEY."),
+    ]),
+    el("div", { class: "row" }, [save, check]),
+    el("h3", {}, ["iPhones"]),
+    rows.length
+      ? el("table", {}, [el("thead", {}, [el("tr", {}, [el("th", {}, ["iPhone"]), el("th", {}, ["User"]), el("th", {}, ["Asked"]), el("th", {}, ["State"]), el("th", {}, [""])])]), el("tbody", {}, rows)])
+      : el("p", { class: "muted" }, ["No requests yet. Users register their iPhone from the portal (Devices → iPhone app)."]),
+    el("p", { class: "muted small" }, ["Approving registers the iPhone on the Apple team (up to 100 a year) and re-signs the current app for it, on GitHub; every gateway then fetches that build."]),
+  ]);
 }
 
 // ---------------------------------------------------------------- users
@@ -903,7 +1012,7 @@ function cloudflareCard(cf, conn) {
   const body = el("div");
   const head = el("div", { class: "row spread" }, [el("span", {}, ["Status: ", pill(cf.state || "inactive")]), cf.public_url ? el("span", { class: "mono" }, [cf.public_url]) : null]);
   const c = card("Option 2 — Cloudflare Tunnel (access from anywhere, no port forwarding)", [
-    el("p", { class: "muted" }, ["Uses your Cloudflare account and domain. AegisNet creates the tunnel, the DNS record and runs the connector itself — no dashboard steps. Your router needs no open ports. Cloudflare sees encrypted device traffic only; device authentication stays end-to-end."]),
+    el("p", { class: "muted" }, ["Uses your Cloudflare account and domain. AegisBorne creates the tunnel, the DNS record and runs the connector itself — no dashboard steps. Your router needs no open ports. Cloudflare sees encrypted device traffic only; device authentication stays end-to-end."]),
     head,
     cf.error ? el("p", { class: "err-text" }, ["Last error: " + cf.error]) : null,
     cf.warning ? el("p", { class: "warn-text" }, [cf.warning]) : null,
@@ -943,14 +1052,14 @@ function cloudflareCard(cf, conn) {
     const off = button("Disconnect Cloudflare", "danger");
     busy(off, async () => {
       if (!token.value) throw new Error("Paste the API token: removing the tunnel and DNS record needs it.");
-      if (!confirm("Remove the AegisNet tunnel" + (keepDns.checked ? "" : " and its DNS record") + " from Cloudflare? Devices using " + (cf.hostname || "it") + " lose access until you choose another option.")) return;
+      if (!confirm("Remove the AegisBorne tunnel" + (keepDns.checked ? "" : " and its DNS record") + " from Cloudflare? Devices using " + (cf.hostname || "it") + " lose access until you choose another option.")) return;
       await api("POST", "/integrations/cloudflare/disable", { body: { token: token.value, keep_dns: keepDns.checked } });
       token.value = "";
       notice("Cloudflare removal started.");
       await renderConnectivity();
     });
     body.append(field("API token (only needed to retry or disconnect)", token), tokenHelp,
-      el("label", { class: "check" }, [keepDns, " Keep the DNS record (only resources AegisNet created are ever removed)"]),
+      el("label", { class: "check" }, [keepDns, " Keep the DNS record (only resources AegisBorne created are ever removed)"]),
       el("div", { class: "row" }, [restart, retry, off]));
     return c;
   }
@@ -989,7 +1098,7 @@ function cloudflareCard(cf, conn) {
         await renderConnectivity();
       });
       preview.replaceChildren(el("div", { class: "plan" }, [
-        el("h3", {}, ["AegisNet will:"]),
+        el("h3", {}, ["AegisBorne will:"]),
         el("ul", {}, (p.changes || []).map((/** @type {string} */ x) => el("li", {}, [x]))),
         p.warnings && p.warnings.length ? el("ul", { class: "warn-list" }, p.warnings.map((/** @type {string} */ x) => el("li", {}, [x]))) : null,
         el("label", { class: "check" }, [store, " Remember the token on this server (only needed for DNS-validated Let's Encrypt renewals)"]),
@@ -1083,6 +1192,10 @@ async function renderIntegrations() {
     return;
   }
   for (const i of data.integrations) {
+    if (i.id === "ios") {
+      v.append(iosCard(i));
+      continue;
+    }
     const go = i.id === "cloudflare" || i.id === "acme" ? button("Configure", "small") : null;
     if (go) go.addEventListener("click", () => view("connectivity"));
     v.append(el("section", { class: "card integration" }, [
@@ -1229,7 +1342,7 @@ async function renderDiagnostics() {
     el("h3", {}, ["How to diagnose a device"]),
     el("ol", { class: "steps" }, [
       el("li", {}, ["Start recording here."]),
-      el("li", {}, ["On the device, open the AegisNet app → Troubleshooting → Start recording."]),
+      el("li", {}, ["On the device, open the AegisBorne app → Troubleshooting → Start recording."]),
       el("li", {}, ["Reproduce the problem, then press Stop and send in the app (it also sends by itself when its recording ends)."]),
       el("li", {}, ["Read the analysis below. A device that can't reach this server can Save to file instead; import that file here."]),
     ]),
@@ -1279,7 +1392,7 @@ async function renderDiagnostics() {
     busy(exp, async () => {
       const resp = await fetch(BASE + "/api/v1/diagnostics/otlp", { credentials: "same-origin" });
       if (!resp.ok) throw new Error("Nothing to download yet.");
-      download("aegisnet-diagnostics.otlp.json", await resp.text(), "application/json");
+      download("aegisborne-diagnostics.otlp.json", await resp.text(), "application/json");
     });
     v.append(card("Analysis", [...items, el("div", { class: "row" }, [exp])]));
   }
@@ -1315,7 +1428,7 @@ async function renderAccount() {
     busy(dl, async () => {
       const resp = await fetch(BASE + "/api/v1/system/web-ca.pem", { credentials: "same-origin" });
       if (!resp.ok) throw new Error("Download failed.");
-      download("aegisnet-web-ca.pem", await resp.text(), "application/x-pem-file");
+      download("aegisborne-web-ca.pem", await resp.text(), "application/x-pem-file");
     });
     v.append(card("Trust this console in your browser (optional)", [
       el("p", { class: "muted" }, ["The console uses a certificate from this server's own web CA, so browsers warn the first time. To remove the warning, install this CA as trusted on your computer — only do this if you trust this server's operators."]),
@@ -1443,7 +1556,7 @@ async function deviceCaCard() {
         const e = await resp.json().catch(() => ({}));
         throw new Error(e.detail || friendly(e.aegis_error_code || String(resp.status)));
       }
-      download("aegisnet-device-root-key.pem", await resp.text(), "application/x-pem-file");
+      download("aegisborne-device-root-key.pem", await resp.text(), "application/x-pem-file");
       pw.value = "";
       notice("Root key downloaded. Store it somewhere safe and offline, then remove it from the server below.");
     });

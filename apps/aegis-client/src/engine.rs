@@ -19,6 +19,8 @@ use tokio::sync::mpsc;
 /// How often a connected client checks whether its certificate is due for
 /// renewal (renewal itself starts 10 days before expiry).
 const RENEWAL_CHECK: Duration = Duration::from_secs(6 * 3600);
+/// How often a connected app asks its server for a newer version.
+const UPDATE_CHECK: Duration = Duration::from_secs(6 * 3600);
 /// A changed server address that couldn't be verified from this network is
 /// tried again after this long (each try can take ~15 s before falling back).
 const ENDPOINT_RETRY: Duration = Duration::from_secs(3600);
@@ -71,6 +73,31 @@ pub struct Snapshot {
     /// Outcome of the last diagnostics send/save: (success, message).
     pub diag_message: Option<(bool, String)>,
     pub diag_sending: bool,
+    /// A newer version of this app that the server offers.
+    pub update: UpdateState,
+}
+
+/// A newer version of this app, offered by the server (ADR-0017). The app
+/// never installs it by itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UpdateState {
+    #[default]
+    None,
+    Available(String),
+    Downloading {
+        version: String,
+        done: u64,
+        total: u64,
+    },
+    /// In place; restarting starts it.
+    Ready {
+        version: String,
+        start: PathBuf,
+    },
+    Failed {
+        version: String,
+        message: String,
+    },
 }
 
 impl Default for Snapshot {
@@ -99,6 +126,7 @@ impl Default for Snapshot {
             vpn_message: None,
             diag_message: None,
             diag_sending: false,
+            update: UpdateState::None,
         }
     }
 }
@@ -125,6 +153,8 @@ pub enum Command {
     DiagSend,
     DiagSave,
     DiagDiscard,
+    /// Download the offered update and put it in this app's place.
+    InstallUpdate,
     Shutdown(std::sync::mpsc::Sender<()>),
 }
 
@@ -181,6 +211,8 @@ impl Engine {
             proxy_saved: None,
             vpn: None,
             endpoint_failed: None,
+            offer: None,
+            update_checked: None,
         };
         runtime.spawn(worker.run(rx));
         Ok(Engine {
@@ -225,6 +257,9 @@ struct Worker {
     /// A changed server address that failed its check here, and when: it
     /// isn't tried again on every reconnect (see ENDPOINT_RETRY).
     endpoint_failed: Option<(String, Instant)>,
+    /// The update the server offers, checked and signed (ADR-0017).
+    offer: Option<aegis_join::update::Update>,
+    update_checked: Option<Instant>,
 }
 
 impl Worker {
@@ -335,6 +370,7 @@ impl Worker {
                             self.diag_was_recording = false;
                             self.update(|s| s.diag_message = None);
                         }
+                        Command::InstallUpdate => self.install_update().await,
                         Command::Shutdown(done) => {
                             self.disconnect().await;
                             let _ = done.send(());
@@ -350,6 +386,13 @@ impl Worker {
                     if self.node.is_some() && renewal_checked.elapsed() >= RENEWAL_CHECK {
                         renewal_checked = Instant::now();
                         self.renew_connected().await;
+                    }
+                    // Once connected, then every few hours.
+                    if self.node.is_some()
+                        && self.update_checked.is_none_or(|t| t.elapsed() >= UPDATE_CHECK)
+                    {
+                        self.update_checked = Some(Instant::now());
+                        self.check_update().await;
                     }
                     let recording = self.diag.is_recording();
                     if self.diag_was_recording && !recording {
@@ -888,6 +931,88 @@ impl Worker {
         })
     }
 
+    /// Ask the server for a newer version of this app; offer it if it is
+    /// signed by the release workflow (aegis_join checks).
+    async fn check_update(&mut self) {
+        let (Some(platform), Some(device)) = (aegis_join::update::platform(), self.device.clone())
+        else {
+            return;
+        };
+        let busy = matches!(
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).update,
+            UpdateState::Downloading { .. } | UpdateState::Ready { .. }
+        );
+        if busy {
+            return;
+        }
+        match aegis_join::update::check(&device, platform, env!("CARGO_PKG_VERSION")).await {
+            Ok(Some(offer)) => {
+                let version = offer.version.clone();
+                self.offer = Some(offer);
+                self.update(|s| s.update = UpdateState::Available(version));
+            }
+            Ok(None) => {}
+            Err(e) => self.diag.note(
+                Severity::Info,
+                "client.update.check_failed",
+                &[("error", &e.to_string())],
+            ),
+        }
+    }
+
+    async fn install_update(&mut self) {
+        let (Some(offer), Some(device)) = (self.offer.clone(), self.device.clone()) else {
+            return;
+        };
+        let version = offer.version.clone();
+        let failed = |message: String| UpdateState::Failed {
+            version: version.clone(),
+            message,
+        };
+        let folder = self.data_dir.join("update");
+        if let Err(e) = std::fs::create_dir_all(&folder) {
+            self.update(|s| s.update = failed(format!("{}: {e}", folder.display())));
+            return;
+        }
+        let dest = folder.join(&offer.file);
+        let _ = std::fs::remove_file(&dest);
+        self.update(|s| {
+            s.update = UpdateState::Downloading {
+                version: version.clone(),
+                done: 0,
+                total: offer.size,
+            }
+        });
+        let (state, repaint) = (&self.state, &self.repaint);
+        let downloaded = aegis_join::update::download(&device, &offer, &dest, |done, total| {
+            if let UpdateState::Downloading {
+                done: d, total: t, ..
+            } = &mut state.lock().unwrap_or_else(|e| e.into_inner()).update
+            {
+                (*d, *t) = (done, total);
+            }
+            repaint();
+        })
+        .await;
+        if let Err(e) = downloaded {
+            self.update(|s| s.update = failed(format!("Could not download the update: {e}")));
+            return;
+        }
+        let installed = tokio::task::spawn_blocking(move || crate::selfupdate::install(&dest))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+        self.update(|s| {
+            s.update = match installed {
+                Ok(start) => UpdateState::Ready {
+                    version: version.clone(),
+                    start,
+                },
+                Err(e) => failed(e),
+            }
+        });
+    }
+
     async fn diag_send(&mut self) {
         let Some(mut report) = self.report() else {
             return;
@@ -935,7 +1060,7 @@ impl Worker {
         };
         let path = self
             .data_dir
-            .join(format!("aegisnet-diagnostics-{}.otlp.json", now()));
+            .join(format!("aegisborne-diagnostics-{}.otlp.json", now()));
         let body = serde_json::to_vec_pretty(&report.to_otlp()).unwrap_or_default();
         let message = match std::fs::write(&path, body) {
             Ok(()) => (true, format!("Saved to {}", path.display())),

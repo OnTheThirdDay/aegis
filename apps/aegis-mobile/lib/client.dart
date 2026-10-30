@@ -68,6 +68,8 @@ class Status {
     this.connections = 0,
     this.udpFlows = 0,
     this.transport,
+    this.updateDone,
+    this.updateTotal,
   });
 
   factory Status.fromJson(Map<String, dynamic> j) => Status(
@@ -86,6 +88,8 @@ class Status {
         connections: (j['connections'] as num?)?.toInt() ?? 0,
         udpFlows: (j['udp_flows'] as num?)?.toInt() ?? 0,
         transport: j['transport'] as String?,
+        updateDone: (j['update_done'] as num?)?.toInt(),
+        updateTotal: (j['update_total'] as num?)?.toInt(),
       );
 
   final ConnectionState state;
@@ -105,7 +109,45 @@ class Status {
 
   /// What carries the tunnel: `quic` (direct UDP) or `websocket`.
   final String? transport;
+
+  /// An app update downloading: bytes done and total.
+  final int? updateDone;
+  final int? updateTotal;
 }
+
+/// A newer version of the app that the server offers, signed by the
+/// release workflow (ADR-0017), and the version installed.
+class AppUpdate {
+  AppUpdate(this.version, this.current);
+  final String version;
+  final String current;
+}
+
+/// Moving from the old Android app (AegisNet, `net.aegis.app`) to AegisBorne
+/// (android/.../Migration.kt).
+class Migration {
+  Migration({this.legacy = false, this.moved = false, this.otherInstalled = false});
+
+  factory Migration.fromJson(Map<String, dynamic> j) => Migration(
+        legacy: j['legacy'] == true,
+        moved: j['moved'] == true,
+        otherInstalled: j['other_installed'] == true,
+      );
+
+  /// This is the old app.
+  final bool legacy;
+
+  /// The old app: AegisBorne took its servers.
+  final bool moved;
+
+  /// The other app (AegisBorne in the old app, and the reverse) is installed.
+  final bool otherInstalled;
+}
+
+/// What taking the old app's servers found: how many it added, and the old
+/// app's state (`absent`, `outdated`: too old to hand them over,
+/// `untrusted`: not signed by us, `done`: taken before, `ok`).
+typedef Imported = ({int count, String legacy});
 
 DateTime? _time(Object? unix) =>
     unix is num ? DateTime.fromMillisecondsSinceEpoch(unix.toInt() * 1000) : null;
@@ -113,7 +155,7 @@ DateTime? _time(Object? unix) =>
 /// The platform side (Android: MainActivity + AegisVpnService over the
 /// Rust core). Results arrive as the core's JSON.
 class Client {
-  static const _channel = MethodChannel('aegisnet/client');
+  static const _channel = MethodChannel('aegisborne/client');
 
   Future<Map<String, dynamic>> _call(String method, [Map<String, Object?>? args]) async {
     final raw = await _channel.invokeMethod<String>(method, args);
@@ -146,4 +188,46 @@ class Client {
 
   /// An invitation shared to the app from another app, once.
   Future<String?> sharedText() => _channel.invokeMethod<String>('sharedText');
+
+  /// Where the move to AegisBorne stands (nothing to move on iOS, or when
+  /// the platform can't tell).
+  Future<Migration> migration() async {
+    try {
+      return Migration.fromJson(await _call('migration'));
+    } on MissingPluginException {
+      return Migration();
+    } on ClientError {
+      return Migration();
+    }
+  }
+
+  /// AegisBorne: take the old app's servers, once.
+  Future<Imported> importLegacy() async {
+    final j = await _call('importLegacy');
+    return (count: (j['imported'] as num?)?.toInt() ?? 0, legacy: (j['legacy'] as String?) ?? 'absent');
+  }
+
+  /// The old app: install the AegisBorne it carries, or open it. Returns a
+  /// message when the user has something to do first.
+  Future<String?> installBorne() async => (await _call('installBorne'))['message'] as String?;
+
+  /// A newer app the selected server offers (checked every few hours), or
+  /// null. Not on iOS yet.
+  Future<AppUpdate?> checkUpdate() async {
+    try {
+      final j = await _call('checkUpdate');
+      final v = j['version'] as String?;
+      return v == null ? null : AppUpdate(v, (j['current'] as String?) ?? '');
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Download the offered update and hand it to the system installer,
+  /// which asks the user. Returns a message when the user has something to
+  /// do first.
+  Future<String?> installUpdate() async => (await _call('installUpdate'))['message'] as String?;
+
+  /// Ask Android to uninstall the old app (the user confirms).
+  Future<void> uninstallLegacy() => _call('uninstallLegacy');
 }

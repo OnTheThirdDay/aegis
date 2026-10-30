@@ -1,5 +1,5 @@
 #!/bin/sh
-# AegisNet gateway installer (Docker). It ships inside the gateway image, so
+# AegisBorne gateway installer (Docker). It ships inside the gateway image, so
 # everything comes from the public registry; no GitHub access is needed:
 #
 #   docker run --rm --pull always --entrypoint cat \
@@ -92,7 +92,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION=${2:?}; shift 2 ;;
     --image) IMAGE=${2:?}; shift 2 ;;
     --from) FROM=${2:?}; shift 2 ;;
-    --native) die "--native is no longer supported; AegisNet installs with Docker" ;;
+    --native) die "--native is no longer supported; AegisBorne installs with Docker" ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
     -h|--help) sed -n '2,40p' "$0" 2>/dev/null || true; exit 0 ;;
@@ -284,7 +284,7 @@ detect_addresses() {
 
 print_summary() { # password fingerprint addresses
   say ""
-  say "  AegisNet gateway is running."
+  say "  AegisBorne gateway is running."
   say ""
   if [ "$LOCAL_CONSOLE" = 1 ]; then
     say "  The console listens on this machine only. From your computer run:"
@@ -352,7 +352,7 @@ docker_install() {
   fi
   if [ -n "$FROM" ]; then
     [ -f "$FROM/Dockerfile" ] || die "--from: $FROM/Dockerfile missing"
-    IMAGE=${IMAGE:-aegisnet/gateway:local}
+    IMAGE=${IMAGE:-aegisborne/gateway:local}
     say "Building $IMAGE from $FROM..."
     docker build -q --build-arg TARGETARCH="$(host_arch)" -t "$IMAGE" "$FROM" >/dev/null
   else

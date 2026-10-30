@@ -22,6 +22,10 @@ mod fd;
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(any(target_vendor = "apple", test))]
+pub mod ffi;
+
+use aegis_join::update::Update;
 use aegis_join::{DeviceDir, JoinError, Ports, Servers};
 use aegis_tun::{dns, packet, routes};
 use serde_json::{json, Value};
@@ -39,6 +43,8 @@ const RENEWAL_CHECK: Duration = Duration::from_secs(6 * 3600);
 /// whenever no session is up) the tunnel is checked end to end.
 const TICK: Duration = Duration::from_secs(2);
 const PROBE_EVERY: u32 = 15;
+/// How long an answer to "is there a newer app?" is reused.
+const UPDATE_CHECK: Duration = Duration::from_secs(6 * 3600);
 
 /// What the app shows.
 #[derive(Clone, Default)]
@@ -85,6 +91,10 @@ struct Client {
     snapshot: Arc<Mutex<Snapshot>>,
     stats: Mutex<Arc<packet::Stats>>,
     running: Mutex<Option<Running>>,
+    /// The last update check: when, and the signed build offered (ADR-0017).
+    offer: Mutex<Option<(Instant, Option<Update>)>>,
+    /// An update download in progress: bytes done and total.
+    progress: Arc<Mutex<Option<(u64, u64)>>>,
 }
 
 fn client() -> Result<&'static Client, String> {
@@ -102,6 +112,8 @@ fn client() -> Result<&'static Client, String> {
                 snapshot: Arc::default(),
                 stats: Mutex::default(),
                 running: Mutex::default(),
+                offer: Mutex::default(),
+                progress: Arc::default(),
             })
         })
         .as_ref()
@@ -222,6 +234,21 @@ pub fn vpn_config() -> Value {
 /// is closed on disconnect). Returns at once; progress shows in [`status`].
 #[cfg(unix)]
 pub fn start(dir: &str, fd: i32) -> Value {
+    start_device(dir, fd, false)
+}
+
+/// [`start`] on the iOS packet tunnel's utun interface, which this process
+/// finds itself (the system doesn't hand its descriptor over).
+#[cfg(target_vendor = "apple")]
+pub fn start_tunnel(dir: &str) -> Value {
+    match fd::find_utun() {
+        Some(fd) => start_device(dir, fd, true),
+        None => fail("The VPN interface was not found."),
+    }
+}
+
+#[cfg(unix)]
+fn start_device(dir: &str, fd: i32, utun: bool) -> Value {
     let c = match client() {
         Ok(c) => c,
         Err(e) => return fail(e),
@@ -229,7 +256,11 @@ pub fn start(dir: &str, fd: i32) -> Value {
     // Registering the descriptor needs the runtime's reactor.
     let device = {
         let _rt = c.rt.enter();
-        fd::TunDevice::new(fd)
+        if utun {
+            fd::TunDevice::utun(fd)
+        } else {
+            fd::TunDevice::new(fd)
+        }
     };
     match device {
         Ok(device) => start_with(dir, device),
@@ -298,6 +329,82 @@ pub fn stop() -> Value {
     ok(json!({}))
 }
 
+/// Ask the selected server for a newer version of this app (blocking; the
+/// answer is reused for a few hours). `{"version": "1.2.0"}` when one signed
+/// by the release workflow is offered, else `{"version": null}`.
+pub fn check_update(dir: &str) -> Value {
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let Some(platform) = aegis_join::update::platform() else {
+        return ok(json!({"version": null}));
+    };
+    let cached = lock(&c.offer)
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < UPDATE_CHECK)
+        .map(|(_, offer)| offer.clone());
+    let offer = match cached {
+        Some(offer) => offer,
+        None => {
+            let server = match Servers::open(dir).map(|s| s.selected()) {
+                Ok(Some(s)) => s,
+                Ok(None) => return ok(json!({"version": null})),
+                Err(e) => return fail(e),
+            };
+            let checked = c.rt.block_on(aegis_join::update::check(
+                &server.dir,
+                platform,
+                env!("CARGO_PKG_VERSION"),
+            ));
+            match checked {
+                Ok(offer) => {
+                    *lock(&c.offer) = Some((Instant::now(), offer.clone()));
+                    offer
+                }
+                Err(e) => return fail(e),
+            }
+        }
+    };
+    ok(json!({"version": offer.map(|o| o.version), "current": env!("CARGO_PKG_VERSION")}))
+}
+
+/// Download the offered update into the folder `into` (blocking), checking
+/// it against its signed description. Returns the file's `path`; progress
+/// shows in [`status`] meanwhile.
+pub fn download_update(dir: &str, into: &str) -> Value {
+    let c = match client() {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let Some(offer) = lock(&c.offer).as_ref().and_then(|(_, o)| o.clone()) else {
+        return fail("No update is offered.");
+    };
+    let server = match Servers::open(dir).map(|s| s.selected()) {
+        Ok(Some(s)) => s,
+        Ok(None) => return fail("Join a server first."),
+        Err(e) => return fail(e),
+    };
+    if let Err(e) = std::fs::create_dir_all(into) {
+        return fail(format!("{into}: {e}"));
+    }
+    let dest = std::path::Path::new(into).join(&offer.file);
+    let _ = std::fs::remove_file(&dest);
+    let progress = Arc::clone(&c.progress);
+    *lock(&progress) = Some((0, offer.size));
+    let result = c.rt.block_on(aegis_join::update::download(
+        &server.dir,
+        &offer,
+        &dest,
+        |done, total| *lock(&progress) = Some((done, total)),
+    ));
+    *lock(&progress) = None;
+    match result {
+        Ok(()) => ok(json!({"path": dest.to_string_lossy(), "version": offer.version})),
+        Err(e) => fail(format!("Could not download the update: {e}")),
+    }
+}
+
 /// Connection state and counters.
 pub fn status() -> Value {
     let c = match client() {
@@ -306,6 +413,7 @@ pub fn status() -> Value {
     };
     let s = lock(&c.snapshot).clone();
     let stats = Arc::clone(&lock(&c.stats));
+    let downloading = *lock(&c.progress);
     ok(json!({
         "state": s.state.as_str(),
         "error": s.error,
@@ -324,6 +432,8 @@ pub fn status() -> Value {
         "udp_flows_failed": stats.udp_failed.load(Ordering::Relaxed),
         "dns_queries": stats.dns_queries.load(Ordering::Relaxed),
         "dropped": stats.dropped.load(Ordering::Relaxed),
+        "update_done": downloading.map(|(d, _)| d),
+        "update_total": downloading.map(|(_, t)| t),
     }))
 }
 
@@ -433,6 +543,19 @@ async fn session<D>(
     });
 }
 
+/// iOS ends a VPN extension that uses more than about 50 MB, so there the
+/// client's buffers stay well below it (ADR-0018). Within the configuration
+/// rules: the session window holds two stream buffers, and window plus one
+/// stream buffer fit the peer budget.
+fn within_memory_limit(core: &mut aegis_config::CoreConfig, small: bool) {
+    if small {
+        core.process_buffer_budget_bytes = 16 * 1024 * 1024;
+        core.peer_buffer_budget_bytes = 12 * 1024 * 1024;
+        core.stream_buffer_budget_bytes = 256 * 1024;
+        core.session_window_bytes = 4 * 1024 * 1024;
+    }
+}
+
 /// Start the client node on ephemeral local ports, first trying a changed
 /// server address the gateway reports (kept only if the pinned gateway
 /// answers there).
@@ -441,7 +564,8 @@ async fn start_node(
     snapshot: &Mutex<Snapshot>,
 ) -> Result<aegis_node::NodeRuntime, String> {
     let ports = Ports { socks: 0, http: 0 };
-    let start = |cfg| async {
+    let start = |mut cfg: aegis_config::NodeConfig| async {
+        within_memory_limit(&mut cfg.core, cfg!(target_os = "ios"));
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(dir.root.join(format!("state.db{suffix}")));
         }
@@ -500,6 +624,24 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["dns"], "198.18.0.1");
         assert!(v["routes"].as_array().is_some_and(|r| r.len() > 5));
+    }
+
+    #[test]
+    fn the_ios_limits_keep_the_configuration_rules() {
+        let mut c = aegis_config::CoreConfig::default();
+        within_memory_limit(&mut c, true);
+        let mib = 1024 * 1024;
+        assert!((4 * mib..=1024 * mib).contains(&c.process_buffer_budget_bytes));
+        assert!(c.peer_buffer_budget_bytes <= c.process_buffer_budget_bytes);
+        assert!((16 * 1024..=mib as u32).contains(&c.stream_buffer_budget_bytes));
+        assert!(c.session_window_bytes >= 2 * c.stream_buffer_budget_bytes);
+        assert!(
+            u64::from(c.session_window_bytes) + u64::from(c.stream_buffer_budget_bytes)
+                <= c.peer_buffer_budget_bytes
+        );
+        let mut unchanged = aegis_config::CoreConfig::default();
+        within_memory_limit(&mut unchanged, false);
+        assert_eq!(unchanged, aegis_config::CoreConfig::default());
     }
 
     #[test]

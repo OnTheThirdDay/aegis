@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Taking the servers of the old app, AegisNet (Migration.kt). -->
+    <uses-permission android:name="borne.aegis.app.permission.MIGRATE" />
+    <queries>
+        <package android:name="net.aegis.app" />
+    </queries>
+</manifest>
