@@ -52,6 +52,12 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       # The latest cloudflared release, the same for both architectures.
       cloudflared: ${{ steps.plan.outputs.cloudflared }}
+      # Releases: the apps unchanged since the previous release (desktop,
+      # macos, android), whose builds are carried instead of rebuilt; the
+      # files to carry; and that release's tag.
+      reuse: ${{ steps.plan.outputs.reuse }}
+      carry: ${{ steps.plan.outputs.carry }}
+      previous: ${{ steps.plan.outputs.previous }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -89,6 +95,18 @@ jobs:
           esac
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # An app that didn't change since the previous release keeps its
+          # build, so devices aren't offered it again (ADR-0017).
+          if [ "$channel" = release ]; then
+            previous=$(git tag -l 'v*' --sort=-v:refname | sed -n 1p)
+            if [ -n "$previous" ]; then
+              gh release view "$previous" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/assets"
+              python3 .github/scripts/unchanged-apps.py "$previous" "$RUNNER_TEMP/assets" > "$RUNNER_TEMP/carry"
+              echo "previous=$previous" >> "$GITHUB_OUTPUT"
+              echo "reuse=$(cut -d' ' -f1 "$RUNNER_TEMP/carry" | xargs)" >> "$GITHUB_OUTPUT"
+              echo "carry=$(cut -d' ' -f2- "$RUNNER_TEMP/carry" | xargs)" >> "$GITHUB_OUTPUT"
+            fi
+          fi
           cloudflared=$(curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
             https://api.github.com/repos/cloudflare/cloudflared/releases/latest \
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])')
@@ -148,7 +166,7 @@ jobs:
   clients:
     # Linux and Windows clients, both built on Linux (Windows via mingw).
     needs: plan
-    if: needs.plan.outputs.channel != 'none'
+    if: needs.plan.outputs.channel != 'none' && !contains(needs.plan.outputs.reuse, 'desktop')
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -196,7 +214,7 @@ jobs:
   clients-macos:
     # macOS runners bill 10x: only for releases, both architectures in one job.
     needs: plan
-    if: needs.plan.outputs.channel == 'release'
+    if: needs.plan.outputs.channel == 'release' && !contains(needs.plan.outputs.reuse, 'macos')
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -228,7 +246,7 @@ jobs:
   android:
     # The Android client: the Rust core with the NDK, the app with Flutter.
     needs: plan
-    if: needs.plan.outputs.channel != 'none'
+    if: needs.plan.outputs.channel != 'none' && !contains(needs.plan.outputs.reuse, 'android')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -390,8 +408,45 @@ jobs:
           path: out/
           retention-days: 7
 
+  carry:
+    # The previous release's builds of the apps that didn't change, with the
+    # version each one is (BUILDS: a carried build may be older still).
+    needs: plan
+    if: needs.plan.outputs.carry != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS: ${{ needs.plan.outputs.previous }}
+          CARRY: ${{ needs.plan.outputs.carry }}
+        run: |
+          set -euo pipefail
+          mkdir -p out builds
+          for file in $CARRY; do
+            gh release download "$PREVIOUS" --repo "$GITHUB_REPOSITORY" -p "$file" -D out
+          done
+          # Releases before 1.1.9 have no BUILDS: everything in them is their version.
+          gh release download "$PREVIOUS" --repo "$GITHUB_REPOSITORY" -p BUILDS -D "$RUNNER_TEMP" || true
+          for file in $CARRY; do
+            version=$(awk -v f="$file" '$1 == f { print $2 }' "$RUNNER_TEMP/BUILDS" 2>/dev/null || true)
+            echo "$file ${version:-${PREVIOUS#v}}" >> builds/BUILDS
+          done
+          cat builds/BUILDS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: client-carried
+          path: out/
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: builds-carried
+          path: builds/
+          retention-days: 7
+
   image:
-    needs: [plan, gateway, clients, clients-macos, android, ios]
+    needs: [plan, gateway, clients, clients-macos, android, ios, carry]
     # clients-macos is skipped for staging; any failure still stops here.
     if: needs.plan.outputs.channel != 'none' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
@@ -415,6 +470,12 @@ jobs:
           pattern: client-*
           path: context/clients
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        if: needs.plan.outputs.carry != ''
+        with:
+          pattern: builds-*
+          path: builds
+          merge-multiple: true
       - name: Prepare build context
         env:
           IMAGE: ${{ needs.plan.outputs.image }}
@@ -428,10 +489,11 @@ jobs:
           chmod 0755 context/bin/*/* context/clients/*
           # Releases sign their client builds as app updates, which the
           # gateway offers its devices (ADR-0017). Staging builds reuse the
-          # release's version number, so they are never offered.
+          # release's version number, so they are never offered. Carried
+          # builds are signed as the version they are.
           if [ "$CHANNEL" = release ]; then
             if [ -n "$AEGIS_UPDATE_SIGNING_KEY" ]; then
-              bash .github/scripts/sign-updates.sh context/clients "$VERSION"
+              bash .github/scripts/sign-updates.sh context/clients "$VERSION" builds/BUILDS
             else
               echo "::warning::AEGIS_UPDATE_SIGNING_KEY is not set: this release's apps won't be offered as updates"
             fi
@@ -478,7 +540,7 @@ jobs:
           sbom: true
 
   release:
-    needs: [plan, gateway, clients, clients-macos, android, ios, image]
+    needs: [plan, gateway, clients, clients-macos, android, ios, carry, image]
     if: needs.plan.outputs.channel == 'release' && !failure() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -493,10 +555,26 @@ jobs:
           pattern: client-*
           path: assets
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        if: needs.plan.outputs.carry != ''
+        with:
+          pattern: builds-*
+          path: builds
+          merge-multiple: true
       - name: Checksums
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           chmod 0755 assets/*
+          # Which version each app is, for the next release's carried builds.
+          for path in assets/*; do
+            file=$(basename "$path")
+            version=$(awk -v f="$file" '$1 == f { print $2 }' builds/BUILDS 2>/dev/null || true)
+            echo "$file ${version:-$VERSION}"
+          done > "$RUNNER_TEMP/BUILDS"
+          mv "$RUNNER_TEMP/BUILDS" assets/BUILDS
+          cat assets/BUILDS
           ( cd assets && sha256sum * > SHA256SUMS )
           cat assets/SHA256SUMS
       - name: Tag and publish the release
@@ -505,8 +583,14 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           IMAGE: ${{ needs.plan.outputs.image }}
           DIGEST: ${{ needs.image.outputs.digest }}
+          REUSE: ${{ needs.plan.outputs.reuse }}
+          PREVIOUS: ${{ needs.plan.outputs.previous }}
         run: |
           set -euo pipefail
+          carried=""
+          if [ -n "$REUSE" ]; then
+            carried="Unchanged since $PREVIOUS, so not rebuilt or offered again: $REUSE (each file's version is in BUILDS)."
+          fi
           cat > notes.md <<NOTES
           ## Install or upgrade the gateway
 
@@ -518,6 +602,7 @@ jobs:
           Image: \`$IMAGE:$VERSION\` (\`$IMAGE@$DIGEST\`), linux/amd64 and linux/arm64.
           Clients: download below or from the gateway's web console (Devices > Client apps).
           Verify files with \`SHA256SUMS\`.
+          $carried
           NOTES
           gh release create "v$VERSION" assets/* \
             --target "$GITHUB_SHA" --title "v$VERSION" \

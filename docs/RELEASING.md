@@ -32,7 +32,8 @@ Test images are built only when you ask for one: a full build takes about 30 min
 2. Merge it, then merge the release pull request into `main`.
 3. `release.yml` sees an untagged version on `main` and does the rest:
    - creates tag `vX.Y.Z`;
-   - builds the gateway for amd64 and arm64, plus the client apps for Windows, macOS (arm64 and x86_64) and Linux;
+   - builds the gateway for amd64 and arm64, plus the client apps for Windows, macOS (arm64 and x86_64), Linux, Android and iPhone;
+   - carries an app unchanged since the previous release instead of rebuilding it, so devices aren't offered it again (ADR-0017). The release notes name the carried apps, and the `BUILDS` asset gives each file's version;
    - pushes the multi-arch image (with build provenance and an SBOM);
    - publishes the GitHub Release.
 
