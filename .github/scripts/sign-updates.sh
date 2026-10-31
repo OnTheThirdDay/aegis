@@ -3,12 +3,15 @@
 # write FILE.update with its platform, version, size, SHA-256 and an Ed25519
 # signature over the statement the apps verify (aegis-join update.rs).
 #
-#   sign-updates.sh DIR VERSION
+#   sign-updates.sh DIR VERSION [BUILDS]
+#   BUILDS  optional "FILE VERSION" lines for builds carried from an earlier
+#           release, which are signed as the version they are
 #   AEGIS_UPDATE_SIGNING_KEY  the private key (PEM, PKCS#8)
 set -euo pipefail
 
 dir=$1
-version=$2
+release_version=$2
+builds=${3:-}
 [ -n "${AEGIS_UPDATE_SIGNING_KEY:-}" ] || { echo "AEGIS_UPDATE_SIGNING_KEY is not set" >&2; exit 1; }
 key=$(mktemp)
 trap 'rm -f "$key" "$key.statement"' EXIT
@@ -30,6 +33,11 @@ for path in "$dir"/*; do
   file=$(basename "$path")
   platform=$(platform_of "$file")
   [ -n "$platform" ] || continue
+  version=$release_version
+  if [ -n "$builds" ] && [ -f "$builds" ]; then
+    carried=$(awk -v f="$file" '$1 == f { print $2 }' "$builds")
+    version=${carried:-$release_version}
+  fi
   size=$(stat -c %s "$path")
   sha=$(sha256sum "$path" | cut -d' ' -f1)
   printf 'aegisborne-update/1\nplatform=%s\nversion=%s\nfile=%s\nsize=%s\nsha256=%s\n' \
