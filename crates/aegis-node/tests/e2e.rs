@@ -1693,7 +1693,7 @@ async fn udp_waiting_for_its_flows_stays_within_the_buffer_budget() {
     let _pki = provision(&secrets);
     let limit: u64 = 4 * 1024 * 1024;
     let toml = format!(
-        "{}\n[core]\nprocess_buffer_budget_bytes = {limit}\npeer_buffer_budget_bytes = {limit}\nsession_window_bytes = 2097152\n",
+        "{}\n[core]\nprocess_buffer_budget_bytes = {limit}\npeer_buffer_budget_bytes = {limit}\nsession_window_bytes = 2097152\nstream_buffer_budget_bytes = 262144\n",
         client_toml(dir.path(), &secrets, gw)
     );
     let client = start(StartOptions {
@@ -1827,7 +1827,7 @@ async fn stalled_downloads_leave_room(
 }
 
 /// As the iPhone build runs (crates/aegis-mobile, within_memory_limit).
-const IPHONE_CORE: &str = "process_buffer_budget_bytes = 25165824\npeer_buffer_budget_bytes = 20971520\nstream_buffer_budget_bytes = 262144\nsession_window_bytes = 8388608";
+const IPHONE_CORE: &str = "process_buffer_budget_bytes = 25165824\npeer_buffer_budget_bytes = 20971520\nstream_buffer_budget_bytes = 1048576\nsession_window_bytes = 8388608";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stalled_downloads_leave_the_tunnel_usable() {

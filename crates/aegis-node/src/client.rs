@@ -105,7 +105,9 @@ impl Tunnel {
                 stream_window: c.stream_buffer_budget_bytes,
                 session_window: c.session_window_bytes,
                 max_frame_payload: c.max_frame_payload_bytes,
-                stream_tx_buffer: c.stream_buffer_budget_bytes,
+                stream_tx_buffer: c
+                    .stream_buffer_budget_bytes
+                    .min(aegis_session::MAX_STREAM_TX_BUFFER),
                 handshake_timeout: Duration::from_millis(u64::from(c.tls_handshake_timeout_ms)),
                 keepalive_interval: Duration::from_secs(u64::from(c.keepalive_interval_seconds)),
                 datagrams: true,

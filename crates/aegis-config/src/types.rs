@@ -71,16 +71,18 @@ impl Default for CoreConfig {
             shutdown_grace_seconds: 15,
             max_sessions: 128,
             // Streams start with a 16 KiB window that grows (up to
-            // stream_buffer_budget_bytes) only while busy, inside the 8 MiB
+            // stream_buffer_budget_bytes) only while busy, inside the 10 MiB
             // session window less one full stream window as the working
-            // share: ~500 concurrent connections, idle ones nearly free.
+            // share: 512 concurrent connections, idle ones nearly free.
+            // 2 MiB lets one connection carry ~2-4 MB/s over a ~0.5-1 s
+            // round trip (a phone in China through Cloudflare).
             // The peer budget covers the session window plus each stream's
             // initial transmit reservation, with room to grow.
             max_streams_per_session: 512,
             process_buffer_budget_bytes: 256 * 1024 * 1024,
             peer_buffer_budget_bytes: 24 * 1024 * 1024,
-            stream_buffer_budget_bytes: 256 * 1024,
-            session_window_bytes: 8 * 1024 * 1024,
+            stream_buffer_budget_bytes: 2 * 1024 * 1024,
+            session_window_bytes: 10 * 1024 * 1024,
             max_frame_payload_bytes: 16 * 1024,
             fail_closed: true,
             connect_timeout_ms: 10_000,

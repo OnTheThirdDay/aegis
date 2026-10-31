@@ -40,7 +40,7 @@ The owner has a paid Apple developer account (individual) and no Mac. Distributi
   - utun puts a 4-byte address family in front of each packet, which `TunDevice::utun` removes and adds. Packets don't cross between Swift and Rust.
 - **Memory:** iOS ends a packet tunnel that uses more than about 50 MB, so on iOS the client's buffer budgets are smaller:
   - process 24 MiB, peer 20 MiB;
-  - stream 256 KiB, session window 8 MiB (the desktop's);
+  - stream 1 MiB (256 KiB until 1.1.10; the desktop's is 2 MiB, ADR-0009), session window 8 MiB (the desktop's until 1.1.10, now 10 MiB);
   - within the configuration rules, which a test checks.
   - Until 1.1.7 the session window was 4 MiB. It bounds the sum of all connections' windows, so about 20 connections that stopped reading (a browser's slow or abandoned page loads) left no room for any new one, the health check included: the tunnel froze until it reconnected. An end-to-end test (`stalled_downloads_leave_the_tunnel_usable`) runs the iPhone's settings.
 - **Unsafe code:** the crate's unsafe boundary (ADR-0011) gains `ffi.rs` (exported C functions, strings from Swift) and the utun lookup (`getsockopt`), each item with a SAFETY comment.
