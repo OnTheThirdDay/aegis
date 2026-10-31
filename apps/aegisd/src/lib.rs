@@ -222,6 +222,7 @@ type UpgradePlan = fn(&serde_json::Value) -> Option<serde_json::Value>;
 const PROFILE_UPGRADES: &[(&str, UpgradePlan)] = &[
     ("session-limits-upgrade", session_limits_plan),
     ("quic-inbound-upgrade", quic_inbound_plan),
+    ("stream-window-upgrade", stream_window_plan),
 ];
 
 /// Session limits to the current defaults, only while all of them still
@@ -240,6 +241,30 @@ fn session_limits_plan(spec: &serde_json::Value) -> Option<serde_json::Value> {
         "session_window_bytes": d.session_window_bytes,
         "peer_buffer_budget_bytes": d.peer_buffer_budget_bytes,
         "process_buffer_budget_bytes": d.process_buffer_budget_bytes,
+    }}))
+}
+
+/// The connection and session windows of profiles from before 1.1.10
+/// (256 KiB and 8 MiB) to the current defaults, while they still hold those
+/// values and the peer budget leaves room. The connection window bounds how
+/// fast a device uploads through one connection over a long round trip; the
+/// session window grows with it, so as many connections fit as before.
+fn stream_window_plan(spec: &serde_json::Value) -> Option<serde_json::Value> {
+    let core = &spec["core"];
+    if core["stream_buffer_budget_bytes"].as_u64() != Some(256 * 1024)
+        || core["session_window_bytes"].as_u64() != Some(8 * 1024 * 1024)
+    {
+        return None;
+    }
+    let d = aegis_config::CoreConfig::default();
+    let window = u64::from(d.stream_buffer_budget_bytes);
+    let session = u64::from(d.session_window_bytes);
+    if session + window > core["peer_buffer_budget_bytes"].as_u64()? {
+        return None;
+    }
+    Some(serde_json::json!({"core": {
+        "stream_buffer_budget_bytes": window,
+        "session_window_bytes": session,
     }}))
 }
 
@@ -344,5 +369,31 @@ mod tests {
         assert!(quic_inbound_plan(&patch).is_none());
         // No edge to take the port from: left alone.
         assert!(quic_inbound_plan(&serde_json::json!({"inbounds": []})).is_none());
+    }
+
+    #[test]
+    fn the_old_default_window_grows_once_and_chosen_ones_stay() {
+        let core = |window: u64| {
+            serde_json::json!({"core": {
+                "stream_buffer_budget_bytes": window,
+                "session_window_bytes": 8 * 1024 * 1024,
+                "peer_buffer_budget_bytes": 24 * 1024 * 1024,
+            }})
+        };
+        let patch = stream_window_plan(&core(256 * 1024)).expect("planned");
+        assert_eq!(patch["core"]["stream_buffer_budget_bytes"], 2 * 1024 * 1024);
+        assert_eq!(patch["core"]["session_window_bytes"], 10 * 1024 * 1024);
+        let mut upgraded = core(2 * 1024 * 1024);
+        upgraded["core"]["session_window_bytes"] = serde_json::json!(10 * 1024 * 1024);
+        assert!(stream_window_plan(&upgraded).is_none(), "already upgraded");
+        assert!(stream_window_plan(&core(512 * 1024)).is_none(), "chosen");
+        // An operator's session window: left alone.
+        let mut chosen = core(256 * 1024);
+        chosen["core"]["session_window_bytes"] = serde_json::json!(4 * 1024 * 1024);
+        assert!(stream_window_plan(&chosen).is_none());
+        // A peer budget without room: left alone.
+        let mut small = core(256 * 1024);
+        small["core"]["peer_buffer_budget_bytes"] = serde_json::json!(10 * 1024 * 1024);
+        assert!(stream_window_plan(&small).is_none());
     }
 }

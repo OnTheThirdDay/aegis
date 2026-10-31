@@ -833,13 +833,22 @@ async fn legacy_session_limits_are_upgraded_once_and_operator_values_kept() {
         let running = launch_with_core(&data, legacy).await;
         let core = &running.node.ctx.startup.core;
         assert_eq!(core.max_streams_per_session, 512, "upgraded and restarted");
-        assert_eq!(core.stream_buffer_budget_bytes, 256 * 1024);
-        assert_eq!(core.session_window_bytes, 8 * 1024 * 1024);
+        assert_eq!(core.stream_buffer_budget_bytes, 2 * 1024 * 1024);
+        assert_eq!(core.session_window_bytes, 10 * 1024 * 1024);
         let after = revisions(&data);
         running.shutdown().await;
         let running = launch_with_core(&data, "").await;
         assert_eq!(running.node.ctx.startup.core.max_streams_per_session, 512);
         assert_eq!(revisions(&data), after, "no second upgrade");
+        running.shutdown().await;
+
+        // 1.1.9's defaults: the windows grow to today's (ADR-0009).
+        let windows = "\n[core]\nstream_buffer_budget_bytes = 262144\nsession_window_bytes = 8388608\n";
+        let data = tmp.path().join("windows");
+        let running = launch_with_core(&data, windows).await;
+        let core = &running.node.ctx.startup.core;
+        assert_eq!(core.stream_buffer_budget_bytes, 2 * 1024 * 1024);
+        assert_eq!(core.session_window_bytes, 10 * 1024 * 1024);
         running.shutdown().await;
 
         // An operator's own limits are not touched.

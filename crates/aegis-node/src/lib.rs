@@ -255,7 +255,9 @@ impl NodeContext {
             stream_window: c.stream_buffer_budget_bytes,
             session_window: c.session_window_bytes,
             max_frame_payload: c.max_frame_payload_bytes,
-            stream_tx_buffer: c.stream_buffer_budget_bytes,
+            stream_tx_buffer: c
+                .stream_buffer_budget_bytes
+                .min(aegis_session::MAX_STREAM_TX_BUFFER),
             handshake_timeout: Duration::from_millis(u64::from(c.tls_handshake_timeout_ms)),
             keepalive_interval: Duration::from_secs(u64::from(c.keepalive_interval_seconds)),
             keepalive_timeout: Duration::from_secs(u64::from(c.keepalive_interval_seconds).max(10)),
@@ -867,7 +869,9 @@ mod capacity_tests {
             max_streams: core.max_streams_per_session,
             stream_window: core.stream_buffer_budget_bytes,
             session_window: core.session_window_bytes,
-            stream_tx_buffer: core.stream_buffer_budget_bytes,
+            stream_tx_buffer: core
+                .stream_buffer_budget_bytes
+                .min(aegis_session::MAX_STREAM_TX_BUFFER),
             ..aegis_session::SessionConfig::default()
         };
         let streams = cfg.effective_max_streams(core.session_window_bytes);
