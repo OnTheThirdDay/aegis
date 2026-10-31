@@ -80,10 +80,12 @@ impl Default for SessionConfig {
     }
 }
 
-/// Largest per-stream transmit buffer. Data leaves it as soon as the peer's
-/// credit allows, so a larger one wouldn't send faster: it would only hold
-/// more for a peer that stopped reading.
-pub const MAX_STREAM_TX_BUFFER: u32 = 1024 * 1024;
+/// The largest per-stream transmit buffer nodes use, whatever the window.
+/// Data leaves it as soon as the peer's credit allows, so a larger one
+/// wouldn't send faster. It would only hold more for a peer that stopped
+/// reading, out of the same peer budget new streams need: with 1 MiB, about
+/// 19 stalled downloads kept a gateway from opening any new stream.
+pub const MAX_STREAM_TX_BUFFER: u32 = 256 * 1024;
 
 impl SessionConfig {
     /// Validate ranges; returns a human-readable reason on failure.
@@ -103,7 +105,7 @@ impl SessionConfig {
         if self.max_streams == 0 {
             return Err("max_streams must be positive");
         }
-        if !(1024..=MAX_STREAM_TX_BUFFER).contains(&self.stream_tx_buffer) {
+        if !(1024..=1024 * 1024).contains(&self.stream_tx_buffer) {
             return Err("stream_tx_buffer must be 1 KiB..=1 MiB");
         }
         if self.control_queue_frames < 16 {

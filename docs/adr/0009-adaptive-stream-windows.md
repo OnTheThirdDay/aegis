@@ -78,7 +78,7 @@ The wire format is unchanged. Windows were always receiver-chosen: a peer honors
   - The session window grows from 8 MiB to **10 MiB**, so the working share (10 − 2 MiB) still holds all 512 connections at 16 KiB. With 8 MiB it would hold 384.
   - The peer budget (24 MiB) still covers the session window plus every connection's initial transmit reservation.
 - iPhones use **1 MiB** (ADR-0018).
-- The per-stream transmit buffer stays at most 1 MiB (`MAX_STREAM_TX_BUFFER`). Data leaves it as soon as credit allows, so a larger one would only hold more for a peer that stopped reading.
+- The per-stream transmit buffer stays at 256 KiB at most (`MAX_STREAM_TX_BUFFER`), as before. Data leaves it as soon as credit allows, so a larger one wouldn't send faster. It would only hold more for a peer that stopped reading, out of the peer budget new streams need. With 1 MiB, about 19 stalled downloads kept a gateway from opening any new stream (CI caught it).
 - Gateways whose profile still holds the old defaults (256 KiB and 8 MiB) get the new ones once at start (`stream-window-upgrade`). Values an operator chose stay.
 
 **Compatibility**

@@ -125,7 +125,7 @@ fn cfg(node: &str, window_kib: u32) -> SessionConfig {
     SessionConfig {
         node_id: node.into(),
         stream_window: window_kib * 1024,
-        stream_tx_buffer: window_kib.min(1024) * 1024,
+        stream_tx_buffer: (window_kib * 1024).min(aegis_session::MAX_STREAM_TX_BUFFER),
         ..SessionConfig::default()
     }
 }
