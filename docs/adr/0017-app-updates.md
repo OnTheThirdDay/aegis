@@ -59,6 +59,20 @@ The Windows and macOS apps aren't signed by a certificate authority, so nothing 
 - **Phones (1.1.8):** the answer to an update check is reused for 15 minutes, for the server that gave it only; a download comes from the server that offered it.
 - **Desktop (1.1.8):** downloading and installing runs as a task of its own, so Disconnect and Shutdown are handled meanwhile; shutting down cancels it.
 
+**Unchanged apps keep their build (1.1.9, owner direction)**
+
+- Apps compare version numbers, and every release gives every build a new one. So a release that changed only the gateway or one app used to offer every device the same app again under a new number. Android users downloaded it for nothing.
+- Now the release workflow's `plan` job compares each app's build inputs with the previous release (`.github/scripts/unchanged-apps.py`). The inputs are:
+  - the app's workspace crates and every workspace crate they depend on, and files their sources include;
+  - `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml`, with the workspace version left out;
+  - the app's job in `release.yml`, without scheduling lines and comments;
+  - the app's other sources: `apps/aegis-mobile` except `ios/` for Android, and `macos-dmg.sh` for macOS.
+- An app with the same inputs, whose builds the previous release has, isn't rebuilt. Its files are carried into the new release and image and signed as the version they are. Android, desktop (Linux and Windows together) and macOS are decided separately.
+- Each release lists every file's version in a `BUILDS` asset, so a build carried twice keeps its first version. Releases before 1.1.9 have no `BUILDS`; their files are their own version.
+- The release notes name the carried apps.
+- iOS is always rebuilt. Gateways up to 1.1.8 label the iPhone app with the release's version, not the app's, so a carried app would be offered again and again.
+- Counting too much only rebuilds an app. Anything that changes a build must be among the inputs: a build step outside the app's job, for example, would be missed.
+
 **iOS (owner choice: Ad Hoc IPA, when the iOS app exists)**
 
 - The platform name `ios` and the file name `aegis-client-ios.ipa` are reserved, and the signing script signs such a build.
@@ -71,7 +85,7 @@ The Windows and macOS apps aren't signed by a certificate authority, so nothing 
 
 - Users update apps in one tap from the version their server runs, and nothing changes without their action.
 - An update can't come from anyone but the release workflow, even through a compromised server. A leaked signing key is as serious as a leaked Android key. Replacing it needs app releases carrying the new public key, installed by hand once.
-- A release that changes only the gateway still offers the apps its new version number. That's harmless: the same code with a new number.
+- A release offers an app only when its build inputs changed (1.1.9). A carried app reports its own, older version, for example in its about screen, while the gateway runs the new one.
 - Tests:
   - signatures made by OpenSSL verify, and any changed field breaks them;
   - versions only move forward;
