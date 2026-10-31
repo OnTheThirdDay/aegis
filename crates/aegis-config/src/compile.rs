@@ -115,8 +115,8 @@ fn check_core(c: &CoreConfig, ctx: &mut Ctx) {
     if c.peer_buffer_budget_bytes > c.process_buffer_budget_bytes {
         ctx.err("core.peer_buffer_budget_bytes must not exceed the process budget");
     }
-    if !(16 * 1024..=mib as u32).contains(&c.stream_buffer_budget_bytes) {
-        ctx.err("core.stream_buffer_budget_bytes must be 16 KiB..=1 MiB");
+    if !(16 * 1024..=4 * mib as u32).contains(&c.stream_buffer_budget_bytes) {
+        ctx.err("core.stream_buffer_budget_bytes must be 16 KiB..=4 MiB");
     }
     if c.session_window_bytes < 2 * c.stream_buffer_budget_bytes
         || c.session_window_bytes > aegis_contracts_max_window()

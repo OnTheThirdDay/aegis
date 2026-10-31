@@ -866,8 +866,11 @@ async fn unless_stopped<F: std::future::Future>(
 }
 
 /// iOS ends a VPN extension that uses more than about 50 MB, so there the
-/// client's buffers stay well below it (ADR-0018). The session window is
-/// the desktop's (8 MB): it bounds the sum of all connections' windows, and
+/// client's buffers stay well below it (ADR-0018). One connection's window
+/// stays at 1 MiB (half the desktop's): everything received is bounded by
+/// the session window anyway, but this is the device with a hard limit.
+/// The session window is
+/// 8 MB (the desktop's until 1.1.10): it bounds the sum of all connections' windows, and
 /// with 4 MB about 20 connections that stopped reading (a browser's slow or
 /// abandoned page loads) left no room for any new one, the tunnel's health
 /// check included. Within the configuration rules: the window holds two
@@ -876,7 +879,7 @@ fn within_memory_limit(core: &mut aegis_config::CoreConfig, small: bool) {
     if small {
         core.process_buffer_budget_bytes = 24 * 1024 * 1024;
         core.peer_buffer_budget_bytes = 20 * 1024 * 1024;
-        core.stream_buffer_budget_bytes = 256 * 1024;
+        core.stream_buffer_budget_bytes = 1024 * 1024;
         core.session_window_bytes = 8 * 1024 * 1024;
     }
 }
@@ -983,7 +986,7 @@ mod tests {
         let mib = 1024 * 1024;
         assert!((4 * mib..=1024 * mib).contains(&c.process_buffer_budget_bytes));
         assert!(c.peer_buffer_budget_bytes <= c.process_buffer_budget_bytes);
-        assert!((16 * 1024..=mib as u32).contains(&c.stream_buffer_budget_bytes));
+        assert!((16 * 1024..=4 * mib as u32).contains(&c.stream_buffer_budget_bytes));
         assert!(c.session_window_bytes >= 2 * c.stream_buffer_budget_bytes);
         assert!(
             u64::from(c.session_window_bytes) + u64::from(c.stream_buffer_budget_bytes)

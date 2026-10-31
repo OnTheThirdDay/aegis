@@ -11,7 +11,7 @@ pub struct SessionConfig {
     /// Upper bound on concurrent streams (incl. closing records) we accept.
     pub max_streams: u32,
     /// Largest receive window one stream can grow to: the per-stream RX
-    /// quota (16 KiB – 1 MiB).
+    /// quota (16 KiB – 4 MiB).
     pub stream_window: u32,
     /// Receive window a new stream starts with (advertised in HELLO). It
     /// grows towards `stream_window` while the stream's sender is limited
@@ -80,11 +80,18 @@ impl Default for SessionConfig {
     }
 }
 
+/// The largest per-stream transmit buffer nodes use, whatever the window.
+/// Data leaves it as soon as the peer's credit allows, so a larger one
+/// wouldn't send faster. It would only hold more for a peer that stopped
+/// reading, out of the same peer budget new streams need: with 1 MiB, about
+/// 19 stalled downloads kept a gateway from opening any new stream.
+pub const MAX_STREAM_TX_BUFFER: u32 = 256 * 1024;
+
 impl SessionConfig {
     /// Validate ranges; returns a human-readable reason on failure.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !(16 * 1024..=1024 * 1024).contains(&self.stream_window) {
-            return Err("stream_window must be 16 KiB..=1 MiB");
+        if !(16 * 1024..=4 * 1024 * 1024).contains(&self.stream_window) {
+            return Err("stream_window must be 16 KiB..=4 MiB");
         }
         if !(1024..=self.stream_window).contains(&self.initial_stream_window) {
             return Err("initial_stream_window must be 1 KiB..=stream_window");

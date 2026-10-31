@@ -27,7 +27,7 @@ mod error;
 mod mux;
 mod stream;
 
-pub use config::SessionConfig;
+pub use config::{SessionConfig, MAX_STREAM_TX_BUFFER};
 pub use datagram::{DatagramFlow, DatagramPath};
 pub use error::{OpenError, SessionError};
 pub use mux::{

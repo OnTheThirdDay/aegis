@@ -26,6 +26,8 @@ use tokio::time::Instant;
 /// Largest batch the writer assembles before issuing one transport write.
 const WRITE_BATCH: usize = 64 * 1024;
 const TIMER_TICK: Duration = Duration::from_millis(250);
+/// How old a round-trip sample may get while streams receive data.
+const RTT_REFRESH: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +173,12 @@ pub(crate) struct Entry {
     /// Current receive window (`buffered + outstanding + pending_grant`
     /// while open): starts at the initial window and grows while busy.
     pub window: u32,
+    /// How far `window` grew beyond the initial window.
+    pub grown: u32,
+    /// Bytes consumed since `epoch_start`: a stream that consumes a whole
+    /// window within two round trips is limited by the window.
+    pub epoch_start: Instant,
+    pub epoch_bytes: u32,
     pub remote_fin: bool,
     pub tx: BytesMut,
     pub tx_cap: usize,
@@ -205,6 +213,9 @@ impl Entry {
             rx_outstanding: rx_window,
             pending_grant: 0,
             window: rx_window,
+            grown: 0,
+            epoch_start: Instant::now(),
+            epoch_bytes: 0,
             remote_fin: false,
             tx: BytesMut::new(),
             tx_cap,
@@ -264,6 +275,9 @@ pub(crate) struct State {
     /// Sum of all stream windows; kept within
     /// `SessionConfig::stream_windows_budget(recv_reserved)`.
     pub stream_windows: u64,
+    /// The part of `stream_windows` grown beyond initial windows; kept
+    /// within three quarters of that budget.
+    pub grown_windows: u64,
     /// Next client stream ID to allocate (client role); `None` = exhausted.
     pub next_local_id: Option<u32>,
     /// Highest client stream ID seen (server role); 0 = none yet.
@@ -276,6 +290,12 @@ pub(crate) struct State {
     pub last_rx: Instant,
     pub ping_outstanding: Option<Instant>,
     pub ping_counter: u64,
+    /// The ping whose PONG gives the next round-trip sample, and when it
+    /// was sent.
+    pub rtt_probe: Option<(u64, Instant)>,
+    /// Smoothed round trip, and when it was last sampled.
+    pub rtt: Option<Duration>,
+    pub rtt_sampled: Option<Instant>,
     pub incoming_tx: Option<mpsc::Sender<IncomingOpen>>,
     /// Datagrams waiting for the writer, with their total size.
     pub dgram_tx: VecDeque<(u32, Bytes)>,
@@ -361,6 +381,26 @@ impl Shared {
         Ok(())
     }
 
+    /// While streams receive data, keep a recent round-trip sample: a PING
+    /// whose PONG is timed (every peer answers PINGs). Idle sessions send
+    /// nothing extra.
+    fn maybe_probe_rtt(&self, st: &mut State, now: Instant) -> Result<(), SessionError> {
+        let waiting = st
+            .rtt_probe
+            .is_some_and(|(_, sent)| now.duration_since(sent) < self.cfg.keepalive_timeout);
+        let fresh = st
+            .rtt_sampled
+            .is_some_and(|t| now.duration_since(t) < RTT_REFRESH);
+        if waiting || fresh {
+            return Ok(());
+        }
+        st.ping_counter += 1;
+        let payload = Bytes::copy_from_slice(&st.ping_counter.to_be_bytes());
+        self.push_control(st, Frame::new(FrameType::Ping, 0, payload))?;
+        st.rtt_probe = Some((st.ping_counter, now));
+        Ok(())
+    }
+
     fn maybe_grant_session(&self, st: &mut State, force: bool) -> Result<(), SessionError> {
         let threshold = Self::session_grant_threshold(st);
         if st.recv_pending_grant > 0 && (force || st.recv_pending_grant >= threshold) {
@@ -381,25 +421,53 @@ impl Shared {
         st.recv_pending_grant += u64::from(n);
         let quota = self.cfg.stream_window;
         let budget = self.cfg.stream_windows_budget(st.recv_reserved);
+        let rtt = st.rtt;
+        let now = Instant::now();
         let mut grant = None;
         if let Some(e) = st.streams.get_mut(&id) {
             e.rx_buffered -= n;
             if !e.remote_fin {
                 e.pending_grant += n;
+                e.epoch_bytes = e.epoch_bytes.saturating_add(n);
                 if e.pending_grant >= (e.window / 4).max(1) {
-                    // The sender used most of its credit before we could
-                    // replenish it: it is limited by our window, so double
-                    // it (up to the per-stream quota, within the budget).
+                    // The sender is limited by our window when it used most
+                    // of its credit before we could replenish it, or (on a
+                    // long round trip, where credit and data in flight
+                    // can't be told apart) when a whole window went through
+                    // within two round trips. Then double the window, up to
+                    // the per-stream quota, within the budget.
+                    let mut limited = e.rx_outstanding < e.window / 2;
+                    // A window used up within two round trips may be far
+                    // too small yet: grow it fourfold.
+                    let mut step = e.window;
+                    if let Some(rtt) = rtt {
+                        if now.saturating_duration_since(e.epoch_start) > 2 * rtt {
+                            e.epoch_start = now;
+                            e.epoch_bytes = 0;
+                        } else if e.epoch_bytes >= e.window {
+                            limited = true;
+                            step = e.window.saturating_mul(3);
+                            e.epoch_start = now;
+                            e.epoch_bytes = 0;
+                        }
+                    }
                     let mut grow = 0;
-                    if e.rx_outstanding < e.window / 2 && e.window < quota {
-                        let room = budget.saturating_sub(st.stream_windows);
-                        grow = e
-                            .window
+                    if limited && e.window < quota {
+                        // Growth may take at most three quarters of the
+                        // working share: the rest stays for new streams, so
+                        // a few stalled streams with grown windows can't
+                        // keep the session from opening any.
+                        let room = budget
+                            .saturating_sub(st.stream_windows)
+                            .min((budget - budget / 4).saturating_sub(st.grown_windows));
+                        grow = step
                             .min(quota - e.window)
                             .min(u32::try_from(room).unwrap_or(u32::MAX));
                     }
                     e.window += grow;
+                    e.grown += grow;
                     st.stream_windows += u64::from(grow);
+                    st.grown_windows += u64::from(grow);
                     let amount = e.pending_grant + grow;
                     e.rx_outstanding += amount;
                     e.pending_grant = 0;
@@ -410,6 +478,7 @@ impl Shared {
         if let Some(amount) = grant {
             let payload = encode_window_update(amount)?;
             self.push_control(st, Frame::new(FrameType::WindowUpdate, id, payload))?;
+            self.maybe_probe_rtt(st, now)?;
         }
         self.maybe_grant_session(st, false)?;
         self.writer.notify_one();
@@ -1035,6 +1104,7 @@ impl Drop for IncomingOpen {
 fn take_stream(st: &mut State, id: u32) -> Option<Entry> {
     let e = st.streams.remove(&id)?;
     st.stream_windows -= u64::from(e.window);
+    st.grown_windows -= u64::from(e.grown);
     Some(e)
 }
 
@@ -1312,6 +1382,7 @@ where
         recv_buffered: 0,
         recv_pending_grant: 0,
         stream_windows: 0,
+        grown_windows: 0,
         next_local_id: Some(1),
         last_peer_id: 0,
         goaway_sent: false,
@@ -1322,6 +1393,9 @@ where
         last_rx: Instant::now(),
         ping_outstanding: None,
         ping_counter: 0,
+        rtt_probe: None,
+        rtt: None,
+        rtt_sampled: None,
         incoming_tx,
         dgram_tx: VecDeque::new(),
         dgram_tx_bytes: 0,
@@ -1485,6 +1559,15 @@ fn handle_frame(
         FrameType::Pong => {
             if !limiter.allow() {
                 return Err(SessionError::ControlOverload);
+            }
+            if let Some((counter, sent)) = st.rtt_probe {
+                if frame.payload[..] == counter.to_be_bytes() {
+                    let now = Instant::now();
+                    let sample = now.duration_since(sent);
+                    st.rtt = Some(st.rtt.map_or(sample, |r| (r * 7 + sample) / 8));
+                    st.rtt_sampled = Some(now);
+                    st.rtt_probe = None;
+                }
             }
             Ok(())
         }
@@ -2094,6 +2177,9 @@ async fn timer_task(shared: Arc<Shared>) {
                 return;
             }
             st.ping_outstanding = Some(now);
+            if st.rtt_probe.is_none() {
+                st.rtt_probe = Some((st.ping_counter, now));
+            }
             shared.writer.notify_one();
         }
     }
